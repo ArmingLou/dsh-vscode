@@ -587,3 +587,78 @@ test('v0.3.2 握手未携带 shortcuts 时：组合键一律放行（向后兼�
     rmSync(b.outDir, { recursive: true, force: true });
   }
 });
+
+test('v0.3.2 文件路径点击：fileMention 与产物 chip 统一转发 openFile（title 优先于 aria-label 文案）', async () => {
+  const fakeRealFetch = async (_input: unknown, _init: any) => jsonResponse(ACCEPT_BODY);
+  const b = loadBridge({ fetch: fakeRealFetch });
+  try {
+    b.apply();
+    b.emitWin('message', { kind: 'bridgeHello', token: 'tok', imageFallback: true });
+    const started = b.parentMessages.length;
+
+    // 模拟 DSH 的「路径按钮」DOM：title=真实路径、aria-label=「打开 xxx」文案（与 fileMention/产物 chip 一致）
+    const mkBtn = (over: any) => {
+      const btn: any = {
+        classList: { contains: (c: string) => (over.classes ?? []).includes(c) },
+        getAttribute: (name: string) =>
+          name === 'title' ? (over.title ?? null) : name === 'aria-label' ? (over.ariaLabel ?? null) : null,
+        textContent: over.text ?? '',
+        closest: (sel: string) => (sel === 'button[title], button[aria-label]' ? btn : null),
+      };
+      return btn;
+    };
+    const click = (target: any) => {
+      let prevented = 0;
+      let stopped = 0;
+      b.emitDoc('click', {
+        target,
+        preventDefault() { prevented += 1; },
+        stopPropagation() { stopped += 1; },
+      });
+      return { prevented, stopped };
+    };
+    const openFiles = () => b.parentMessages.slice(started).filter((m) => m.kind === 'openFile');
+
+    // ① 模型回复路径（button.fileMention）：必须转发 title 真实路径（旧实现误用 aria-label 文案）
+    click(mkBtn({ classes: ['fileMention'], title: '/ws/src/main.ts', ariaLabel: '打开 /ws/src/main.ts', text: 'main.ts' }));
+    assert.equal(openFiles().length, 1, 'fileMention 应转发 openFile');
+    assert.equal(openFiles()[0].path, '/ws/src/main.ts', '应转发 title 真实路径而非 aria-label 文案');
+
+    // ② 产物列表 chip（无 fileMention class，title 为绝对路径）：同样被拦截转发
+    click(mkBtn({ title: '/ws/out/a.log', ariaLabel: '打开 /ws/out/a.log', text: 'a.log' }));
+    assert.equal(openFiles().length, 2, '产物 chip（title 绝对路径）应转发 openFile');
+    assert.equal(openFiles()[1].path, '/ws/out/a.log');
+
+    // ③ Windows 盘符绝对路径同样识别
+    click(mkBtn({ title: 'C:\\proj\\b.ts', ariaLabel: '打开 C:\\proj\\b.ts', text: 'b.ts' }));
+    assert.equal(openFiles().length, 3);
+    assert.equal(openFiles()[2].path, 'C:\\proj\\b.ts');
+
+    // ④ 普通按钮（title 非路径、无 fileMention class）：不拦截、不 preventDefault（放行给页面）
+    const r4 = click(mkBtn({ title: '复制代码', ariaLabel: '复制', text: '复制' }));
+    assert.equal(openFiles().length, 3, '非路径按钮不应转发');
+    assert.equal(r4.prevented, 0, '非路径按钮不应 preventDefault');
+    assert.equal(r4.stopped, 0, '非路径按钮不应 stopPropagation');
+  } finally {
+    rmSync(b.outDir, { recursive: true, force: true });
+  }
+});
+
+test('v0.3.2 未握手时文件路径点击不拦截（普通浏览器保持 DSH 原生行为）', async () => {
+  const fakeRealFetch = async (_input: unknown, _init: any) => jsonResponse(ACCEPT_BODY);
+  const b = loadBridge({ fetch: fakeRealFetch });
+  try {
+    b.apply(); // 不握手
+    const started = b.parentMessages.length;
+    const btn: any = {
+      classList: { contains: () => true },
+      getAttribute: () => '/ws/a.ts',
+      textContent: 'a.ts',
+      closest: (sel: string) => (sel === 'button[title], button[aria-label]' ? btn : null),
+    };
+    b.emitDoc('click', { target: btn, preventDefault() {}, stopPropagation() {} });
+    assert.equal(b.parentMessages.slice(started).filter((m) => m.kind === 'openFile').length, 0, '未握手不应转发');
+  } finally {
+    rmSync(b.outDir, { recursive: true, force: true });
+  }
+});

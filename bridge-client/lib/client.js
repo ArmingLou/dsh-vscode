@@ -448,7 +448,7 @@ window.__ModuleLoader__.load({
       if (menuEl) menuEl.style.display = "none";
     }
 
-    // —— DOM 拦截：外链与 fileMention 点击 → postMessage 转发给父页面（扩展） ——
+    // —— DOM 拦截：外链与文件路径点击 → postMessage 转发给父页面（扩展） ——
     function bindLinkInterception() {
       document.addEventListener("click", (e) => {
         if (bridgeToken === "") return; // 未握手（普通浏览器打开）不激活
@@ -462,15 +462,26 @@ window.__ModuleLoader__.load({
           parent.postMessage(buildOpenExternalMessage(anchor.href), "*");
           return;
         }
-        // 文件路径按钮：DSH fileMention 渲染为 button.fileMention，label 取 aria-label/title/textContent
+        // 文件路径按钮：DSH 的「模型回复内路径」（button.fileMention）与「产物列表 chip」
+        // 都渲染为 title=真实路径 的 button，onClick 走 host.openPath（系统默认应用打开）。
+        // 桥接统一拦截并转发扩展宿主 → showTextDocument（在当前 VS Code 窗口打开）。
+        // 识别：fileMention class（兼容相对路径 title）或 title 为绝对路径形态（覆盖产物 chip
+        // 与 DSH 改版后的新结构）。路径取 title（真实路径）优先——aria-label 是「打开 xxx」文案，
+        // 绝不能当路径用（旧实现曾误用导致解析失败）。
         const btn = target.closest("button[title], button[aria-label]");
-        if (btn && btn.classList && btn.classList.contains("fileMention")) {
-          e.preventDefault();
-          e.stopPropagation();
-          const label = btn.getAttribute("aria-label") || btn.getAttribute("title") || btn.textContent || "";
-          // openFile 消息仍发送 path；不带 cwd 字段（工作区同步已移除，会话 cwd 不再维护），
-          // 扩展侧以工作区根目录作为相对路径解析兜底。
-          parent.postMessage(buildOpenFileMessage(label), "*");
+        if (btn && btn.classList) {
+          const title = btn.getAttribute("title") || "";
+          const isFileMention = btn.classList.contains("fileMention");
+          const titleIsPath = title !== "" && (title.startsWith("/") || /^[a-zA-Z]:[\\/]/.test(title));
+          if (isFileMention || titleIsPath) {
+            e.preventDefault();
+            e.stopPropagation();
+            const path = title || btn.getAttribute("aria-label") || btn.textContent || "";
+            // openFile 消息仍发送 path；不带 cwd 字段（工作区同步已移除，会话 cwd 不再维护），
+            // 扩展侧以工作区根目录作为相对路径解析兜底。
+            parent.postMessage(buildOpenFileMessage(path), "*");
+            return;
+          }
         }
       }, true); // 捕获阶段：先于 DSH 自身处理器
     }
