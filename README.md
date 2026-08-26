@@ -98,6 +98,7 @@ After installation, the extension installs its own bridge package `dsh-vscode-br
 - 📂 **File jumps**: clicking a file path in the panel opens the file in VS Code;
 - 📋 **Clipboard copy**: copy buttons inside DSH (such as code-block copy) are routed through the extension host, working around VS Code's clipboard permission block for cross-origin iframes inside webviews.
 - ↩️ **Undo/redo (macOS Cmd+Z / Cmd+Shift+Z, Windows Ctrl+Z / Ctrl+Y)**: VS Code swallows standard shortcuts in nested iframes, and DSH's input is a React-controlled field whose native undo stack is empty, so `execCommand('undo')` no-ops. After handshake the bridge keeps a **manual undo/redo stack** per editable element (consecutive typing grouped into one step per 400ms) — native undo is preferred when it works, manual fallback otherwise (fixes issue #6 "Cmd+Z undo doesn't work").
+- ⌨️ **Arbitrary shortcut forwarding (v0.3.2)**: key chords swallowed by VS Code inside the panel (e.g. `Cmd+1`, `Cmd+Esc`) are forwarded to the extension host via the `dsh.bridge.shortcuts` mapping, which executes the mapped VS Code command. Ships with `Cmd+1/2/3` (toggle auxiliary bar / panel / sidebar, matching the author's keybindings) and `Cmd+Esc` (toggle maximized panel) by default; override them or add any combo in settings (e.g. `"alt+1": "workbench.view.explorer"`, `"cmd+`": "workbench.action.terminal.toggleTerminal"`). Editing shortcuts (Cmd/Ctrl+C/V/A/X/Z) are still simulated locally inside the page and take precedence.
 
 ### Install / uninstall mechanism (transparency disclosure)
 
@@ -119,6 +120,7 @@ To remove, either way works:
 | `dsh.bridge.enabled` | `true` | Enable the bridge (when off: no install, no injection, no warning; the three integrations are unavailable) |
 | `dsh.workspaceRootIndex` | `0` | For multi-root workspaces: which root to use as the `dsh web` process working directory (out-of-range falls back to the first) |
 | `dsh.bridge.silenceWarning` | `false` | Suppress the bridge degradation warning |
+| `dsh.bridge.shortcuts` | see right | Shortcut forwarding map `{ combo: VS Code command }` (v0.3.2). Key syntax: modifiers `cmd`/`ctrl`/`alt`/`shift` + a key (`a`-`z`, `0`-`9`, `` ` ``, `escape`, `f1`-`f24`, ...), e.g. `"cmd+1"`; overrides the defaults and accepts any new combo, the panel re-renders automatically on change |
 
 ### Degradation behavior
 

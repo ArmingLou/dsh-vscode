@@ -1,3 +1,13 @@
+## [0.3.2] - 2026-08-26
+
+### 新增
+
+- **快捷键桥接：面板内任意 VS Code 快捷键可用**。与 Cmd+C/V 修复同源（VS Code 只把快捷键转发给顶层 webview、嵌套 iframe 内的组合键全部被吞），桥接现在把 iframe 内按下的组合键转发给扩展宿主执行对应 VS Code 命令。新增设置 `dsh.bridge.shortcuts`（`{ 组合键: 命令 }` 映射）：
+  - **默认内置**（与作者 keybindings 一致）：`Cmd+1` 切换辅助栏、`Cmd+2` 切换面板、`Cmd+3` 切换侧边栏、`Cmd+Esc` 最大化面板（Windows 对应 `Ctrl+` 前缀版本同设）；反引号键未内置默认映射，需要时自行添加（如 `"cmd+`": "workbench.action.terminal.toggleTerminal"`）；
+  - **任意扩展**：组合键写法 `cmd`/`ctrl`/`alt`/`shift` + 按键（字母、`0-9`、`` ` ``、`escape`、`f1-f24` 等），如 `"alt+1": "workbench.view.explorer"`；条目覆盖默认、可自由新增，修改后自动重渲染面板生效；
+  - 编辑类快捷键（Cmd/Ctrl+C/V/A/X/Z）仍由页面内本地仿真优先（复制/粘贴/撤销等），不参与自定义映射；按住不放的自动重复不会重复触发 toggle 类命令。
+  - 配套桥接升至 `0.3.2`（扩展+桥接统一，触发强制重装），握手诊断日志新增 `shortcuts=N` 便于确认映射已下发。
+
 ## [0.3.1] - 2026-08-24
 
 ### 修复

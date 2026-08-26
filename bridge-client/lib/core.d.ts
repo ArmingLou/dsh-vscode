@@ -25,11 +25,13 @@ export function isBridgeMessage(data: unknown, token: string): boolean;
 /** 握手 token 字段名（父页面发来的消息里携带） */
 export const HANDSHAKE_TOKEN_KEY: string;
 
-/** 键盘事件关键字段（getShortcutCommand 的输入，兼容真实 KeyboardEvent 与测试桩） */
+/** 键盘事件关键字段（getShortcutCommand / getShortcutCombo 的输入，兼容真实 KeyboardEvent 与测试桩） */
 interface ShortcutEventLike {
   key?: string;
+  code?: string;
   metaKey?: boolean;
   ctrlKey?: boolean;
+  altKey?: boolean;
   shiftKey?: boolean;
 }
 
@@ -41,6 +43,25 @@ type EditCommand = 'copy' | 'paste' | 'cut' | 'selectAll' | 'undo' | 'redo';
  * 命中返回对应编辑命令；未命中返回 null（调用方应放行原事件）。
  */
 export function getShortcutCommand(e: ShortcutEventLike | null | undefined): EditCommand | null;
+
+/**
+ * 把键盘事件归一为「规范组合键字符串」（如 'cmd+1'、'ctrl+shift+f'、'cmd+`'）。
+ * 按键名优先取 e.code（布局无关）；无任何修饰键返回 null（普通按键不参与转发）。
+ */
+export function getShortcutCombo(e: ShortcutEventLike | null | undefined): string | null;
+
+/** 把用户配置的组合键写法归一为规范形式（'CMD + Esc' → 'cmd+escape'）；非法返回 null */
+export function canonicalizeCombo(s: unknown): string | null;
+
+/** 规范化快捷键映射：{ 组合键写法: 命令 id } → { 规范组合键: 命令 id }；非法条目丢弃，非对象返回 {} */
+export function normalizeShortcutMap(raw: unknown): Record<string, string>;
+
+/** 构造「快捷键」上行消息（iframe 页面 → 父页面 → 扩展宿主执行 VS Code 命令） */
+export function buildShortcutMessage(
+  combo: string,
+  key?: string,
+  code?: string,
+): { kind: 'shortcut'; combo: string; key: string; code: string };
 
 /** 判定元素是否为可编辑元素（textarea / 可输入 input / contenteditable） */
 export function isEditableElement(el: unknown): boolean;

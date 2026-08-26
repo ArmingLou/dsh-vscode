@@ -11,6 +11,10 @@ import {
   isBridgeMessage,
   HANDSHAKE_TOKEN_KEY,
   getShortcutCommand,
+  getShortcutCombo,
+  canonicalizeCombo,
+  normalizeShortcutMap,
+  buildShortcutMessage,
   isEditableElement,
   computeInsertedValue,
   buildReadTextMessage,
@@ -118,4 +122,65 @@ test('buildReadTextMessage / buildReadTextAck 构造剪贴板读取消息', () =
   // 读取失败：不带 text 字段
   assert.deepEqual(buildReadTextAck('req-2', false), { kind: 'readTextAck', requestId: 'req-2', ok: false });
   assert.deepEqual(buildReadTextAck('req-3', true, ''), { kind: 'readTextAck', requestId: 'req-3', ok: false });
+});
+
+// —— v0.3.2 桥接快捷键转发（VS Code 吞掉 iframe 内组合键的修复） ——
+
+test('getShortcutCombo 生成规范组合键（e.code 优先、布局无关）', () => {
+  assert.equal(getShortcutCombo({ key: '1', code: 'Digit1', metaKey: true }), 'cmd+1');
+  assert.equal(getShortcutCombo({ key: '2', code: 'Digit2', metaKey: true }), 'cmd+2');
+  assert.equal(getShortcutCombo({ key: '3', code: 'Digit3', ctrlKey: true }), 'ctrl+3');
+  // 反引号键：中文输入法下 key 可能是 '·'，code 恒为 Backquote → 归一为 cmd+`
+  assert.equal(getShortcutCombo({ key: '`', code: 'Backquote', metaKey: true }), 'cmd+`');
+  assert.equal(getShortcutCombo({ key: '·', code: 'Backquote', metaKey: true }), 'cmd+`');
+  // Esc / 组合修饰键 / 无 code 回退 key
+  assert.equal(getShortcutCombo({ key: 'Escape', code: 'Escape', metaKey: true }), 'cmd+escape');
+  assert.equal(getShortcutCombo({ key: 'z', code: 'KeyZ', metaKey: true, shiftKey: true }), 'cmd+shift+z');
+  assert.equal(getShortcutCombo({ key: 'F', code: 'KeyF', ctrlKey: true, shiftKey: true }), 'ctrl+shift+f');
+  assert.equal(getShortcutCombo({ key: 'F2', code: 'F2', altKey: true }), 'alt+f2');
+  assert.equal(getShortcutCombo({ key: 'k', metaKey: true }), 'cmd+k'); // 测试桩无 code：回退 key
+  // 无修饰键（普通按键/页面自身快捷键）不参与转发
+  assert.equal(getShortcutCombo({ key: 'a', code: 'KeyA' }), null);
+  assert.equal(getShortcutCombo({ key: 'Escape', code: 'Escape' }), null);
+  // 非法输入
+  assert.equal(getShortcutCombo(null), null);
+  assert.equal(getShortcutCombo(undefined), null);
+  assert.equal(getShortcutCombo({}), null);
+});
+
+test('canonicalizeCombo 归一化配置的组合键写法', () => {
+  assert.equal(canonicalizeCombo('cmd+1'), 'cmd+1');
+  assert.equal(canonicalizeCombo('CMD + Esc'), 'cmd+escape');
+  assert.equal(canonicalizeCombo('Cmd+`'), 'cmd+`');
+  assert.equal(canonicalizeCombo('ctrl+shift+f '), 'ctrl+shift+f');
+  assert.equal(canonicalizeCombo('meta+1'), 'cmd+1'); // meta → cmd
+  assert.equal(canonicalizeCombo('option+1'), 'alt+1'); // option → alt
+  assert.equal(canonicalizeCombo('cmd+backtick'), 'cmd+`');
+  assert.equal(canonicalizeCombo('cmd+f2'), 'cmd+f2');
+  // 无修饰键 / 重复按键 / 未知键名 / 非字符串 → null
+  assert.equal(canonicalizeCombo('1'), null);
+  assert.equal(canonicalizeCombo(''), null);
+  assert.equal(canonicalizeCombo('cmd+'), null);
+  assert.equal(canonicalizeCombo('cmd++'), null);
+  assert.equal(canonicalizeCombo('cmd+1+2'), null);
+  assert.equal(canonicalizeCombo('cmd+wat'), null);
+  assert.equal(canonicalizeCombo(null), null);
+  assert.equal(canonicalizeCombo(42), null);
+});
+
+test('normalizeShortcutMap 只保留合法条目并归一化键名', () => {
+  assert.deepEqual(
+    normalizeShortcutMap({ 'cmd+esc': 'workbench.action.x', 'CMD+1': 'workbench.action.y', 'ctrl+shift+f': 'workbench.action.z' }),
+    { 'cmd+escape': 'workbench.action.x', 'cmd+1': 'workbench.action.y', 'ctrl+shift+f': 'workbench.action.z' },
+  );
+  // 非法条目（无修饰键、空命令、非字符串值、非对象）一律丢弃
+  assert.deepEqual(normalizeShortcutMap({ 'cmd+1': '', '1': 'x', 'cmd+wat': 'y', 42: 'z' }), {});
+  assert.deepEqual(normalizeShortcutMap(null), {});
+  assert.deepEqual(normalizeShortcutMap('x'), {});
+  assert.deepEqual(normalizeShortcutMap([1, 2]), {});
+});
+
+test('buildShortcutMessage 构造转发消息', () => {
+  assert.deepEqual(buildShortcutMessage('cmd+1', '1', 'Digit1'), { kind: 'shortcut', combo: 'cmd+1', key: '1', code: 'Digit1' });
+  assert.deepEqual(buildShortcutMessage('cmd+escape'), { kind: 'shortcut', combo: 'cmd+escape', key: '', code: '' });
 });

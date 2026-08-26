@@ -2,7 +2,7 @@
   "name": "dsh-vscode-panel",
   "displayName": "DSH",
   "description": "在 VS Code 侧边栏中使用 DeepSeek Harness（DSH）网页界面",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "publisher": "Fengze233",
   "icon": "assets/icon.png",
   "license": "MIT",
@@ -255,6 +255,23 @@
           "type": "boolean",
           "default": true,
           "markdownDescription": "%dsh.config.imageFallback%"
+        },
+        "dsh.bridge.shortcuts": {
+          "type": "object",
+          "default": {
+            "cmd+1": "workbench.action.toggleAuxiliaryBar",
+            "cmd+2": "workbench.action.togglePanel",
+            "cmd+3": "workbench.action.toggleSidebarVisibility",
+            "cmd+escape": "workbench.action.toggleMaximizedPanel",
+            "ctrl+1": "workbench.action.toggleAuxiliaryBar",
+            "ctrl+2": "workbench.action.togglePanel",
+            "ctrl+3": "workbench.action.toggleSidebarVisibility",
+            "ctrl+escape": "workbench.action.toggleMaximizedPanel"
+          },
+          "additionalProperties": {
+            "type": "string"
+          },
+          "markdownDescription": "%dsh.config.bridgeShortcuts%"
         }
       }
     }

@@ -509,3 +509,81 @@ test('issue #6：Cmd+Z 撤销 / Cmd+Shift+Z 重做（原生 execCommand 失效�
     rmSync(b.outDir, { recursive: true, force: true });
   }
 });
+
+test('v0.3.2 桥接快捷键：命中映射的组合键转发给扩展宿主，未命中放行', async () => {
+  const fakeRealFetch = async (_input: unknown, _init: any) => jsonResponse(ACCEPT_BODY);
+  const b = loadBridge({ fetch: fakeRealFetch });
+  try {
+    b.apply();
+    // 握手携带快捷键映射（combo → commandId，扩展侧生成）
+    b.emitWin('message', {
+      kind: 'bridgeHello',
+      token: 'tok',
+      imageFallback: true,
+      shortcuts: {
+        'cmd+1': 'workbench.action.toggleAuxiliaryBar',
+        'cmd+escape': 'workbench.action.toggleMaximizedPanel',
+      },
+    });
+    const started = b.parentMessages.length;
+    const keydown = (k: any) => b.windowListeners.get('keydown')?.forEach((fn) => fn(k));
+    const ev = (over: any) => ({
+      key: '', code: '', metaKey: false, ctrlKey: false, altKey: false, shiftKey: false, repeat: false,
+      preventDefault() {}, stopPropagation() {}, ...over,
+    });
+    const shortcutMsgs = () => b.parentMessages.slice(started).filter((m) => m.kind === 'shortcut');
+
+    // ① 命中映射：转发 shortcut 消息并 preventDefault
+    const e1 = ev({ key: '1', code: 'Digit1', metaKey: true });
+    keydown(e1);
+    assert.equal(shortcutMsgs().length, 1, '命中映射应转发一条 shortcut');
+    assert.equal(shortcutMsgs()[0].combo, 'cmd+1');
+    assert.equal(shortcutMsgs()[0].code, 'Digit1');
+
+    // ② Cmd+Esc（带修饰键的 Esc）同样命中映射
+    const e2 = ev({ key: 'Escape', code: 'Escape', metaKey: true });
+    keydown(e2);
+    assert.equal(shortcutMsgs().length, 2);
+    assert.equal(shortcutMsgs()[1].combo, 'cmd+escape');
+
+    // ③ 未命中映射的组合键：不转发、不 preventDefault（放行给 DSH 页面自身）
+    let prevented = 0;
+    const e3 = ev({ key: '2', code: 'Digit2', metaKey: true, preventDefault() { prevented += 1; } });
+    keydown(e3);
+    assert.equal(shortcutMsgs().length, 2, '未命中不应转发');
+    assert.equal(prevented, 0, '未命中不应 preventDefault');
+
+    // ④ 自动重复（按住不放）不转发，避免 toggle 类命令来回横跳
+    const e4 = ev({ key: '1', code: 'Digit1', metaKey: true, repeat: true });
+    keydown(e4);
+    assert.equal(shortcutMsgs().length, 2, 'repeat 事件不应转发');
+
+    // ⑤ 编辑类快捷键（Cmd+Z）仍走本地仿真，不产生 shortcut 消息
+    keydown({ key: 'z', metaKey: true, ctrlKey: false, shiftKey: false, preventDefault() {}, stopPropagation() {} });
+    assert.equal(shortcutMsgs().length, 2, '编辑类快捷键不应进入转发');
+
+    // ⑥ 无修饰键的 Esc 不转发（仅收起自定义菜单，放行给页面）
+    const e6 = ev({ key: 'Escape', code: 'Escape' });
+    keydown(e6);
+    assert.equal(shortcutMsgs().length, 2, '无修饰键 Esc 不应转发');
+  } finally {
+    rmSync(b.outDir, { recursive: true, force: true });
+  }
+});
+
+test('v0.3.2 握手未携带 shortcuts 时：组合键一律放行（向后兼容）', async () => {
+  const fakeRealFetch = async (_input: unknown, _init: any) => jsonResponse(ACCEPT_BODY);
+  const b = loadBridge({ fetch: fakeRealFetch });
+  try {
+    b.apply();
+    // 旧版握手（无 shortcuts 字段）：cmd+1 不应被拦截
+    b.emitWin('message', { kind: 'bridgeHello', token: 'tok', imageFallback: true });
+    const started = b.parentMessages.length;
+    const keydown = (k: any) => b.windowListeners.get('keydown')?.forEach((fn) => fn(k));
+    const e = { key: '1', code: 'Digit1', metaKey: true, preventDefault() {}, stopPropagation() {} };
+    keydown(e);
+    assert.equal(b.parentMessages.slice(started).filter((m) => m.kind === 'shortcut').length, 0, '无映射不应转发');
+  } finally {
+    rmSync(b.outDir, { recursive: true, force: true });
+  }
+});

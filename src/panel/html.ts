@@ -23,7 +23,8 @@ export type PanelMessage =
   | { type: 'bridgeSaveImage'; requestId: string; name: string; dataB64: string; sessionCwd?: string }
   | { type: 'bridgeSaveImageAck'; requestId: string; ok: boolean; path?: string }
   | { type: 'bridgeDeleteImages'; requestId: string; paths: string[] }
-  | { type: 'bridgeDeleteImagesAck'; requestId: string; ok: boolean };
+  | { type: 'bridgeDeleteImagesAck'; requestId: string; ok: boolean }
+  | { type: 'bridgeShortcut'; combo: string; key?: string; code?: string };
 
 /** 渲染上下文 */
 export interface PageCtx {
@@ -79,8 +80,18 @@ document.addEventListener('click', (e) => {
  * 安全约束：上行仅接收「目标 origin」且「source 为 iframe 内容窗口」的消息，防止其它站点伪造。
  * @param token 握手防伪凭据（与桥接侧 isBridgeMessage 校验的一致）
  * @param allowedOrigin 允许的消息来源 origin（由 DSH 页面地址推导，如 http://127.0.0.1:3080）
+ * @param imageFallback 非视觉模型图片降级开关（随 hello 下发）
+ * @param shortcuts 桥接快捷键映射（v0.3.2：组合键 → VS Code 命令 id，随 hello 下发供 iframe 拦截）
  */
-function bridgeHandshakeScript(token: string, allowedOrigin: string, imageFallback: boolean): string {
+function bridgeHandshakeScript(
+  token: string,
+  allowedOrigin: string,
+  imageFallback: boolean,
+  shortcuts: Record<string, string>,
+): string {
+  // 快捷键映射含反引号键（'cmd+`'）：JSON 内嵌进外层模板字符串会提前终止模板字面量，
+  // 因此把反引号与 ${ 转义为 \uXXXX 序列（浏览器解析后还原，语义不变）
+  const shortcutsJson = JSON.stringify(shortcuts).replaceAll('`', '\\u0060').replaceAll('${', '\\u0024{');
   return `
 // dsh-bridge-handshake：DSH 页面桥接握手与消息路由（上行转发 + 剪贴板回执下行转发）
 const iframeEl = document.getElementById('dsh-frame');
@@ -90,6 +101,7 @@ if (iframeEl) {
   const TOKEN = ${JSON.stringify(token)};
   const ALLOWED_ORIGIN = ${JSON.stringify(allowedOrigin)};
   const IMAGE_FALLBACK = ${JSON.stringify(imageFallback)}; // v0.3.0：非视觉模型图片降级开关
+  const SHORTCUTS = ${shortcutsJson}; // v0.3.2：桥接快捷键映射（组合键 → VS Code 命令 id）
   let bridgeAcked = false;
   window.addEventListener('message', (e) => {
     const d = e.data;
@@ -166,6 +178,17 @@ if (iframeEl) {
     // 读取剪贴板：转发给扩展 → vscode.env.clipboard.readText（Cmd+V 粘贴兜底）
     if (d && d.kind === 'readText' && typeof d.requestId === 'string') {
       vscode.postMessage({ type: 'bridgeReadText', requestId: d.requestId });
+      return;
+    }
+    // 快捷键：转发给扩展 → 按 dsh.bridge.shortcuts 映射执行 VS Code 命令
+    // （VS Code 吞掉 iframe 内 Cmd+1/Cmd+Esc/Cmd+反引号 等组合键的修复，v0.3.2）
+    if (d && d.kind === 'shortcut' && typeof d.combo === 'string') {
+      vscode.postMessage({
+        type: 'bridgeShortcut',
+        combo: d.combo,
+        ...(typeof d.key === 'string' ? { key: d.key } : {}),
+        ...(typeof d.code === 'string' ? { code: d.code } : {}),
+      });
     }
   });
   // iframe 加载完成后下发握手消息（携带 token）。
@@ -175,7 +198,7 @@ if (iframeEl) {
     let helloAttempts = 0;
     const sendHello = () => {
       if (!bridgeAcked && iframeEl.contentWindow) {
-        iframeEl.contentWindow.postMessage({ kind: 'bridgeHello', token: TOKEN, imageFallback: IMAGE_FALLBACK }, iframeSrc);
+        iframeEl.contentWindow.postMessage({ kind: 'bridgeHello', token: TOKEN, imageFallback: IMAGE_FALLBACK, shortcuts: SHORTCUTS }, iframeSrc);
       }
     };
     sendHello();
@@ -276,10 +299,15 @@ export function stoppedPage(t: T, ctx: PageCtx): string {
  * 桥接启用时注入握手脚本，让顶层 webview 与 DSH 页面 iframe 建立握手并转发跳转/剪贴板消息。
  * @param bridge 桥接配置（可选，向后兼容既有调用）：token 为握手凭据，enabled 为是否注入握手脚本
  */
-export function readyPage(url: string, ctx: PageCtx, bridge?: { token: string; enabled: boolean; imageFallback?: boolean }): string {
+export function readyPage(url: string, ctx: PageCtx, bridge?: { token: string; enabled: boolean; imageFallback?: boolean; shortcuts?: Record<string, string> }): string {
   // 桥接启用时注入握手脚本；未传入或 enabled=false 时保持向后兼容，不注入
   const extraScripts = bridge?.enabled
-    ? `<script nonce="${ctx.nonce}">${bridgeHandshakeScript(bridge.token, new URL(url).origin, bridge.imageFallback === true)}</script>`
+    ? `<script nonce="${ctx.nonce}">${bridgeHandshakeScript(
+        bridge.token,
+        new URL(url).origin,
+        bridge.imageFallback === true,
+        bridge.shortcuts ?? {},
+      )}</script>`
     : '';
   return shell(
     ctx,

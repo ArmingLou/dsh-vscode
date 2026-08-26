@@ -116,3 +116,21 @@ test('readyPage 握手脚本携带 imageFallback 开关（v0.3.0）', () => {
   assert.ok(html2.includes('IMAGE_FALLBACK = false'));
 });
 
+test('readyPage 握手脚本携带快捷键映射并转发 shortcut 上行消息（v0.3.2）', () => {
+  const html = readyPage('http://127.0.0.1:3080/', ctx(), {
+    token: 'tok123',
+    enabled: true,
+    shortcuts: { 'cmd+1': 'workbench.action.toggleAuxiliaryBar' },
+  });
+  // 映射随 hello 下发：iframe 据此决定拦截哪些组合键
+  assert.ok(html.includes('SHORTCUTS'), '脚本应定义 SHORTCUTS');
+  assert.ok(html.includes('cmd+1'), 'hello 消息应携带快捷键映射');
+  assert.ok(html.includes('shortcuts: SHORTCUTS'), 'hello 消息应携带 shortcuts 字段');
+  // 上行：iframe 的 shortcut → vscode.postMessage(bridgeShortcut)
+  assert.ok(html.includes("kind === 'shortcut'"), '应转发 iframe 的 shortcut 上行消息');
+  assert.ok(html.includes("type: 'bridgeShortcut'"), '应向扩展宿主发送 bridgeShortcut');
+  // 未配置映射时为空对象（向后兼容）
+  const html2 = readyPage('http://127.0.0.1:3080/', ctx(), { token: 'tok123', enabled: true });
+  assert.ok(html2.includes('SHORTCUTS = {}'));
+});
+

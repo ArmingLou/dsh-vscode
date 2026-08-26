@@ -23,8 +23,24 @@ window.__ModuleLoader__.load({
     console.log("[dsh-vscode-bridge] client.js executed");
     // —— 握手状态 ——
     let bridgeToken = ""; // 父页面下发的握手 token；未握手前为空，不激活任何拦截
+
+    // —— 桥接快捷键映射（v0.3.2）：握手时随 bridgeHello 下发 { 组合键: VS Code 命令 id } ——
+    // 背景：VS Code 只把快捷键转发给顶层 webview，嵌套 iframe 内的 Cmd+1 / Cmd+Esc / Cmd+` 等
+    // 组合键全部被吞掉（与 Cmd+C/V 同源问题）。扩展侧按 dsh.bridge.shortcuts 配置生成该映射，
+    // 页面侧只读「键集合」决定拦截哪些组合键：命中 → 转发扩展宿主执行对应 VS Code 命令；
+    // 未命中 → 放行给 DSH 页面自身（不干涉页面自己的快捷键）。
+    let bridgeShortcuts = {};
+
+    function hasShortcut(combo) {
+      return (
+        bridgeShortcuts !== null &&
+        typeof bridgeShortcuts === "object" &&
+        Object.prototype.hasOwnProperty.call(bridgeShortcuts, combo)
+      );
+    }
+
     // 桥接包版本（与插件版本统一，随包发布；安装器按「版本不一致或 client.js 内容不一致」强制重装）
-    const BRIDGE_VERSION = "0.3.1";
+    const BRIDGE_VERSION = "0.3.2";
 
     // —— 剪贴板写桥接：VS Code webview 对跨源 iframe 的 navigator.clipboard.writeText 有权限拦截 ——
     // 背景：即使 iframe 声明 allow="clipboard-write"，VS Code（Electron）仍会拒绝写入
@@ -459,22 +475,35 @@ window.__ModuleLoader__.load({
       }, true); // 捕获阶段：先于 DSH 自身处理器
     }
 
-    // —— keydown 拦截：仿真标准编辑快捷键（VS Code 吞掉 Cmd+C/V/A/X/Z 的修复） ——
+    // —— keydown 拦截：标准编辑快捷键本地仿真 + 桥接快捷键转发（VS Code 吞掉 iframe 内快捷键的修复） ——
     function onKeyDown(e) {
-      // Esc 仅用于收起自定义右键菜单，任何状态下都响应
-      if (e.key === "Escape") {
+      // 无修饰键的 Esc 仅用于收起自定义右键菜单，任何状态下都响应；
+      // 不 preventDefault：把 Esc 继续交给 DSH 页面自身处理（如关闭弹窗）。
+      // 注意：Cmd+Esc 等带修饰键的 Esc 不在此列（v0.3.2 起可经快捷键映射转发给扩展宿主）。
+      if (e.key === "Escape" && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey) {
         hideMenu();
-        // 不 preventDefault：把 Esc 继续交给 DSH 页面自身处理（如关闭弹窗）
         return;
       }
       if (bridgeToken === "") return; // 未握手（普通浏览器）不干涉原生行为
+      // ① 标准编辑命令（Cmd/Ctrl+C/V/A/X/Z、Shift+Insert）：本地仿真（execCommand + 剪贴板桥接兜底）
       const cmd = getShortcutCommand(e);
-      if (!cmd) return;
-      // 捕获阶段拦截：阻止事件继续传播，避免 DSH 自身处理器或 VS Code 二次处理产生冲突
-      e.preventDefault();
-      e.stopPropagation();
-      hideMenu();
-      void handleEditCommand(cmd);
+      if (cmd) {
+        // 捕获阶段拦截：阻止事件继续传播，避免 DSH 自身处理器或 VS Code 二次处理产生冲突
+        e.preventDefault();
+        e.stopPropagation();
+        hideMenu();
+        void handleEditCommand(cmd);
+        return;
+      }
+      // ② 桥接快捷键映射（dsh.bridge.shortcuts）：命中 → 转发扩展宿主执行对应 VS Code 命令。
+      //    自动重复（按住不放）不转发，避免 toggle 类命令来回横跳；未命中的组合放行给页面。
+      const combo = getShortcutCombo(e);
+      if (combo !== null && e.repeat !== true && hasShortcut(combo)) {
+        e.preventDefault();
+        e.stopPropagation();
+        hideMenu();
+        parent.postMessage(buildShortcutMessage(combo, e.key || "", e.code || ""), "*");
+      }
     }
 
     // —— contextmenu 拦截：弹出自定义右键菜单（VS Code 不向 iframe 弹原生菜单） ——
@@ -493,8 +522,10 @@ window.__ModuleLoader__.load({
       if (d.kind === "bridgeHello" && typeof d.token === "string" && d.token !== "") {
         bridgeToken = d.token;
         imageFallbackEnabled = d.imageFallback === true; // v0.3.0：非视觉模型图片降级开关（随 hello 下发）
+        // v0.3.2：快捷键桥接映射随 hello 下发（{ 组合键: 命令 id }），决定 keydown 拦截哪些组合键
+        if (d.shortcuts && typeof d.shortcuts === "object") bridgeShortcuts = d.shortcuts;
         // 诊断日志：页面可据此确认握手成功与降级开关状态（排查“图片上传不生效”用）
-        console.log("[dsh-vscode-bridge] handshake ok, v" + BRIDGE_VERSION + ", imageFallback=" + imageFallbackEnabled);
+        console.log("[dsh-vscode-bridge] handshake ok, v" + BRIDGE_VERSION + ", imageFallback=" + imageFallbackEnabled + ", shortcuts=" + Object.keys(bridgeShortcuts).length);
         // 附件图片捕获已由工厂期常驻绑定（bindImageCapture），此处仅刷新开关即可生效
         // 回执统一用 core.js 的 buildSyncWorkspaceAck 构造，形状与工作区同步回执一致
         // （{ kind: 'bridgeAck', ok }，不带 token 字段）；顶层 webview 靠 origin + source

@@ -146,7 +146,7 @@ export function activate(context: vscode.ExtensionContext): void {
   appendLog(
     `配置: host=${config.host} port=${config.port} autoStart=${config.autoStart} stopOnExit=${config.stopOnExit} ` +
     `bridgeEnabled=${config.bridgeEnabled} extraArgs=${JSON.stringify(config.extraArgs)} ` +
-    `executablePath=${config.executablePath || '(空)'}`,
+    `executablePath=${config.executablePath || '(空)'} shortcutMappings=${Object.keys(config.shortcuts).length}`,
   );
   appendLog(`工作区: ${vscode.workspace.workspaceFolders?.map((f) => f.uri.fsPath).join(', ') || '(无)'}`);
   appendLog('=============================');
@@ -319,6 +319,10 @@ export function activate(context: vscode.ExtensionContext): void {
   const remoteEnabledGetter = (): boolean => readConfig().config.remoteEnabled;
   // 图片降级 getter：dsh.image.fallback 驱动桥接客户端「非视觉模型自动降级」行为
   const imageFallbackGetter = (): boolean => readConfig().config.imageFallback;
+  // 快捷键映射 getter：dsh.bridge.shortcuts（含默认映射）随握手消息带给桥接客户端
+  const shortcutsGetter = (): Record<string, string> => readConfig().config.shortcuts;
+  // 上次渲染用快捷键映射（配置变更时对比，决定是否重渲染面板让 iframe 重新握手）
+  let lastShortcuts: Record<string, string> = config.shortcuts;
   // URL 解析器：远程窗口经 vscode.env.asExternalUri 建立端口隧道，返回本地可达 URL；本地原样返回
   const resolveExternalUrl = createUrlResolver({
     asExternalUri: async (uri) => await vscode.env.asExternalUri(vscode.Uri.parse(uri.toString())),
@@ -337,6 +341,7 @@ export function activate(context: vscode.ExtensionContext): void {
     remoteEnabledGetter, // remoteEnabled：dsh.remote.enabled 驱动远程隧道（开启后才接线）
     resolveExternalUrl, // resolveExternalUrl：远程窗口的 URL 隧道解析
     imageFallbackGetter, // imageFallback：dsh.image.fallback 驱动图片降级
+    shortcutsGetter, // shortcuts：dsh.bridge.shortcuts 驱动 iframe 内快捷键转发
   );
   const panelSecondary = new DshPanelProvider(
     manager,
@@ -347,6 +352,7 @@ export function activate(context: vscode.ExtensionContext): void {
     remoteEnabledGetter,
     resolveExternalUrl,
     imageFallbackGetter,
+    shortcutsGetter,
   );
   // 复制网址命令读取主面板的展示 URL（远程=隧道本地 URL）
   getDisplayUrl = () => panelPrimary.getDisplayUrl();
@@ -380,7 +386,16 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('dsh.bridge.uninstall', () => void uninstallBridgeCmd()),
     vscode.commands.registerCommand('dsh.cleanupImageCache', () => void cleanupImageCacheCmd()),
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration('dsh')) onConfigChanged();
+      if (e.affectsConfiguration('dsh')) {
+        onConfigChanged();
+        // 快捷键映射变化：重渲染两个面板 → 握手脚本把新映射带给 iframe（iframe 随重渲染重载并重新握手）
+        const { config } = readConfig();
+        if (JSON.stringify(config.shortcuts) !== JSON.stringify(lastShortcuts)) {
+          lastShortcuts = config.shortcuts;
+          panelPrimary.refresh();
+          panelSecondary.refresh();
+        }
+      }
     }),
     { dispose: () => manager?.dispose() },
   );
@@ -474,7 +489,7 @@ async function cleanupImageCacheCmd(): Promise<void> {
   void vscode.window.showInformationMessage(t('msg.imageCacheCleaned', { count: removed }));
 }
 
-/** 配置变更：host/port 变化时自动重启自启服务，退出策略实时生效 */
+/** 配置变更：host/port 变化时自动重启自启服务，退出策略实时生效（快捷键映射的重渲染见 activate 内订阅） */
 function onConfigChanged(): void {
   const m = manager;
   if (!m) return;

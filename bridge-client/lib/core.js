@@ -96,6 +96,152 @@ export function getShortcutCommand(e) {
   }
 }
 
+// —— 桥接快捷键转发（v0.3.2）：把 iframe 内被 VS Code 吞掉的任意组合键转发给扩展宿主执行 ——
+// 背景：VS Code 只把快捷键转发给顶层 webview，嵌套 iframe（本桥接所在的 DSH 页面）内的
+// 组合键（Cmd+1、Cmd+Esc、Cmd+` 等）全部被吞掉；但 iframe 的 keydown 仍可达，因此这里
+// 把「按键事件 → 规范组合键字符串」抽成纯函数，由 client.js 在捕获阶段判定、命中扩展侧
+// 配置的映射（dsh.bridge.shortcuts）后转发给父页面 → 扩展宿主 → vscode.commands.executeCommand。
+// 规范写法（与 VS Code keybinding 语法相近）：修饰键 cmd/ctrl/alt/shift + '+' + 按键名。
+
+/** 修饰键别名（canonicalizeCombo 归一化用） */
+const SHORTCUT_MODIFIER_ALIASES = { meta: 'cmd', control: 'ctrl', option: 'alt' };
+/** 按键别名（canonicalizeCombo 归一化用；与 getShortcutCombo 产出的规范名一致） */
+const SHORTCUT_KEY_ALIASES = {
+  esc: 'escape',
+  backtick: '`',
+  backquote: '`',
+  return: 'enter',
+  arrowup: 'up',
+  arrowdown: 'down',
+  arrowleft: 'left',
+  arrowright: 'right',
+};
+/** 具名按键白名单（canonicalizeCombo 校验用） */
+const SHORTCUT_NAMED_KEYS = new Set([
+  'escape', 'enter', 'tab', 'space', 'backspace', 'delete', 'insert', 'home', 'end',
+  'pageup', 'pagedown', 'capslock', 'up', 'down', 'left', 'right',
+]);
+/** 修饰键规范顺序（输出固定：cmd/ctrl/alt/shift，便于与配置键比对） */
+const SHORTCUT_MOD_ORDER = ['cmd', 'ctrl', 'alt', 'shift'];
+
+/**
+ * 把键盘事件归一为「规范组合键字符串」（如 'cmd+1'、'ctrl+shift+f'、'cmd+`'）。
+ *
+ * 按键名优先取 e.code（布局无关：中文输入法下 ⌘+` 的 key 可能是 '·' 但 code 恒为
+ * 'Backquote'）；无 code（测试桩/旧浏览器）时回退 e.key 小写。
+ * 无任何修饰键的按键返回 null（普通输入/页面自身快捷键，不参与转发）。
+ *
+ * @param {{ key?: string, code?: string, metaKey?: boolean, ctrlKey?: boolean, altKey?: boolean, shiftKey?: boolean }} e
+ * @returns {null | string} 规范组合键；无修饰键或输入非法返回 null
+ */
+export function getShortcutCombo(e) {
+  if (!e || typeof e !== 'object') return null;
+  const mods = [];
+  if (e.metaKey === true) mods.push('cmd');
+  if (e.ctrlKey === true) mods.push('ctrl');
+  if (e.altKey === true) mods.push('alt');
+  if (e.shiftKey === true) mods.push('shift');
+  if (mods.length === 0) return null; // 无修饰键：普通按键，不转发
+  const key = shortcutKeyName(e);
+  if (key === null) return null;
+  return mods.join('+') + '+' + key;
+}
+
+/** 按键 → 规范按键名（e.code 优先，布局无关；无 code 回退 e.key） */
+function shortcutKeyName(e) {
+  const code = typeof e.code === 'string' ? e.code : '';
+  if (code !== '') {
+    const letter = /^Key([A-Z])$/.exec(code);
+    if (letter) return letter[1].toLowerCase();
+    const digit = /^Digit([0-9])$/.exec(code);
+    if (digit) return digit[1];
+    const fn = /^F([1-9]|1[0-9]|2[0-4])$/.exec(code);
+    if (fn) return 'f' + fn[1];
+    const byCode = {
+      Backquote: '`', Escape: 'escape', Enter: 'enter', Tab: 'tab', Space: 'space',
+      Backspace: 'backspace', Delete: 'delete', Insert: 'insert', Home: 'home', End: 'end',
+      PageUp: 'pageup', PageDown: 'pagedown', ArrowLeft: 'left', ArrowRight: 'right',
+      ArrowUp: 'up', ArrowDown: 'down', Minus: '-', Equal: '=', BracketLeft: '[',
+      BracketRight: ']', Backslash: '\\', Semicolon: ';', Quote: "'", Comma: ',',
+      Period: '.', Slash: '/',
+    };
+    if (Object.prototype.hasOwnProperty.call(byCode, code)) return byCode[code];
+    return code.toLowerCase(); // 其它 code（Numpad 等）按小写原样
+  }
+  const key = typeof e.key === 'string' && e.key !== '' ? e.key : '';
+  if (key === '') return null;
+  return key.toLowerCase();
+}
+
+/**
+ * 把用户配置的组合键写法归一为规范形式（'CMD + Esc' → 'cmd+escape'）。
+ * 规则：+ 分隔、去空格、小写、修饰键/按键别名归一；必须含 ≥1 个修饰键且恰好 1 个按键。
+ * 非法输入（无修饰键、多余按键、未知键名、非字符串）返回 null，调用方应丢弃该条目。
+ */
+export function canonicalizeCombo(s) {
+  if (typeof s !== 'string') return null;
+  const parts = s.split('+').map((p) => p.trim().toLowerCase()).filter((p) => p !== '');
+  if (parts.length < 2) return null; // 至少一个修饰键 + 一个按键
+  const mods = [];
+  let key = null;
+  for (const p of parts) {
+    if (p === 'cmd' || p === 'ctrl' || p === 'alt' || p === 'shift') {
+      mods.push(p);
+      continue;
+    }
+    if (Object.prototype.hasOwnProperty.call(SHORTCUT_MODIFIER_ALIASES, p)) {
+      mods.push(SHORTCUT_MODIFIER_ALIASES[p]);
+      continue;
+    }
+    if (key !== null) return null; // 出现第二个按键：非法
+    if (p.length === 1 && p !== '+') {
+      key = p; // 单字符按键（字母/数字/标点）
+      continue;
+    }
+    if (Object.prototype.hasOwnProperty.call(SHORTCUT_KEY_ALIASES, p)) {
+      key = SHORTCUT_KEY_ALIASES[p];
+      continue;
+    }
+    if (SHORTCUT_NAMED_KEYS.has(p)) {
+      key = p;
+      continue;
+    }
+    if (/^f([1-9]|1[0-9]|2[0-4])$/.test(p)) {
+      key = p;
+      continue;
+    }
+    return null; // 未知按键名
+  }
+  if (mods.length === 0 || key === null) return null;
+  const ordered = SHORTCUT_MOD_ORDER.filter((m) => mods.includes(m)); // 去重 + 固定顺序
+  return ordered.join('+') + '+' + key;
+}
+
+/**
+ * 规范化快捷键映射对象：{ 组合键写法: VS Code 命令 id } → { 规范组合键: 命令 id }。
+ * 非法组合键 / 非字符串命令被丢弃；非对象输入返回空对象（调用方决定回退默认）。
+ */
+export function normalizeShortcutMap(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const out = {};
+  for (const [k, v] of Object.entries(raw)) {
+    const combo = canonicalizeCombo(k);
+    if (combo === null || typeof v !== 'string' || v.trim() === '') continue;
+    out[combo] = v.trim();
+  }
+  return out;
+}
+
+/** 构造「快捷键」上行消息（iframe 页面 → 父页面 → 扩展宿主执行 VS Code 命令） */
+export function buildShortcutMessage(combo, key, code) {
+  return {
+    kind: 'shortcut',
+    combo,
+    key: typeof key === 'string' ? key : '',
+    code: typeof code === 'string' ? code : '',
+  };
+}
+
 /**
  * 判定一个元素是否为"可编辑元素"（可接收粘贴/剪切/打字的目标）。
  *

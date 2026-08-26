@@ -98,6 +98,7 @@ npm run package        # 产出 dsh-vscode.vsix，再按方式二安装
 - 📂 **文件跳转**：点击面板内的文件路径，在 VS Code 中打开对应文件；
 - 📋 **剪贴板复制**：面板内 DSH 的复制按钮（如代码块复制）改由扩展宿主写入系统剪贴板，绕开 VS Code 对 webview 内跨源 iframe 的剪贴板权限拦截。
 - ↩️ **撤销/重做（macOS Cmd+Z / Cmd+Shift+Z，Windows Ctrl+Z / Ctrl+Y）**：VS Code 会吞掉嵌套 iframe 内的标准快捷键；且 DSH 输入框为 React 受控组件、其原生撤销栈为空，`execCommand('undo')` 会失效。桥接在握手后为输入框维护**手动撤销/重做栈**（连续输入按 400ms 归组为一条记录），原生撤销可用时优先原生、失败时手动兜底——修复 issue #6「无法 Cmd+Z 撤销」。
+- ⌨️ **任意快捷键转发（v0.3.2）**：面板内被 VS Code 吞掉的组合键（如 `Cmd+1`、`Cmd+Esc`）按 `dsh.bridge.shortcuts` 映射转发给扩展宿主执行对应 VS Code 命令。默认内置 `Cmd+1/2/3`（切换辅助栏/面板/侧边栏，与作者 keybindings 一致）、`Cmd+Esc`（最大化面板）；可在设置里自由覆盖或新增任意组合键（如 `"alt+1": "workbench.view.explorer"`、`"cmd+`": "workbench.action.terminal.toggleTerminal"`）；编辑类快捷键（Cmd/Ctrl+C/V/A/X/Z）仍由页面内本地仿真优先。
 
 ### 安装与卸载机制（透明披露）
 
@@ -119,6 +120,7 @@ npm run package        # 产出 dsh-vscode.vsix，再按方式二安装
 | `dsh.bridge.enabled` | `true` | 是否启用桥接（关闭后不安装、不注入、不弹警告，三项联动不可用） |
 | `dsh.workspaceRootIndex` | `0` | 多根工作区时，用第几个根目录作为 `dsh web` 进程工作目录（越界回退第一个） |
 | `dsh.bridge.silenceWarning` | `false` | 抑制桥接降级警告（例如在面板之外打开 DSH 页面时） |
+| `dsh.bridge.shortcuts` | 见右 | 快捷键转发映射 `{ 组合键: VS Code 命令 }`（v0.3.2）。键写法：修饰键 `cmd`/`ctrl`/`alt`/`shift` + 按键（`a`-`z`、`0`-`9`、`` ` ``、`escape`、`f1`-`f24` 等），如 `"cmd+1"`；覆盖默认并支持新增任意组合，修改后面板自动重渲染生效 |
 
 ### 降级行为
 

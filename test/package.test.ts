@@ -54,6 +54,21 @@ test('v0.3.0 设置项：remote.enabled 默认 false、image.fallback 默认 tru
   assert.equal(props['dsh.openInBrowser'].default, false);
 });
 
+test('v0.3.2 设置项：bridge.shortcuts 默认包含用户要求的组合键', () => {
+  const p = pkg();
+  const prop = p.contributes.configuration.properties['dsh.bridge.shortcuts'];
+  assert.ok(prop, '存在 dsh.bridge.shortcuts 设置');
+  assert.equal(prop.type, 'object');
+  assert.ok(prop.additionalProperties && prop.additionalProperties.type === 'string', '值为 VS Code 命令 id 字符串');
+  const def = prop.default;
+  assert.equal(def['cmd+1'], 'workbench.action.toggleAuxiliaryBar');
+  assert.equal(def['cmd+2'], 'workbench.action.togglePanel');
+  assert.equal(def['cmd+3'], 'workbench.action.toggleSidebarVisibility');
+  assert.equal(def['cmd+escape'], 'workbench.action.toggleMaximizedPanel');
+  assert.equal(def['cmd+`'], undefined, '反引号键未内置默认映射');
+  assert.equal(def['ctrl+1'], 'workbench.action.toggleAuxiliaryBar');
+});
+
 test('桥接版本与插件版本统一（一同随包发布），且卸载钩子自动清理桥接', () => {
   const p = pkg();
   // ① 卸载钩子：VS Code 卸载扩展时执行 node ./out/uninstall.js

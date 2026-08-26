@@ -40,6 +40,7 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
    * @param remoteEnabled 是否启用远程（SSH Remote 等）的 getter（v0.3.0，默认关闭）
    * @param resolveExternalUrl URL→本地可达 URL 解析器（远程走 asExternalUri 隧道；默认原样返回）
    * @param imageFallback 是否启用非视觉模型图片降级（v0.3.0，默认开）
+   * @param shortcuts 桥接快捷键映射 getter（v0.3.2：组合键 → VS Code 命令 id，随握手下发 iframe）
    */
   constructor(
     private manager: ServiceManager,
@@ -50,6 +51,7 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
     private remoteEnabled: () => boolean = () => false,
     private resolveExternalUrl: (url: string) => Promise<string> = async (u) => u,
     private imageFallback: () => boolean = () => true,
+    private shortcuts: () => Record<string, string> = () => ({}),
   ) {
     // 订阅状态变化，重绘面板（iframe 与占位页由状态驱动，无白屏路径）
     manager.onChange(() => void this.handleStateChange());
@@ -134,7 +136,25 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
         // 握手回执：通知注入的回调（Task 7 据此评估桥接状态；version 供日志确认桥接代码版本）
         this.onBridgeAck?.(msg.ok, msg.version);
         break;
+      case 'bridgeShortcut': {
+        // 快捷键桥接（v0.3.2）：iframe 内命中的组合键 → 按 dsh.bridge.shortcuts 映射执行 VS Code 命令。
+        // 命令 id 只来自本扩展配置（绝不接受页面侧直传命令），未知命令仅记日志不打断操作。
+        const cmd = this.shortcuts()[msg.combo];
+        if (typeof cmd === 'string' && cmd !== '') {
+          void vscode.commands.executeCommand(cmd).then(undefined, (err) => {
+            console.warn(`[dsh] shortcut ${msg.combo} -> command ${cmd} failed: ${String(err)}`);
+          });
+        } else {
+          console.warn(`[dsh] shortcut ${msg.combo} has no mapping`);
+        }
+        break;
+      }
     }
+  }
+
+  /** 配置变更后重渲染（快捷键映射变化时由入口调用；iframe 随重渲染重载并重新握手） */
+  refresh(): void {
+    this.render();
   }
 
   /** 桥接落盘/删除依赖：图片缓存写文件/删文件（node:fs/promises）与回执投递（webview.postMessage） */
@@ -254,6 +274,7 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
               token: this.bridgeToken,
               enabled: this.bridgeEnabled(), // 由 dsh.bridge.enabled 配置驱动（Task 7 接入）
               imageFallback: this.imageFallback(), // v0.3.0：降级开关随握手消息带给桥接客户端
+              shortcuts: this.shortcuts(), // v0.3.2：快捷键映射随握手消息带给桥接客户端（拦截哪些组合键）
             });
           }
           break;

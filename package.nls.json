@@ -21,6 +21,7 @@
   "dsh.config.bridgeEnabled": "Enable the DSH page bridge (external links and file jumps between the panel and DSH).",
   "dsh.config.workspaceRootIndex": "Which workspace root to use as the working directory for the auto-started `dsh web` (0-based; falls back to the first root when out of range).",
   "dsh.config.bridgeSilenceWarning": "Suppress bridge warnings (e.g. when a DSH page is open outside the panel).",
+  "dsh.config.bridgeShortcuts": "Forward key chords pressed inside the DSH panel (which VS Code swallows in nested iframes) to VS Code commands. Key syntax: modifiers `cmd`/`ctrl`/`alt`/`shift` + a key (`a`-`z`, `0`-`9`, `` ` ``, `escape`, `f1`-`f24`, ...), e.g. `\"cmd+1\"`. Entries override the defaults and extra combos can be added freely; changes re-render the panel automatically. Note: editing shortcuts (Cmd/Ctrl+C/V/A/X/Z) are simulated locally by the bridge and are not remappable.",
   "dsh.config.executablePath": "Absolute path to the dsh executable (dsh.cmd on Windows). Empty = look up on PATH.",
   "dsh.config.openInBrowser": "Open the DSH page in the default browser after the service starts (when off, \u0060--no-open\u0060 is passed to \u0060dsh web\u0060).",
   "dsh.config.remoteEnabled": "Enable remote scenarios (SSH Remote / WSL / Dev Containers / Codespaces): run dsh on the remote host and open the panel through a VS Code tunnel. Off by default; when off, remote windows show a guide instead of starting a remote service. Requires \u0060dsh\u0060 installed on the remote and a window reload after enabling.",

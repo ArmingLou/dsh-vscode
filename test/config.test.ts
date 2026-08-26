@@ -1,7 +1,7 @@
 // test/config.test.ts — 配置规范化与回环地址校验的单元测试
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeConfig, isLoopbackHost, DEFAULTS } from '../src/config';
+import { normalizeConfig, isLoopbackHost, DEFAULTS, DEFAULT_SHORTCUTS } from '../src/config';
 
 test('合法配置原样通过', () => {
   const { config, errors } = normalizeConfig({
@@ -11,7 +11,7 @@ test('合法配置原样通过', () => {
   assert.deepEqual(config, {
     host: 'localhost', port: 4000, autoStart: false, stopOnExit: false, extraArgs: ['--trusted-host', 'x:1'],
     bridgeEnabled: true, workspaceRootIndex: 0, silenceWarning: false, executablePath: '',
-    openInBrowser: false, remoteEnabled: false, imageFallback: true,
+    openInBrowser: false, remoteEnabled: false, imageFallback: true, shortcuts: DEFAULTS.shortcuts,
   });
 });
 
@@ -122,4 +122,43 @@ test('v0.3.0 新设置非布尔值回退默认（不记错误）', () => {
   assert.equal(r2.errors.length, 0);
   assert.equal(r3.errors.length, 0);
   assert.equal(r4.errors.length, 0);
+});
+
+// —— v0.3.2 快捷键映射设置：dsh.bridge.shortcuts ——
+test('v0.3.2 默认快捷键映射包含用户要求的组合键', () => {
+  assert.equal(DEFAULT_SHORTCUTS['cmd+1'], 'workbench.action.toggleAuxiliaryBar');
+  assert.equal(DEFAULT_SHORTCUTS['cmd+2'], 'workbench.action.togglePanel');
+  assert.equal(DEFAULT_SHORTCUTS['cmd+3'], 'workbench.action.toggleSidebarVisibility');
+  assert.equal(DEFAULT_SHORTCUTS['cmd+escape'], 'workbench.action.toggleMaximizedPanel');
+  // 反引号键未内置默认映射（需要时由用户配置）
+  assert.equal(DEFAULT_SHORTCUTS['cmd+`'], undefined);
+  // Windows/Linux 对应 Ctrl+ 前缀版本
+  assert.equal(DEFAULT_SHORTCUTS['ctrl+1'], 'workbench.action.toggleAuxiliaryBar');
+  assert.equal(DEFAULT_SHORTCUTS['ctrl+escape'], 'workbench.action.toggleMaximizedPanel');
+});
+
+test('v0.3.2 快捷键映射：用户条目覆盖默认并可新增', () => {
+  const { config, errors } = normalizeConfig({
+    shortcuts: { 'cmd+1': 'workbench.action.openEditorAtIndex1', 'alt+1': 'workbench.view.explorer' },
+  });
+  assert.deepEqual(errors, []);
+  assert.equal(config.shortcuts['cmd+1'], 'workbench.action.openEditorAtIndex1', '用户条目应覆盖默认');
+  assert.equal(config.shortcuts['alt+1'], 'workbench.view.explorer', '新组合键应被追加');
+  assert.equal(config.shortcuts['cmd+2'], DEFAULT_SHORTCUTS['cmd+2'], '未覆盖的默认应保留');
+});
+
+test('v0.3.2 快捷键映射：非法条目丢弃、全非法回退默认并记录错误', () => {
+  // 全非法：回退默认 + 记录错误
+  const r1 = normalizeConfig({ shortcuts: { '1': 'workbench.action.x', 'cmd+wat': 'y' } });
+  assert.deepEqual(r1.config.shortcuts, DEFAULTS.shortcuts);
+  assert.equal(r1.errors.length, 1);
+  // 非对象：回退默认 + 记录错误
+  const r2 = normalizeConfig({ shortcuts: 'nope' as unknown as Record<string, string> });
+  assert.deepEqual(r2.config.shortcuts, DEFAULTS.shortcuts);
+  assert.equal(r2.errors.length, 1);
+  // 部分非法：合法条目生效，非法条目静默丢弃（不记错误）
+  const r3 = normalizeConfig({ shortcuts: { 'CMD+Esc': 'workbench.action.x', '1': 'bad' } });
+  assert.deepEqual(r3.errors, []);
+  assert.equal(r3.config.shortcuts['cmd+escape'], 'workbench.action.x', '写法应归一化后生效');
+  assert.equal(r3.config.shortcuts['cmd+2'], DEFAULT_SHORTCUTS['cmd+2'], '默认保留');
 });

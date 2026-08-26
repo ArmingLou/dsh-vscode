@@ -2,6 +2,7 @@
 // 纯函数（normalizeConfig / isLoopbackHost）不依赖 vscode，可直接单测；
 // readConfig 是 vscode 设置的薄封装，供 extension.ts 使用。
 import * as vscode from 'vscode';
+import { normalizeShortcutMap } from '../bridge-client/lib/core.js';
 
 /** 用户可配置的原始值（可能缺失/非法） */
 export interface RawDshConfig {
@@ -24,6 +25,8 @@ export interface RawDshConfig {
   remoteEnabled?: boolean;
   /** 模型无视觉能力时是否自动把图片降级为文本+路径转发（默认开启） */
   imageFallback?: boolean;
+  /** 桥接快捷键映射（dsh.bridge.shortcuts：组合键 → VS Code 命令 id，覆盖默认映射） */
+  shortcuts?: Record<string, string>;
 }
 
 /** 规范化后的配置（均有合法默认值） */
@@ -47,7 +50,26 @@ export interface DshConfig {
   remoteEnabled: boolean;
   /** 非视觉模型下发图自动降级为文本+路径转发 */
   imageFallback: boolean;
+  /** 桥接快捷键映射（组合键 → VS Code 命令 id；已在 normalizeConfig 中与默认映射合并） */
+  shortcuts: Record<string, string>;
 }
+
+/**
+ * 默认桥接快捷键映射（v0.3.2）。
+ * 组合键写法：修饰键（cmd/ctrl/alt/shift）+ 按键（字母、0-9、`、escape、f1-f24 等），如 "cmd+1"。
+ * 默认值取作者 keybindings.json 的自定义绑定（cmd+2 在该文件出现两次，按 VS Code「后者生效」取 togglePanel）；
+ * 反引号键（cmd+` 等）未内置默认映射，需要时可用 dsh.bridge.shortcuts 自行添加。
+ */
+export const DEFAULT_SHORTCUTS: Record<string, string> = {
+  'cmd+1': 'workbench.action.toggleAuxiliaryBar',
+  'cmd+2': 'workbench.action.togglePanel',
+  'cmd+3': 'workbench.action.toggleSidebarVisibility',
+  'cmd+escape': 'workbench.action.toggleMaximizedPanel',
+  'ctrl+1': 'workbench.action.toggleAuxiliaryBar',
+  'ctrl+2': 'workbench.action.togglePanel',
+  'ctrl+3': 'workbench.action.toggleSidebarVisibility',
+  'ctrl+escape': 'workbench.action.toggleMaximizedPanel',
+};
 
 /** 默认配置 */
 export const DEFAULTS: DshConfig = {
@@ -63,6 +85,7 @@ export const DEFAULTS: DshConfig = {
   openInBrowser: false,
   remoteEnabled: false,
   imageFallback: true,
+  shortcuts: DEFAULT_SHORTCUTS,
 };
 
 /** 安全边界：仅允许回环地址 */
@@ -134,10 +157,25 @@ export function normalizeConfig(raw: RawDshConfig): { config: DshConfig; errors:
   const remoteEnabled = typeof raw.remoteEnabled === 'boolean' ? raw.remoteEnabled : DEFAULTS.remoteEnabled;
   const imageFallback = typeof raw.imageFallback === 'boolean' ? raw.imageFallback : DEFAULTS.imageFallback;
 
+  // v0.3.2 快捷键映射：对象 { 组合键: 命令 id }；非对象或全部条目非法时回退默认并记录错误，
+  // 合法条目与默认映射合并（用户条目覆盖同名组合键、可自由扩展新组合键）。
+  let shortcuts: Record<string, string>;
+  if (raw.shortcuts === undefined) {
+    shortcuts = DEFAULTS.shortcuts;
+  } else {
+    const normalized = normalizeShortcutMap(raw.shortcuts);
+    if (Object.keys(normalized).length === 0) {
+      errors.push(`dsh.bridge.shortcuts must be an object of { combo: commandId }, got ${JSON.stringify(raw.shortcuts)}`);
+      shortcuts = DEFAULTS.shortcuts;
+    } else {
+      shortcuts = { ...DEFAULTS.shortcuts, ...normalized };
+    }
+  }
+
   return {
     config: {
       host, port, autoStart, stopOnExit, extraArgs, bridgeEnabled, workspaceRootIndex,
-      silenceWarning, executablePath, openInBrowser, remoteEnabled, imageFallback,
+      silenceWarning, executablePath, openInBrowser, remoteEnabled, imageFallback, shortcuts,
     },
     errors,
   };
@@ -159,5 +197,6 @@ export function readConfig(): { config: DshConfig; errors: string[] } {
     openInBrowser: ws.get<boolean>('openInBrowser'),
     remoteEnabled: ws.get<boolean>('remote.enabled'),
     imageFallback: ws.get<boolean>('image.fallback'),
+    shortcuts: ws.get<Record<string, string>>('bridge.shortcuts'),
   });
 }
