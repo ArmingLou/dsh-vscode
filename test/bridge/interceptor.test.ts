@@ -662,3 +662,70 @@ test('v0.3.2 未握手时文件路径点击不拦截（普通浏览器保持 DSH
     rmSync(b.outDir, { recursive: true, force: true });
   }
 });
+
+test('v0.3.2 工具调用行（ToolRow）fileLink 点击：文本路径转发 openFile，其它按钮放行', async () => {
+  const fakeRealFetch = async (_input: unknown, _init: any) => jsonResponse(ACCEPT_BODY);
+  const b = loadBridge({ fetch: fakeRealFetch });
+  try {
+    b.apply();
+    b.emitWin('message', { kind: 'bridgeHello', token: 'tok', imageFallback: true });
+    const started = b.parentMessages.length;
+
+    // 模拟 DSH ToolCall DOM：容器带 data-tool，内部 fileLink 按钮无 title/aria-label，
+    // 文本形如「read · <路径>」（与 dsh-client-ui-tool 的 ToolRow 渲染一致）
+    const mkFileLink = (text: string) => {
+      const btn: any = {
+        classList: { contains: () => false },
+        getAttribute: () => null,
+        textContent: text,
+        closest: (sel: string) => {
+          if (sel === '[data-tool]') return toolRow;
+          if (sel === 'button') return btn;
+          return null;
+        },
+      };
+      const toolRow: any = {
+        classList: { contains: () => false },
+        getAttribute: (name: string) => (name === 'data-tool' ? 'read' : null),
+        textContent: '',
+        closest: () => null,
+      };
+      return btn;
+    };
+    const click = (target: any) => {
+      let prevented = 0;
+      let stopped = 0;
+      b.emitDoc('click', {
+        target,
+        preventDefault() { prevented += 1; },
+        stopPropagation() { stopped += 1; },
+      });
+      return { prevented, stopped };
+    };
+    const openFiles = () => b.parentMessages.slice(started).filter((m) => m.kind === 'openFile');
+
+    // ① 用户描述的形态：read· test/bridge/interceptor.test.ts → 转发提取出的路径
+    const e1 = click(mkFileLink('read · test/bridge/interceptor.test.ts'));
+    assert.equal(openFiles().length, 1, '工具行文件链接应转发 openFile');
+    assert.equal(openFiles()[0].path, 'test/bridge/interceptor.test.ts', '应转发去掉「read · 」前缀的路径');
+    assert.equal(e1.prevented, 1, '命中应 preventDefault（阻止 DSH 的 host.openPath）');
+
+    // ② 相对会话 cwd 的路径（无前缀形态）同样转发
+    click(mkFileLink('src/main.ts'));
+    assert.equal(openFiles().length, 2);
+    assert.equal(openFiles()[1].path, 'src/main.ts');
+
+    // ③ ~ 缩写路径原样转发（host 侧展开主目录）
+    click(mkFileLink('read · ~/proj/a.ts'));
+    assert.equal(openFiles().length, 3);
+    assert.equal(openFiles()[2].path, '~/proj/a.ts');
+
+    // ④ 无路径形态的按钮（inspect/chevron 等）：不转发、不 preventDefault
+    const e4 = click(mkFileLink('查看轨迹'));
+    assert.equal(openFiles().length, 3, '非路径按钮不应转发');
+    assert.equal(e4.prevented, 0, '非路径按钮不应 preventDefault');
+    assert.equal(e4.stopped, 0, '非路径按钮不应 stopPropagation');
+  } finally {
+    rmSync(b.outDir, { recursive: true, force: true });
+  }
+});

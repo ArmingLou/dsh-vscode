@@ -19,6 +19,19 @@ test('resolveBridgePath 处理绝对/相对/危险协议', () => {
   assert.deepEqual(resolveBridgePath('https://x.com/a', undefined, '/proj'), { kind: 'invalid' });
 });
 
+test('resolveBridgePath 展开 ~ 主目录缩写（DSH 工具行路径显示形态）', () => {
+  const { homedir } = require('node:os');
+  const home = homedir();
+  // ~/x → <homedir>/x（绝对路径，与 cwd/工作区根无关）
+  assert.deepEqual(resolveBridgePath('~/proj/a.ts', undefined, '/proj'), { kind: 'abs', path: home + '/proj/a.ts' });
+  // 单独的 ~ → 主目录本身
+  assert.deepEqual(resolveBridgePath('~', undefined, '/proj'), { kind: 'abs', path: home });
+  // 非 ~ 开头的路径不受影响
+  assert.deepEqual(resolveBridgePath('src/main.ts', '/proj', undefined), { kind: 'abs', path: '/proj/src/main.ts' });
+  // 仅 ~/ 与 ~ 两种形态展开；~user 形式（DSH 不会产出）不特殊处理
+  assert.deepEqual(resolveBridgePath('~user/x.ts', undefined, undefined), { kind: 'invalid' });
+});
+
 test('handleBridgeMessage 转发 openExternal 到外部浏览器', async () => {
   // 记录被转发的 URL，验证 http/https 外链原样透传
   const calls: string[] = [];

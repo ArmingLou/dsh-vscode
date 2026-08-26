@@ -10,7 +10,7 @@
 
 ### 修复
 
-- **点击对话中的文件路径统一改为当前 VS Code 窗口打开**（此前会调用 DSH 的 `host.openPath` 用系统默认应用打开）。根因：① 桥接只拦截了模型回复里的 `button.fileMention`，对话尾部「产物」列表的路径 chip（无该 class）漏拦；② 拦截时 `aria-label`（「打开 xxx」文案）优先于 `title`（真实路径），导致解析失败。修复：文件路径按钮改为按「`fileMention` class 或 `title` 为绝对路径形态」识别（覆盖产物 chip 与 DSH 改版），路径一律取 `title` 真实路径转发扩展宿主 → `showTextDocument` 在当前窗口打开；普通按钮不受影响，未握手（普通浏览器）仍保持 DSH 原生行为。
+- **点击对话中的文件路径统一改为当前 VS Code 窗口打开**（此前会调用 DSH 的 `host.openPath` 用系统默认应用打开）。覆盖三类路径元素：① 模型回复里的 `button.fileMention`；② 对话尾部「产物」列表的路径 chip；③ **工具调用行（ToolRow）的文件链接按钮**（如 `read · test/bridge/interceptor.test.ts`，无 `title`/`aria-label` 属性，此前完全漏拦）。修复：文件路径按钮改为按「`fileMention` class、`title` 为绝对路径形态、或工具行按钮文本为路径形态」识别，路径一律取真实值（`title` 优先；工具行文本去掉「工具名 · 」前缀、`~` 主目录缩写由扩展侧展开）转发扩展宿主 → `showTextDocument` 在当前窗口打开；普通按钮不受影响，未握手（普通浏览器）仍保持 DSH 原生行为。
 
 ## [0.3.1] - 2026-08-24
 

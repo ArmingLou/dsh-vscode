@@ -4,6 +4,7 @@
 // 依赖注入设计：生产侧接 vscode API（openExternal / showTextDocument），测试侧注入假实现，
 // 保证纯逻辑可被 node:test 直接验证。
 import { isAbsolute, resolve, join, basename } from 'node:path';
+import { homedir } from 'node:os';
 import type { PanelMessage } from '../panel/html';
 
 /** 图片缓存文件名白名单正则：前缀（与 core.js 的 imageCacheFilename 一致）+ 时间戳/序号 + 白名单扩展名 */
@@ -182,6 +183,7 @@ function errSummary(err: unknown): string {
 
 /**
  * 解析文件路径：绝对路径直接采用；相对路径依次按 会话 cwd → 工作区根 作为基准解析。
+ * ~ 开头（DSH 工具行路径显示的主目录缩写）展开为主目录后再走绝对路径判定。
  * 安全规则：形似 URL 的协议串（如 https://、javascript:）一律拒绝，
  * 但 Windows 盘符（C:\ 或 C:/）不是协议，需要放行。
  */
@@ -191,12 +193,16 @@ export function resolveBridgePath(raw: string, sessionCwd: string | undefined, w
   if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw) && !/^[a-zA-Z]:[\\/]/.test(raw)) {
     return { kind: 'invalid' };
   }
+  // ~ 主目录缩写（DSH 工具行路径显示用）：~/x → <homedir>/x；单独的 ~ 视为主目录本身
+  let expanded = raw;
+  if (expanded === '~') expanded = homedir();
+  else if (expanded.startsWith('~/') || expanded.startsWith('~\\')) expanded = join(homedir(), expanded.slice(2));
   // 绝对路径直接采用（跨平台：Windows 盘符与 POSIX / 开头都算绝对）
-  if (isAbsolute(raw)) return { kind: 'abs', path: raw };
+  if (isAbsolute(expanded)) return { kind: 'abs', path: expanded };
   // 相对路径：优先用会话 cwd，缺失时退回工作区根；两者都无则无法解析
   const base = sessionCwd ?? workspaceRoot;
   if (base === undefined) return { kind: 'invalid' };
-  return { kind: 'abs', path: resolve(base, raw) };
+  return { kind: 'abs', path: resolve(base, expanded) };
 }
 
 /**

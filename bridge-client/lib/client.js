@@ -483,6 +483,20 @@ window.__ModuleLoader__.load({
             return;
           }
         }
+        // 工具调用行（DSH ToolCall）：容器带 data-tool 属性，文件链接按钮（无 title/aria-label）
+        // 文本形如「read · <路径>」或直接「<路径>」（相对会话 cwd 或 ~ 缩写），onClick 同样走
+        // host.openPath（系统默认打开）。按文本路径形态识别，转发扩展宿主在当前窗口打开；
+        // 无路径形态的按钮（chevron/inspect 等）放行给页面。
+        const toolRow = target.closest("[data-tool]");
+        if (toolRow && target.closest("button")) {
+          const path = extractToolLinkPath(target.closest("button").textContent);
+          if (path !== "") {
+            e.preventDefault();
+            e.stopPropagation();
+            parent.postMessage(buildOpenFileMessage(path), "*");
+            return;
+          }
+        }
       }, true); // 捕获阶段：先于 DSH 自身处理器
     }
 

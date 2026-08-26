@@ -243,6 +243,32 @@ export function buildShortcutMessage(combo, key, code) {
 }
 
 /**
+ * 从 DSH 工具调用行（ToolRow）的文件链接按钮文本中提取路径。
+ *
+ * 背景：agent 工具调用（read/write/edit 等）在对话里渲染为可点击的 fileLink 按钮
+ * （无 title/aria-label，文本形如「read · <路径>」或直接「<路径>」），onClick 走
+ * host.openPath（系统默认打开）。按钮文本里的路径可能相对会话 cwd（DSH 做了相对化
+ * 显示）或带 ~ 主目录缩写，且可能带可选的「工具名 · 」前缀。
+ *
+ * 规则：去掉可选前缀与包裹引号，要求含路径分隔符（/ 或 \）才视为路径——
+ * 无分隔符的文本（如 callId 摘要）不处理，避免误拦工具行的其它按钮。
+ *
+ * @param {unknown} text 按钮文本
+ * @returns {string} 提取出的路径；不是路径形态返回 ''（调用方应放行原事件）
+ */
+export function extractToolLinkPath(text) {
+  if (typeof text !== 'string') return '';
+  let s = text.trim();
+  // 去掉可选的「工具名 · 」前缀（工具名：字母开头，含字母数字下划线连字符）
+  s = s.replace(/^[A-Za-z][A-Za-z0-9_-]*\s*·\s*/, '');
+  // 去掉包裹引号（'、"、`）
+  s = s.trim().replace(/^['"`]+|['"`]+$/g, '').trim();
+  // 必须含路径分隔符才算路径形态（相对路径 src/a.ts、绝对 /a、盘符 C:\a、~ 缩写 ~/a）
+  if (s === '' || (!s.includes('/') && !s.includes('\\'))) return '';
+  return s;
+}
+
+/**
  * 判定一个元素是否为"可编辑元素"（可接收粘贴/剪切/打字的目标）。
  *
  * @param {object|null} el DOM 元素

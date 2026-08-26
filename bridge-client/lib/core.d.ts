@@ -63,6 +63,12 @@ export function buildShortcutMessage(
   code?: string,
 ): { kind: 'shortcut'; combo: string; key: string; code: string };
 
+/**
+ * 从 DSH 工具调用行（ToolRow）的文件链接按钮文本中提取路径。
+ * 去掉可选「工具名 · 」前缀与包裹引号；不含路径分隔符的文本返回 ''（调用方放行原事件）。
+ */
+export function extractToolLinkPath(text: unknown): string;
+
 /** 判定元素是否为可编辑元素（textarea / 可输入 input / contenteditable） */
 export function isEditableElement(el: unknown): boolean;
 

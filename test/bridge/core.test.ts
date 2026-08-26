@@ -15,6 +15,7 @@ import {
   canonicalizeCombo,
   normalizeShortcutMap,
   buildShortcutMessage,
+  extractToolLinkPath,
   isEditableElement,
   computeInsertedValue,
   buildReadTextMessage,
@@ -183,4 +184,31 @@ test('normalizeShortcutMap 只保留合法条目并归一化键名', () => {
 test('buildShortcutMessage 构造转发消息', () => {
   assert.deepEqual(buildShortcutMessage('cmd+1', '1', 'Digit1'), { kind: 'shortcut', combo: 'cmd+1', key: '1', code: 'Digit1' });
   assert.deepEqual(buildShortcutMessage('cmd+escape'), { kind: 'shortcut', combo: 'cmd+escape', key: '', code: '' });
+});
+
+// —— v0.3.2 工具调用行（ToolRow）文件链接路径提取 ——
+
+test('extractToolLinkPath 从工具行按钮文本提取路径', () => {
+  // 带「工具名 · 」前缀（用户看到的 read· test/bridge/interceptor.test.ts 形态）
+  assert.equal(extractToolLinkPath('read · test/bridge/interceptor.test.ts'), 'test/bridge/interceptor.test.ts');
+  assert.equal(extractToolLinkPath('read·test/bridge/interceptor.test.ts'), 'test/bridge/interceptor.test.ts');
+  assert.equal(extractToolLinkPath('write · src/main.ts'), 'src/main.ts');
+  assert.equal(extractToolLinkPath('bash · scripts/build.mjs'), 'scripts/build.mjs');
+  // 无前缀：直接是路径（相对 / 绝对 / ~ 缩写 / Windows 盘符）
+  assert.equal(extractToolLinkPath('test/bridge/interceptor.test.ts'), 'test/bridge/interceptor.test.ts');
+  assert.equal(extractToolLinkPath('/ws/src/main.ts'), '/ws/src/main.ts');
+  assert.equal(extractToolLinkPath('~/proj/a.ts'), '~/proj/a.ts');
+  assert.equal(extractToolLinkPath('C:\\proj\\b.ts'), 'C:\\proj\\b.ts');
+  // 包裹引号
+  assert.equal(extractToolLinkPath('read · "/ws/a b.ts"'), '/ws/a b.ts');
+  // 非路径形态：空 / 无分隔符（callId、图标按钮、inspect 按钮文案）→ 不处理
+  assert.equal(extractToolLinkPath(''), '');
+  assert.equal(extractToolLinkPath('   '), '');
+  assert.equal(extractToolLinkPath('call-123'), '');
+  assert.equal(extractToolLinkPath('查看轨迹'), '');
+  assert.equal(extractToolLinkPath('read · call-123'), '', '去掉前缀后无路径分隔符 → 不处理');
+  // 非字符串输入
+  assert.equal(extractToolLinkPath(null), '');
+  assert.equal(extractToolLinkPath(undefined), '');
+  assert.equal(extractToolLinkPath(42), '');
 });
