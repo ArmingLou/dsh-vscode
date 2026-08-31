@@ -230,7 +230,8 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
     const s = this.manager.getSnapshot();
     if (s.state === 'ready' && isRemoteName(vscode.env.remoteName) && this.remoteEnabled()) {
       const gen = ++this.renderGen;
-      const raw = s.url ?? this.rawUrl();
+      // 面板嵌入用地址：新版 dsh 优先代理地址（webview 无 Cookie 也能访问）；本地原样
+      const raw = s.embedUrl ?? s.url ?? this.rawUrl();
       const resolved = await this.resolveExternalUrl(raw);
       if (gen !== this.renderGen) return; // 期间状态又变，丢弃过期结果
       this.pendingExternalUrl = resolved;
@@ -263,13 +264,17 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
       switch (s.state) {
         case 'ready':
           this.wasConnected = true;
-          // iframe/CSP 使用解析后的本地可达 URL（远程=隧道；本地=原地址）。
-          // frameHosts 以解析出的 origin 为准，保证 CSP 放行该隧道地址。
+          // iframe/CSP 使用解析后的本地可达 URL（远程=隧道；本地=代理地址或原地址）。
+          // frameHosts 以实际 iframe 地址的 origin 为准，保证 CSP 放行（代理端口与 dsh 端口不同）。
           {
-            const displayUrl = this.pendingExternalUrl ?? s.url ?? this.rawUrl();
-            if (this.pendingExternalUrl !== null) {
-              ctx.frameHosts = [new URL(this.pendingExternalUrl).origin];
-            }
+            const displayUrl = this.pendingExternalUrl ?? s.embedUrl ?? s.url ?? this.rawUrl();
+            const frameOrigin =
+              this.pendingExternalUrl !== null
+                ? new URL(this.pendingExternalUrl).origin
+                : s.embedUrl !== null
+                  ? new URL(s.embedUrl).origin
+                  : null;
+            if (frameOrigin !== null) ctx.frameHosts = [frameOrigin];
             html = readyPage(displayUrl, ctx, {
               token: this.bridgeToken,
               enabled: this.bridgeEnabled(), // 由 dsh.bridge.enabled 配置驱动（Task 7 接入）

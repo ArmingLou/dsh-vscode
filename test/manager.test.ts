@@ -1,7 +1,7 @@
 // test/manager.test.ts — 服务管理器状态机的单元测试（假探测 + 假子进程）
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ServiceManager, isNoOpenStderr, type ManagerDeps } from '../src/service/manager';
+import { ServiceManager, isNoOpenStderr, extractAuthToken, type ManagerDeps } from '../src/service/manager';
 import type { ProbeResult } from '../src/service/detect';
 import type { ChildProcessLike, ProcessRunner } from '../src/service/process';
 
@@ -11,7 +11,10 @@ class FakeChild implements ChildProcessLike {
   killed: string[] = [];
   exitCbs: ((code: number | null) => void)[] = [];
   errorCbs: ((err: Error) => void)[] = [];
-  stdout = { on: (_e: 'data', _cb: (chunk: Buffer) => void) => {} };
+  stdoutDataCb: ((chunk: Buffer) => void) | null = null;
+  stdout = { on: (_e: 'data', _cb: (chunk: Buffer) => void): void => {
+    if (_e === 'data') this.stdoutDataCb = _cb;
+  } };
   stderrDataCb: ((chunk: Buffer) => void) | null = null;
   stderr = { on: (_e: 'data', _cb: (chunk: Buffer) => void): void => {
     if (_e === 'data') this.stderrDataCb = _cb;
@@ -27,6 +30,9 @@ class FakeChild implements ChildProcessLike {
   emitExit(code: number | null = null): void {
     for (const cb of [...this.exitCbs]) cb(code);
   }
+  emitStdout(text: string): void {
+    this.stdoutDataCb?.(Buffer.from(text));
+  }
   emitStderr(text: string): void {
     this.stderrDataCb?.(Buffer.from(text));
   }
@@ -39,7 +45,11 @@ interface Harness {
   spawnCount: number;
   spawnOpenInBrowser: boolean[]; // 每次 startDsh 传入的 openInBrowser（用于断言 --no-open 兜底）
   probeCount: number;           // 探测调用次数，用于断言定时器已清理
+  probeTokens: (string | null)[]; // 每次探测收到的访问令牌（null=未带令牌）
   states: string[];             // 记录状态变化序列
+  proxyStarts: number;          // 假代理 start() 次数（断言代理生命周期）
+  proxyStops: number;           // 假代理 stop() 次数
+  proxyCreations: { target: { host: string; port: number }; token: string }[]; // 每次创建的 target/token
 }
 
 function makeHarness(opts?: Partial<Parameters<ServiceManager['reconfigure']>[0]>, depsOpts?: Partial<ManagerDeps>): Harness {
@@ -50,10 +60,15 @@ function makeHarness(opts?: Partial<Parameters<ServiceManager['reconfigure']>[0]
     spawnCount: 0,
     spawnOpenInBrowser: [],
     probeCount: 0,
+    probeTokens: [],
     states: [],
+    proxyStarts: 0,
+    proxyStops: 0,
+    proxyCreations: [],
   };
-  const probeService = async (_host: string, _port: number): Promise<ProbeResult> => {
+  const probeService = async (_host: string, _port: number, _timeoutMs?: number, token?: string): Promise<ProbeResult> => {
     h.probeCount += 1;
+    h.probeTokens.push(token ?? null);
     return h.probeQueue.length > 1 ? h.probeQueue.shift()! : h.probeQueue[0];
   };
   const processRunner: ProcessRunner = {
@@ -71,12 +86,26 @@ function makeHarness(opts?: Partial<Parameters<ServiceManager['reconfigure']>[0]
     // 模拟真实 runner 记录启动命令（manager 据此写「启动命令」日志）
     lastStart: { command: 'node', args: ['bin.js', 'web', '--host', '127.0.0.1', '--port', '3080'] },
   };
+  // 默认注入假代理：记录创建参数与生命周期（不占真实端口，保持测试隔离）
+  const fakeProxyFactory = (opts: { target: { host: string; port: number }; token: string }) => {
+    h.proxyCreations.push({ target: { ...opts.target }, token: opts.token });
+    return {
+      url: `http://127.0.0.1:${59000 + h.proxyCreations.length}/`,
+      start: async () => {
+        h.proxyStarts += 1;
+      },
+      stop: async () => {
+        h.proxyStops += 1;
+      },
+      setToken: async () => {},
+    };
+  };
   h.manager = new ServiceManager(
     {
       host: '127.0.0.1', port: 3080, extraArgs: [], autoStart: true,
       timeoutMs: 100, pollMs: 5, ...opts,
     },
-    { probeService, processRunner, log: () => {}, startTimeoutMs: 50, ...depsOpts },
+    { probeService, processRunner, log: () => {}, startTimeoutMs: 50, proxyFactory: fakeProxyFactory, ...depsOpts },
   );
   h.manager.onChange((s) => h.states.push(s.state));
   return h;
@@ -479,6 +508,177 @@ test('isNoOpenStderr：仅当 stderr 含 "unknown option" 且 "-no-open" 时判�
   assert.equal(isNoOpenStderr("dsh: 服务启动失败"), false, '无关报错不误判');
   assert.equal(isNoOpenStderr(""), false);
   assert.equal(isNoOpenStderr("--other --option --no-open is fine"), false, '需同时含 unknown option 才是崩溃标记');
+});
+
+test('extractAuthToken：解析 "dsh web: ...?token=..." 启动行（纯函数）', () => {
+  assert.equal(extractAuthToken('dsh web: http://127.0.0.1:3080/?token=ABC123\n'), 'ABC123');
+  // LAN 附加地址含第二个令牌：只取循环回环地址的令牌
+  assert.equal(
+    extractAuthToken('dsh web: http://127.0.0.1:3080/?token=ABC123 (LAN: http://192.168.1.2:3080/?token=LAN456)\n'),
+    'ABC123',
+  );
+  assert.equal(extractAuthToken('dsh web: http://127.0.0.1:3080/\n'), null, '旧版 dsh 无令牌');
+  assert.equal(extractAuthToken('dsh web: http://127.0.0.1:3080/?token=\n'), null, '空令牌视为未解析');
+  assert.equal(extractAuthToken('[stdout] 其它日志\n'), null);
+  assert.equal(extractAuthToken(''), null);
+});
+
+test('新版 dsh：解析启动行访问令牌 → ready 且 URL 携带 ?token，就绪/健康探测都带令牌', async () => {
+  const token = 'G8lxUIZsB9TpX_pZI_2jJG2P1H-yxHqHTChB8qJZOlE';
+  const probeTokens: (string | null)[] = [];
+  // 模拟新版 dsh：未带令牌探测一律「未就绪」（实际是 401 → foreign），带正确令牌才就绪
+  const h = makeHarness(undefined, {
+    healthIntervalMs: 30,
+    probeService: async (_host, _port, _timeout, t) => {
+      probeTokens.push(t ?? null);
+      return t === token ? 'dsh' : 'down';
+    },
+  });
+  const p = h.manager.ensureRunning();
+  await new Promise((r) => setTimeout(r, 5)); // 等待 spawn 完成、等待循环已开始
+  h.child?.emitStdout(`dsh web: http://127.0.0.1:3080/?token=${token}\n`);
+  const s = await p;
+  assert.equal(s.state, 'ready');
+  assert.equal(s.owned, true);
+  assert.equal(s.url, `http://127.0.0.1:3080/?token=${token}`);
+  assert.ok(probeTokens.includes(token), '就绪探测应携带解析出的令牌');
+  // 面板嵌入代理：以解析出的令牌创建并启动，embedUrl 指向代理
+  assert.equal(h.proxyStarts, 1, '应创建并启动一次面板嵌入代理');
+  assert.deepEqual(h.proxyCreations[0].token, token, '代理应使用解析出的令牌做交换');
+  assert.equal(h.proxyCreations[0].target.port, 3080);
+  assert.ok(s.embedUrl?.startsWith('http://127.0.0.1:'), 'ready 应携带面板嵌入地址');
+  // 健康探测同样携带令牌：ready 后等一个健康周期，探测参数应始终是令牌而非 null
+  const before = probeTokens.length;
+  await new Promise((r) => setTimeout(r, 70));
+  const healthProbes = probeTokens.slice(before);
+  assert.ok(healthProbes.length > 0, '应有健康探测发生');
+  assert.ok(healthProbes.every((t) => t === token), '健康探测必须携带令牌（否则 401 被误判为服务失联）');
+  h.manager.dispose();
+});
+
+test('旧版 dsh（无令牌行）：不创建代理，embedUrl 为 null', async () => {
+  const h = makeHarness();
+  h.probeQueue = ['down', 'dsh'];
+  const s = await h.manager.ensureRunning();
+  assert.equal(s.state, 'ready');
+  assert.equal(s.url, 'http://127.0.0.1:3080/');
+  assert.equal(s.embedUrl, null);
+  assert.equal(h.proxyStarts, 0, '无令牌时不启动代理');
+  h.manager.dispose();
+});
+
+test('stop() 后：代理随服务停止，embedUrl 清空', async () => {
+  const h = makeHarness(undefined, {
+    probeService: async (_host, _port, _timeout, t) => (t === 'TOK123' ? 'dsh' : 'down'),
+  });
+  const p = h.manager.ensureRunning();
+  await new Promise((r) => setTimeout(r, 5));
+  h.child?.emitStdout('dsh web: http://127.0.0.1:3080/?token=TOK123\n');
+  const s = await p;
+  assert.equal(s.state, 'ready');
+  assert.ok(s.embedUrl);
+  await h.manager.stop();
+  assert.equal(h.proxyStops, 1, '代理应随服务停止');
+  assert.equal(h.manager.getSnapshot().embedUrl, null);
+  h.manager.dispose();
+});
+
+test('重启后代理重建：新令牌 → 重新创建代理（旧令牌不作数）', async () => {
+  const h = makeHarness(undefined, {
+    probeService: async (_host, _port, _timeout, t) => (t === 'TOKEN1' || t === 'TOKEN2' ? 'dsh' : 'down'),
+  });
+  const p1 = h.manager.ensureRunning();
+  await new Promise((r) => setTimeout(r, 5));
+  h.child?.emitStdout('dsh web: http://127.0.0.1:3080/?token=TOKEN1\n');
+  const s1 = await p1;
+  assert.equal(s1.state, 'ready');
+  assert.equal(h.proxyStarts, 1);
+
+  const p2 = h.manager.restart();
+  await new Promise((r) => setTimeout(r, 10));
+  h.child?.emitStdout('dsh web: http://127.0.0.1:3080/?token=TOKEN2\n');
+  const s2 = await p2;
+  assert.equal(s2.state, 'ready');
+  assert.equal(h.proxyStarts, 2, '重启后应重建代理');
+  assert.equal(h.proxyCreations.length, 2);
+  assert.equal(h.proxyCreations[1].token, 'TOKEN2', '新代理应使用新令牌');
+  assert.notEqual(h.proxyCreations[0].token, h.proxyCreations[1].token);
+  h.manager.dispose();
+});
+
+test('externalToken 复用外部实例：探测携带外部令牌 → ready + url 带令牌 + 代理用外部令牌，不新启动', async () => {
+  const probeTokens: (string | null)[] = [];
+  const h = makeHarness({ externalToken: 'EXT-TOKEN' }, {
+    probeService: async (_host, _port, _timeout, t) => {
+      probeTokens.push(t ?? null);
+      return t === 'EXT-TOKEN' ? 'dsh' : 'down';
+    },
+  });
+  const s = await h.manager.ensureRunning();
+  assert.equal(s.state, 'ready');
+  assert.equal(s.owned, false, '外部实例应被复用而非由插件启动');
+  assert.equal(s.url, 'http://127.0.0.1:3080/?token=EXT-TOKEN');
+  assert.equal(h.spawnCount, 0, '不应启动子进程');
+  assert.ok(probeTokens.includes('EXT-TOKEN'), '首次探测应携带外部令牌');
+  assert.ok(s.embedUrl, '外部实例同样需要面板嵌入代理');
+  assert.equal(h.proxyCreations[0]?.token, 'EXT-TOKEN', '代理应使用外部令牌做交换');
+  h.manager.dispose();
+});
+
+test('externalToken 无效（探测 foreign）：回退自动换端口启动插件自有实例（不带外部令牌）', async () => {
+  const h = makeHarness({ externalToken: 'WRONG' });
+  // 初始探测（带外部令牌）→ foreign → 换 3081 → spawn → 等待循环（无令牌）→ dsh
+  h.probeQueue = ['foreign', 'down', 'dsh'];
+  const s = await h.manager.ensureRunning();
+  assert.equal(s.state, 'ready');
+  assert.equal(s.owned, true, '外部令牌无效时应启动插件自有实例');
+  assert.equal(h.spawnCount, 1);
+  assert.equal(s.url, 'http://127.0.0.1:3081/', '自有实例无令牌（旧版语义）→ 裸地址');
+  h.manager.dispose();
+});
+
+test('启动行跨 chunk 到达：令牌仍能解析（有界缓冲累计）', async () => {
+  const token = 'SPLIT123';
+  const h = makeHarness(undefined, {
+    probeService: async (_host, _port, _timeout, t) => (t === token ? 'dsh' : 'down'),
+  });
+  const p = h.manager.ensureRunning();
+  await new Promise((r) => setTimeout(r, 5));
+  h.child?.emitStdout('dsh web: http://127.0.0.1:3080/?tok'); // 半行：令牌未完整
+  await new Promise((r) => setTimeout(r, 10));
+  h.child?.emitStdout(`en=${token}\n`); // 补全：应解析出令牌
+  const s = await p;
+  assert.equal(s.state, 'ready');
+  assert.equal(s.url, `http://127.0.0.1:3080/?token=${token}`);
+  h.manager.dispose();
+});
+
+test('重启后旧令牌失效：新进程需重新解析令牌（探测不带旧令牌）', async () => {
+  const probeTokens: (string | null)[] = [];
+  const h = makeHarness(undefined, {
+    probeService: async (_host, _port, _timeout, t) => {
+      probeTokens.push(t ?? null);
+      return t === 'TOKEN1' || t === 'TOKEN2' ? 'dsh' : 'down';
+    },
+  });
+  const p1 = h.manager.ensureRunning();
+  await new Promise((r) => setTimeout(r, 5));
+  h.child?.emitStdout('dsh web: http://127.0.0.1:3080/?token=TOKEN1\n');
+  const s1 = await p1;
+  assert.equal(s1.state, 'ready');
+  assert.equal(s1.url, 'http://127.0.0.1:3080/?token=TOKEN1');
+
+  const oldChild = h.child!;
+  const p2 = h.manager.restart(); // 停旧进程 → 旧令牌应清空 → 新进程需重新解析
+  await new Promise((r) => setTimeout(r, 10));
+  assert.notEqual(h.child, oldChild, '应已重新 spawn');
+  assert.ok(probeTokens.includes(null), '重启后存在不带令牌的探测（旧令牌已失效）');
+  h.child?.emitStdout('dsh web: http://127.0.0.1:3080/?token=TOKEN2\n');
+  const s2 = await p2;
+  assert.equal(s2.state, 'ready');
+  assert.equal(s2.url, 'http://127.0.0.1:3080/?token=TOKEN2'); // 新令牌生效
+  assert.ok(probeTokens.includes('TOKEN2'), '就绪探测应携带新令牌');
+  h.manager.dispose();
 });
 
 

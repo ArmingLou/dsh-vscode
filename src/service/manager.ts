@@ -2,6 +2,7 @@
 // 纯模块：不依赖 vscode；探测与进程管理均通过依赖注入，便于单测。
 import { findFreePort, PORT_FALLBACK_ATTEMPTS, type ProbeResult } from './detect';
 import type { ChildProcessLike, ProcessRunner } from './process';
+import { createDefaultProxyFactory, type DshProxyLike, type DshProxyTarget } from './proxy';
 import type { MsgKey } from '../i18n';
 
 /** 服务状态 */
@@ -10,8 +11,10 @@ export type ServiceState = 'idle' | 'detecting' | 'starting' | 'waiting' | 'read
 /** 对外发布的状态快照（不可变副本） */
 export interface ServiceSnapshot {
   state: ServiceState;
-  /** 就绪后的网页地址（http://host:port/） */
+  /** 真实页面地址（http://host:port/，新版 dsh 携带 ?token=；浏览器打开/复制地址用） */
   url: string | null;
+  /** 面板嵌入地址（新版 dsh 经扩展宿主代理，webview 无 Cookie 也能访问；旧版为 null 回退 url） */
+  embedUrl: string | null;
   /** 失败原因（i18n 键，由面板/状态栏负责翻译） */
   error: MsgKey | null;
   /** 错误文案的 {变量} 值 */
@@ -36,6 +39,12 @@ export interface ManagerOptions {
   executablePath?: string;
   /** 是否允许 dsh web 打开浏览器（true=不传 --no-open；默认追加 --no-open） */
   openInBrowser?: boolean;
+  /**
+   * 外部已启动 dsh web 服务的访问令牌（dsh.externalToken，已归一化为纯令牌）：
+   * 终端里手动启动的实例插件拿不到其动态令牌，配置后即可复用该实例
+   * （探测/地址/代理均使用该令牌）；留空则按「端口占用 → 自动换端口多实例」处理。
+   */
+  externalToken?: string;
 }
 
 /**
@@ -46,9 +55,31 @@ export function isNoOpenStderr(stderr: string): boolean {
   return /unknown option/.test(stderr) && /no-open/.test(stderr);
 }
 
+/**
+ * 从 dsh web 启动输出中提取进程访问令牌。
+ *
+ * 新版 dsh 每次启动动态生成 32 字节随机令牌（无禁用/固定选项），并在启动时打印
+ * `dsh web: http://host:port/?token=XXX (LAN: ...)`；未带令牌访问首页会收到 401。
+ * 扩展必须解析该行才能探测与打开页面。旧版 dsh 不打印令牌 → 返回 null（按无令牌探测）。
+ *
+ * @param output 子进程 stdout（可为跨 chunk 累积的缓冲尾，行被截断时本次返回 null，
+ *               后续 chunk 补全后再调用即可命中）
+ * @returns 令牌字符串；未匹配返回 null
+ */
+export function extractAuthToken(output: string): string | null {
+  const m = /dsh web:\s*(https?:\/\/\S+)/.exec(output);
+  if (!m) return null;
+  try {
+    const token = new URL(m[1]).searchParams.get('token');
+    return token !== null && token !== '' ? token : null; // 空令牌视为未解析
+  } catch {
+    return null;
+  }
+}
+
 /** 注入依赖 */
 export interface ManagerDeps {
-  probeService: (host: string, port: number, timeoutMs?: number) => Promise<ProbeResult>;
+  probeService: (host: string, port: number, timeoutMs?: number, token?: string) => Promise<ProbeResult>;
   processRunner: ProcessRunner;
   /** 日志出口（扩展里接到 Output Channel） */
   log: (line: string) => void;
@@ -58,6 +89,12 @@ export interface ManagerDeps {
   healthIntervalMs?: number;
   /** 启动总超时（毫秒，默认 15000） */
   startTimeoutMs?: number;
+  /**
+   * 面板嵌入代理工厂（默认创建真实 DshProxy；单测注入假实现）。
+   * 新版 dsh 的 SameSite=Strict 会话 Cookie 在 VS Code webview（跨站子框架）中无法回传，
+   * 面板必须经扩展宿主代理访问；旧版 dsh 无令牌时不需要代理。
+   */
+  proxyFactory?: (opts: { target: DshProxyTarget; token: string }) => DshProxyLike;
 }
 
 /** 启动总超时默认值（毫秒） */
@@ -68,7 +105,7 @@ const DEFAULT_HEALTH_INTERVAL_MS = 30000;
 const PORT_FALLBACK_MAX_ROUNDS = 3;
 
 export class ServiceManager {
-  private snapshot: ServiceSnapshot = { state: 'idle', url: null, error: null, owned: false };
+  private snapshot: ServiceSnapshot = { state: 'idle', url: null, embedUrl: null, error: null, owned: false };
   private listeners = new Set<(s: ServiceSnapshot) => void>();
   /** 进行中的启动/重启流程（防并发，幂等复用） */
   private op: Promise<ServiceSnapshot> | null = null;
@@ -82,6 +119,17 @@ export class ServiceManager {
   private noOpenDisabled = false;
   /** 最近一次启动子进程的 stderr 缓冲（有界，用于识别 "unknown option '--no-open'" 崩溃根因） */
   private childStderr = '';
+  /** 最近一次启动子进程的 stdout 缓冲（有界，用于解析 "dsh web: ...?token=..." 启动行） */
+  private childStdout = '';
+  /**
+   * 当前子进程的访问令牌（新版 dsh 每次启动动态生成，从 stdout 启动行解析）。
+   * 令牌与进程绑定：子进程退出/重启/停止后必须清空，否则用旧令牌探测新进程会误判。
+   */
+  private authToken: string | null = null;
+  /** 面板嵌入代理（仅新版 dsh 有令牌时存在；随服务停止/重启销毁） */
+  private proxy: DshProxyLike | null = null;
+  /** 代理对应的令牌（重建判据：令牌/端口变化时重启代理并重新交换） */
+  private proxyKey: string | null = null;
   private disposed = false;
   /** 父进程退出时杀掉子进程，防止僵尸（stopOnExit=false 时移除） */
   private parentExitHook = (): void => {
@@ -118,9 +166,10 @@ export class ServiceManager {
     for (const cb of this.listeners) cb(this.getSnapshot());
   }
 
-  /** 网页地址 */
+  /** 网页地址（新版 dsh 需要携带进程访问令牌；未解析到令牌时回退裸地址兼容旧版） */
   private url(): string {
-    return `http://${this.opts.host}:${this.opts.port}/`;
+    const base = `http://${this.opts.host}:${this.opts.port}/`;
+    return this.authToken ? `${base}?token=${encodeURIComponent(this.authToken)}` : base;
   }
 
   /** 确保服务就绪：复用已有 / 自动启动（幂等：并发调用共享同一次流程） */
@@ -154,26 +203,29 @@ export class ServiceManager {
     if (this.child) {
       await this.stopOwned();
     } else {
-      this.set({ state: 'idle', url: null, owned: false, error: null });
+      await this.stopProxy(); // 复用外部服务也可能有代理（理论罕见，防泄漏）
+      this.set({ state: 'idle', url: null, embedUrl: null, owned: false, error: null });
     }
   }
 
   /** 停掉自启子进程并回到 idle */
   private async stopOwned(): Promise<void> {
     this.clearHealthWatch();
+    await this.stopProxy(); // 代理随令牌一起销毁
     if (!this.child) {
-      this.set({ state: 'idle', url: null, owned: false, error: null });
+      this.set({ state: 'idle', url: null, embedUrl: null, owned: false, error: null });
       return;
     }
     this.set({ state: 'stopping' });
     const child = this.child;
     this.child = null;
+    this.authToken = null; // 子进程将停止，其访问令牌随之失效
     try {
       await this.deps.processRunner.stopChild(child);
     } catch (err) {
       this.deps.log(`[process] 停止子进程失败: ${String(err)}`);
     }
-    this.set({ state: 'idle', url: null, owned: false, error: null });
+    this.set({ state: 'idle', url: null, embedUrl: null, owned: false, error: null });
   }
 
   /**
@@ -184,11 +236,17 @@ export class ServiceManager {
    */
   private async doStart(portFallbackRounds = 0): Promise<ServiceSnapshot> {
     this.set({ state: 'detecting', error: null });
-    const probe = await this.deps.probeService(this.opts.host, this.opts.port, this.opts.timeoutMs);
+    // 探测令牌：自启子进程解析出的令牌优先；未配置/未解析时用外部令牌（复用终端已启动的实例）
+    const probe = await this.deps.probeService(
+      this.opts.host, this.opts.port, this.opts.timeoutMs,
+      this.authToken ?? this.opts.externalToken ?? undefined,
+    );
     if (probe === 'dsh') {
-      // 已有服务在跑：直接复用
+      // 已有服务在跑：直接复用（外部实例需配置 externalToken 才能通过探测；自启实例走等待循环）
       if (this.stopRequested) return this.getSnapshot(); // 探测期间被叫停，不覆盖用户的停止意图
-      this.set({ state: 'ready', url: this.url(), owned: false });
+      this.authToken = this.opts.externalToken ?? null; // 复用外部实例：其令牌来自配置
+      await this.ensureProxy(); // 外部实例同样需要面板嵌入代理（webview 无 Cookie）
+      this.set({ state: 'ready', url: this.url(), embedUrl: this.proxy?.url ?? null, owned: false });
       this.startHealthWatch(); // 复用外部服务也要周期探测，失联时回 idle
       return this.getSnapshot();
     }
@@ -274,6 +332,8 @@ export class ServiceManager {
     }
     this.child = child;
     this.childStderr = ''; // 新一轮启动重置 stderr 缓冲（供 --no-open 崩溃识别）
+    this.childStdout = ''; // 新一轮启动重置 stdout 缓冲（供访问令牌解析）
+    this.authToken = null; // 新进程的令牌未知：先按旧版（无令牌）探测，等到 URL 行后更新
     // 记录实际执行的启动命令（含解析出的 node 路径与全部参数），供问题排查对照环境差异
     const lastStart = this.deps.processRunner.lastStart;
     if (lastStart) {
@@ -305,7 +365,31 @@ export class ServiceManager {
       childExited = true;
       this.handleUnexpectedExit(child);
     });
-    child.stdout?.on('data', (chunk) => this.deps.log(`[stdout] ${chunk.toString().trimEnd()}`));
+    child.stdout?.on('data', (chunk) => {
+      const text = chunk.toString();
+      this.deps.log(`[stdout] ${text.trimEnd()}`);
+      // 新版 dsh 每次启动动态生成进程令牌，启动行形如 "dsh web: http://host:port/?token=XXX"。
+      // 解析后用于探测与面板地址：未带令牌访问新版 dsh 首页会收到 401。
+      // 有界缓冲累计 stdout（行可能跨 chunk），命中即更新令牌并刷新就绪地址。
+      if (this.childStdout.length < 4096) {
+        this.childStdout += text;
+        if (this.childStdout.length > 8192) this.childStdout = this.childStdout.slice(-4096);
+      }
+      const token = extractAuthToken(this.childStdout);
+      if (token !== null && token !== this.authToken) {
+        this.authToken = token;
+        this.deps.log('[process] 已捕获 dsh web 访问令牌（新版 dsh 动态生成）');
+        if (this.snapshot.state === 'ready') {
+          this.set({ url: this.url() }); // 就绪后令牌才到：刷新地址
+          // 令牌更新（理论罕见：同一进程重复打印）：让代理重新交换会话 Cookie
+          if (this.proxy) {
+            void this.proxy.setToken?.(token).catch((err) =>
+              this.deps.log(`[proxy] 令牌刷新失败: ${String(err)}`),
+            );
+          }
+        }
+      }
+    });
     child.stderr?.on('data', (chunk) => {
       const text = chunk.toString();
       // 有界缓冲最近一次启动的 stderr（用于识别 --no-open 不支持导致的启动崩溃）
@@ -346,12 +430,13 @@ export class ServiceManager {
         //   b. 端口被非 dsh 抢占（含 WSL 转发代理占端口但页面不可达）→ 自动换端口重启；
         //   c. 其余 → 启动崩溃。
         this.child = null;
-        const reuse = await this.deps.probeService(this.opts.host, this.opts.port, this.opts.timeoutMs);
+        this.authToken = null; // 子进程已退出，其令牌随之失效；残留实例是别的进程，令牌未知
+        const reuse = await this.deps.probeService(this.opts.host, this.opts.port, this.opts.timeoutMs, this.authToken ?? undefined);
         // 自愈探测期间被叫停：保留 stop() 已设置的状态（idle），绝不覆盖为 failed
         if (this.stopRequested) return this.getSnapshot();
         if (reuse === 'dsh') {
           this.deps.log('[process] 子进程退出，但端口已有 dsh 服务在运行（残留实例占端口自愈），改为复用');
-          this.set({ state: 'ready', url: this.url(), owned: false });
+          this.set({ state: 'ready', url: this.url(), embedUrl: this.proxy?.url ?? null, owned: false });
           this.startHealthWatch();
           return this.getSnapshot();
         }
@@ -371,9 +456,11 @@ export class ServiceManager {
         this.set({ state: 'failed', error: 'err.startCrashed' });
         return this.getSnapshot();
       }
-      const result = await this.deps.probeService(this.opts.host, this.opts.port, this.opts.timeoutMs);
+      const result = await this.deps.probeService(this.opts.host, this.opts.port, this.opts.timeoutMs, this.authToken ?? undefined);
       if (result === 'dsh') {
-        this.set({ state: 'ready', url: this.url(), owned: true });
+        // 就绪前先确保面板嵌入代理就绪（新版 dsh 需代理注入会话 Cookie；失败则回退直连并记日志）
+        await this.ensureProxy();
+        this.set({ state: 'ready', url: this.url(), embedUrl: this.proxy?.url ?? null, owned: true });
         this.startHealthWatch();
         return this.getSnapshot();
       }
@@ -395,9 +482,11 @@ export class ServiceManager {
   private handleUnexpectedExit(child: ChildProcessLike): void {
     if (this.child !== child) return; // 已被 stopOwned 接管或已替换
     this.child = null;
+    this.authToken = null; // 子进程退出，其访问令牌随之失效
+    void this.stopProxy(); // 代理随令牌一起销毁
     if (this.snapshot.state === 'ready') {
       this.clearHealthWatch();
-      this.set({ state: 'idle', url: null, owned: false, error: null });
+      this.set({ state: 'idle', url: null, embedUrl: null, owned: false, error: null });
     }
   }
 
@@ -407,13 +496,55 @@ export class ServiceManager {
     const interval = this.deps.healthIntervalMs ?? DEFAULT_HEALTH_INTERVAL_MS;
     if (interval <= 0) return;
     this.healthTimer = setInterval(() => {
-      void this.deps.probeService(this.opts.host, this.opts.port, this.opts.timeoutMs).then((result) => {
+      // 健康探测必须携带访问令牌：新版 dsh 未带令牌返回 401，会被误判为「服务失联」而回到 idle
+      void this.deps.probeService(this.opts.host, this.opts.port, this.opts.timeoutMs, this.authToken ?? undefined).then((result) => {
         if (result !== 'dsh' && this.snapshot.state === 'ready') {
           this.clearHealthWatch(); // 已回 idle，定时器自清理，不空转
-          this.set({ state: 'idle', url: null, owned: false, error: null });
+          void this.stopProxy(); // 服务失联：代理一并销毁
+          this.set({ state: 'idle', url: null, embedUrl: null, owned: false, error: null });
         }
       });
     }, interval);
+  }
+
+  /**
+   * 确保面板嵌入代理就绪（幂等）：有令牌且令牌/端口未变时复用，否则重建并重新交换会话 Cookie。
+   * 新版 dsh 的 SameSite=Strict 会话 Cookie 在 VS Code webview（跨站子框架）中无法回传，
+   * 面板必须经代理访问；旧版 dsh（无令牌）不需要代理，直接返回。
+   * 代理启动失败不回退状态：记录日志，面板回退直连（表现为授权页，日志可排查）。
+   */
+  private async ensureProxy(): Promise<void> {
+    const token = this.authToken;
+    if (!token) return; // 旧版 dsh：无令牌，无需代理
+    const key = `${token}@${this.opts.host}:${this.opts.port}`;
+    if (this.proxy && this.proxyKey === key) return; // 已就绪
+    await this.stopProxy();
+    const factory = this.deps.proxyFactory ?? createDefaultProxyFactory(this.deps.log);
+    try {
+      const proxy = factory({ target: { host: this.opts.host, port: this.opts.port }, token });
+      await proxy.start();
+      this.proxy = proxy;
+      this.proxyKey = key;
+      this.deps.log(`[proxy] 面板嵌入代理已启动: ${proxy.url}（webview 无 Cookie 访问）`);
+    } catch (err) {
+      this.proxy = null;
+      this.proxyKey = null;
+      this.deps.log(`[proxy] 面板嵌入代理启动失败，面板回退直连（新版 dsh 将显示授权页）: ${String(err)}`);
+    }
+  }
+
+  /** 停止面板嵌入代理（幂等） */
+  private async stopProxy(): Promise<void> {
+    const proxy = this.proxy;
+    this.proxy = null;
+    this.proxyKey = null;
+    if (proxy) {
+      try {
+        await proxy.stop();
+      } catch (err) {
+        this.deps.log(`[proxy] 停止代理失败: ${String(err)}`);
+      }
+    }
   }
 
   /** 清除健康探测定时器 */
@@ -427,11 +558,23 @@ export class ServiceManager {
   /** 应用新配置；仅 host/port 变化且自启服务在跑时自动重启（其余项原地生效） */
   reconfigure(opts: ManagerOptions): Promise<ServiceSnapshot> {
     const targetChanged = this.opts.host !== opts.host || this.opts.port !== opts.port;
+    const tokenChanged = this.opts.externalToken !== opts.externalToken;
     this.opts = opts;
     if (targetChanged) {
       if (this.child) return this.restart();
       // 复用外部服务时只更新地址展示，实际可达性由下次 ensureRunning 重新探测
-      if (this.snapshot.state === 'ready') this.set({ url: this.url() });
+      if (this.snapshot.state === 'ready') {
+        // 目标端口变化但无自启子进程：代理目标失效，销毁后由下次就绪重建
+        void this.stopProxy();
+        this.set({ url: this.url(), embedUrl: null });
+      }
+    } else if (tokenChanged && !this.child && this.snapshot.state === 'ready') {
+      // 外部令牌变化（复用外部实例场景）：立即换令牌刷新地址与代理（下次探测用新令牌）
+      this.authToken = this.opts.externalToken ?? null;
+      void (async () => {
+        await this.ensureProxy(); // key 含令牌：变化时自动重建代理并重新交换
+        this.set({ url: this.url(), embedUrl: this.proxy?.url ?? null });
+      })();
     }
     return Promise.resolve(this.getSnapshot());
   }
@@ -451,6 +594,7 @@ export class ServiceManager {
     if (this.disposed) return;
     this.disposed = true;
     this.clearHealthWatch();
+    void this.stopProxy();
     if (!this.child) process.removeListener('exit', this.parentExitHook);
     this.listeners.clear();
   }

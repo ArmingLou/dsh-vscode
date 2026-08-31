@@ -8,24 +8,50 @@ export type ProbeResult = 'dsh' | 'foreign' | 'down';
 const DSH_MARKER = '__DSH_BOOT__';
 
 /**
+ * 新版 dsh 的令牌交换响应特征：GET /?token=X → 303 Location:/ + Set-Cookie 会话。
+ * 该 303 只在令牌有效时发出（令牌是 32 字节随机数，只有 dsh 自己校验），
+ * 因此「303 重定向到干净首页 + dsh-auth-* Cookie」即证明端口上是 dsh 且令牌有效。
+ * fetch 不维护 cookie jar（无法自动跟随 303 并携带 Cookie），故直接以 303 特征判定，
+ * 无需再跟随重定向。
+ */
+const DSH_TOKEN_EXCHANGE = { location: '/', cookiePrefix: 'dsh-auth-' };
+
+/**
  * 探测 host:port 上运行的服务：
+ * - 带令牌时：新版 dsh 走令牌交换（/?token=X → 303 + Cookie），命中即 'dsh'；
+ *   无令牌（旧版 dsh / 页面直出）时仍以首页标记判定。
  * - 200 且首页含 DSH 标记 → 'dsh'
- * - 有 HTTP 响应但不是 DSH → 'foreign'（端口被其他程序占用）
+ * - 有 HTTP 响应但不是 DSH（含新版 dsh 未带令牌的 401）→ 'foreign'（端口被其他程序占用）
  * - 连接失败/超时/拒绝 → 'down'（视为未运行）
+ *
+ * @param token 新版 dsh 的进程访问令牌（由启动输出 "dsh web: ...?token=XXX" 解析；
+ *              未知时传 undefined，按旧版行为探测）
  */
 export async function probeService(
   host: string,
   port: number,
   timeoutMs = 3000,
-  fetchImpl: typeof fetch = fetch,
+  token?: string,
 ): Promise<ProbeResult> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetchImpl(`http://${host}:${port}/`, {
+    // 带令牌时请求令牌交换 URL：新版 dsh 未带令牌访问首页会收到 401
+    const target = token
+      ? `http://${host}:${port}/?token=${encodeURIComponent(token)}`
+      : `http://${host}:${port}/`;
+    const res = await fetch(target, {
       signal: controller.signal,
       redirect: 'manual',
     });
+    if (res.status === 303 && token !== undefined) {
+      const location = res.headers.get('location');
+      const cookies =
+        typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : null;
+      // getSetCookie 缺失（极旧 fetch 实现）时退化为仅校验 Location，不影响判定
+      const cookieOk = cookies === null || cookies.some((c) => c.startsWith(DSH_TOKEN_EXCHANGE.cookiePrefix));
+      if (location === DSH_TOKEN_EXCHANGE.location && cookieOk) return 'dsh';
+    }
     if (!res.ok) return 'foreign';
     const body = await res.text();
     return body.includes(DSH_MARKER) ? 'dsh' : 'foreign';

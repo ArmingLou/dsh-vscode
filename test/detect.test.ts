@@ -66,6 +66,63 @@ test('响应超时 → down', async () => {
   }
 });
 
+test('带令牌探测：303 令牌交换（Location:/ + dsh-auth Cookie）→ dsh', async () => {
+  const { server, port } = await serve((req, res) => {
+    // 模拟新版 dsh：有效令牌 → 303 重定向到干净首页并下发浏览器会话 Cookie
+    if (req.url?.startsWith('/?token=')) {
+      res.writeHead(303, {
+        'location': '/',
+        'set-cookie': 'dsh-auth-xxx=yyy; Max-Age=86400; Path=/; HttpOnly; SameSite=Strict',
+      });
+      res.end();
+      return;
+    }
+    res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('dsh web authentication required; reopen the URL printed by dsh web.\n');
+  });
+  try {
+    assert.equal(await probeService('127.0.0.1', port, 1000, 'TOKEN123'), 'dsh');
+  } finally {
+    server.close();
+  }
+});
+
+test('无令牌探测收到 401 → foreign（新版 dsh 需访问令牌）', async () => {
+  const { server, port } = await serve((_req, res) => {
+    res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('dsh web authentication required; reopen the URL printed by dsh web.\n');
+  });
+  try {
+    assert.equal(await probeService('127.0.0.1', port, 1000), 'foreign');
+  } finally {
+    server.close();
+  }
+});
+
+test('带令牌但令牌错误（401）→ foreign', async () => {
+  const { server, port } = await serve((_req, res) => {
+    res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('dsh web authentication required; reopen the URL printed by dsh web.\n');
+  });
+  try {
+    assert.equal(await probeService('127.0.0.1', port, 1000, 'WRONG'), 'foreign');
+  } finally {
+    server.close();
+  }
+});
+
+test('带令牌但 303 非令牌交换（Location 非 /）→ foreign', async () => {
+  const { server, port } = await serve((_req, res) => {
+    res.writeHead(303, { location: '/login' });
+    res.end();
+  });
+  try {
+    assert.equal(await probeService('127.0.0.1', port, 1000, 'TOKEN123'), 'foreign');
+  } finally {
+    server.close();
+  }
+});
+
 test('findFreePort：从 startPort+1 起找到第一个空闲端口', async () => {
   const calls: number[] = [];
   const probe = async (_host: string, port: number): Promise<'dsh' | 'foreign' | 'down'> => {

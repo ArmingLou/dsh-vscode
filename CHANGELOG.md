@@ -1,3 +1,41 @@
+## [0.3.7] - 2026-08-31
+
+### 新增
+
+- **支持复用外部已启动的 dsh web 实例（手动令牌）**：终端里手动启动的 `dsh web`，插件拿不到其动态令牌（仅打印在该进程的 stdout，无持久化）。新增设置 `dsh.externalToken`：粘贴终端打印的完整 URL（或仅 `token=` 的值）即可在面板中复用该实例（探测/地址/代理均使用该令牌），令牌无效时自动回退「换端口启动插件自有实例」。**更推荐的多实例方式无需任何配置**：插件探测到配置端口被其他 dsh 实例占用时，自动临时换端口启动自有实例并自动解析其令牌（见下）。
+
+### 修复
+
+- **修复「页面能打开但显示『连接中…→连接异常』」**（0.3.6 遗留）。根因：DSH 前端的实时通道（Typert Remote 流：会话/工作区事件推送）走 **WebSocket**（`ws://<页面origin>/api/remote.mux`，`dsh-api-gateway` 的 upgrade 路由），而 0.3.6 的面板嵌入代理**只转发 HTTP、没有处理 upgrade** —— Node http server 对 upgrade 请求会直接关闭 socket → WS 握手必然失败 → 前端连接指示器从「连接中…」变为「连接异常」（首页/静态资源/RPC 单发都正常，所以页面能渲染出来，误导性强）。修复：
+  1. **代理支持 WebSocket upgrade 转发**（`/api/remote.mux` 及任意 upgrade 路径）：注入会话 Cookie、剥离 `Origin`/`sec-fetch-*`、改写 `Host`（与 HTTP 转发同规则，通过 dsh 的 `requestRejection` 鉴权），重建 `Connection: Upgrade` 头，上游 101 响应手写回传（含 `Sec-WebSocket-Accept`），之后双向字节管道透传（含握手后 head 数据）；上游 401 时重新交换会话 Cookie 后重试一次；
+  2. **修复转发请求未剥离 `Transfer-Encoding` 的头**（chunked 请求体会因「chunked 头 + 已解帧 body」损坏）；
+  3. **修复代理 stop() 挂起**（已升级的 WebSocket socket 脱离 http 连接管理，closeAllConnections 关不掉 → server.close 永久等待；现显式跟踪并销毁）；
+  4. 新增 WS 转发单元测试（本地假 dsh + 最小 WS echo 服务端 + 原生 WebSocket 客户端）与真实 dsh 集成断言（无 Cookie 客户端经代理握手成功）。
+- **确认并验证 dsh 多实例（多端口）并发无冲突**：新增真实 dsh 集成测试（`test/integration/multi-instance.test.ts`）——两个实例同时运行，各自的令牌交换 / 首页 / WebSocket 实时通道全部正常，日志无锁/冲突报错。因此插件「端口占用 → 自动换端口启动自有实例」的多实例方案可靠：**旧实例残留时无需手动关闭，也无需手动输入令牌**。
+  - 说明：残留的旧 dsh 实例占着配置端口时，插件会自动临时换端口启动新实例（弹窗告知新端口，仅本次会话），旧实例可随时手动关闭；也可执行 `DSH: 重启` 让插件重新走完整启动流程。
+
+## [0.3.6] - 2026-08-31
+
+### 修复
+
+- **修复「面板能打开 Web 但显示『需要授权』（dsh web authentication required）」**（0.3.5 遗留）。根因：新版 dsh 的会话 Cookie 是 **`HttpOnly; SameSite=Strict`**，而 VS Code webview 的 iframe 是跨站子框架 —— Strict Cookie 在子框架请求中**永远不会被回传**（且 webview 本身不持久化 Cookie）。面板 iframe 加载 `/?token=X` 完成 303 令牌交换后，重定向到 `/` 的请求不带 Cookie → 401 → 显示授权页。**修复：扩展宿主内启动本地反向代理（面板嵌入代理）**——代理自己完成令牌交换并持有会话 Cookie，把 webview 的每个请求注入 Cookie 后转发给 dsh，同时剥离 `Origin`/`sec-fetch-site` 并改写 `Host` 通过 dsh 的 Host/Origin 围栏；webview 只面对代理：无重定向、无 Set-Cookie、全程 200，完全不依赖浏览器 Cookie。具体：
+  1. 新增 `src/service/proxy.ts`（`DshProxy`）：令牌交换拿会话 Cookie → 转发时注入；401 自动重新交换并重试一次；响应剥离 Set-Cookie；
+  2. 管理器就绪后（有令牌时）自动启动代理，`embedUrl` 供面板嵌入；代理随服务停止/重启/令牌变化而重建；旧版 dsh（无令牌）不启动代理，行为不变；
+  3. 面板 iframe / CSP frame-src / 桥接握手 origin 全部改用代理地址；**浏览器打开 / 复制地址仍用带令牌的真实地址**（浏览器 Cookie 正常，行为不变）；
+  4. 代理启动失败自动回退直连并记日志，不影响服务本身。
+  - 该方案不削弱 dsh 的令牌鉴权（只有扩展宿主持有会话凭据），也不依赖 dsh 内部实现，兼容后续 dsh 版本。
+
+## [0.3.5] - 2026-08-31
+
+### 修复
+
+- **修复「升级新版 dsh 后扩展无法在 VS Code 中打开 Web」**（实机日志 `dsh web: http://127.0.0.1:3081/?token=...` 确认）。根因：新版 dsh 每次启动**动态生成 32 字节随机访问令牌**（无禁用/固定选项），URL 形如 `dsh web: http://host:port/?token=XXX`，未带令牌访问首页一律返回 401；而扩展此前用裸地址（无令牌）做端口探测与面板加载 → 探测被误判为「端口被其他程序占用」/「启动超时」，面板打不开 Web。修复：
+  1. **解析子进程启动输出中的令牌**（`dsh web: ...?token=XXX` 行，兼容跨 chunk 分片到达与 LAN 附加地址，只取回环地址的令牌）；
+  2. **端口探测携带令牌**（带令牌走 303 令牌交换判定——`Location:/` + `dsh-auth-*` Cookie；未带令牌保持旧版行为，兼容旧版 dsh）；
+  3. **面板 iframe / 浏览器打开 / 复制地址全部使用带令牌 URL**（就绪后令牌才到达时自动刷新地址）；
+  4. **令牌与进程绑定**：重启/停止/意外退出即失效并重新解析，健康探测同样携带令牌（否则 401 会被误判为「服务失联」）。
+  - 旧版 dsh（无令牌行）完全不受影响：按原裸地址行为探测与访问。
+
 ## [0.3.4] - 2026-08-26
 
 ### 修复

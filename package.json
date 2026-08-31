@@ -2,7 +2,7 @@
   "name": "dsh-vscode-panel",
   "displayName": "DSH",
   "description": "在 VS Code 侧边栏中使用 DeepSeek Harness（DSH）网页界面",
-  "version": "0.3.4",
+  "version": "0.3.7",
   "publisher": "Fengze233",
   "icon": "assets/icon.png",
   "license": "MIT",
@@ -240,6 +240,11 @@
           "type": "string",
           "default": "",
           "markdownDescription": "%dsh.config.executablePath%"
+        },
+        "dsh.externalToken": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "%dsh.config.externalToken%"
         },
         "dsh.openInBrowser": {
           "type": "boolean",

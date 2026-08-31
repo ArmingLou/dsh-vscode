@@ -12,6 +12,7 @@ test('合法配置原样通过', () => {
     host: 'localhost', port: 4000, autoStart: false, stopOnExit: false, extraArgs: ['--trusted-host', 'x:1'],
     bridgeEnabled: true, workspaceRootIndex: 0, silenceWarning: false, executablePath: '',
     openInBrowser: false, remoteEnabled: false, imageFallback: true, shortcuts: DEFAULTS.shortcuts,
+    externalToken: '',
   });
 });
 
@@ -161,4 +162,25 @@ test('v0.3.2 快捷键映射：非法条目丢弃、全非法回退默认并记�
   assert.deepEqual(r3.errors, []);
   assert.equal(r3.config.shortcuts['cmd+escape'], 'workbench.action.x', '写法应归一化后生效');
   assert.equal(r3.config.shortcuts['cmd+2'], DEFAULT_SHORTCUTS['cmd+2'], '默认保留');
+});
+
+test('externalToken 归一化：接受完整 URL 或纯令牌，空串回退默认', () => {
+  // 完整 URL（终端打印的 dsh web 启动行）
+  const r1 = normalizeConfig({ externalToken: 'http://127.0.0.1:3080/?token=ABC123' });
+  assert.equal(r1.config.externalToken, 'ABC123');
+  // 纯令牌
+  const r2 = normalizeConfig({ externalToken: 'ABC123' });
+  assert.equal(r2.config.externalToken, 'ABC123');
+  // 带 LAN 附加信息的完整 URL
+  const r3 = normalizeConfig({ externalToken: 'http://127.0.0.1:3080/?token=ABC123 (LAN: http://192.168.1.2:3080/?token=LAN9)' });
+  assert.equal(r3.config.externalToken, 'ABC123');
+  // 空串/未配置
+  const r4 = normalizeConfig({});
+  assert.equal(r4.config.externalToken, '');
+  const r5 = normalizeConfig({ externalToken: '   ' });
+  assert.equal(r5.config.externalToken, '');
+  // 非字符串回退默认
+  const r6 = normalizeConfig({ externalToken: 42 as unknown as string });
+  assert.equal(r6.config.externalToken, '');
+  assert.deepEqual(r6.errors, []);
 });

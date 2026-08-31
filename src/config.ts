@@ -27,6 +27,12 @@ export interface RawDshConfig {
   imageFallback?: boolean;
   /** 桥接快捷键映射（dsh.bridge.shortcuts：组合键 → VS Code 命令 id，覆盖默认映射） */
   shortcuts?: Record<string, string>;
+  /**
+   * 外部已启动 dsh web 服务的访问令牌（dsh.externalToken）：
+   * 终端里已手动启动 dsh web 时，插件无法获得其动态令牌，填这里即可复用该服务。
+   * 接受完整 URL（`http://host:port/?token=XXX`）或纯令牌字符串，自动归一化。
+   */
+  externalToken?: string;
 }
 
 /** 规范化后的配置（均有合法默认值） */
@@ -52,6 +58,8 @@ export interface DshConfig {
   imageFallback: boolean;
   /** 桥接快捷键映射（组合键 → VS Code 命令 id；已在 normalizeConfig 中与默认映射合并） */
   shortcuts: Record<string, string>;
+  /** 外部已启动 dsh web 服务的访问令牌（空串 = 未配置；已归一化为纯令牌） */
+  externalToken: string;
 }
 
 /**
@@ -86,7 +94,21 @@ export const DEFAULTS: DshConfig = {
   remoteEnabled: false,
   imageFallback: true,
   shortcuts: DEFAULT_SHORTCUTS,
+  externalToken: '',
 };
+
+/**
+ * 归一化外部访问令牌：接受完整 URL（`http://host:port/?token=XXX`）或纯令牌字符串。
+ * 纯函数，便于单测；空串/空白 → 空串（未配置）。
+ */
+export function normalizeExternalToken(input: string): string {
+  const v = input.trim();
+  if (v === '') return '';
+  // 兼容粘贴完整启动行（如 "dsh web: http://127.0.0.1:3080/?token=XXX (LAN: ...)"）：
+  // 令牌是 base64url，遇空格 / & / ) 即结束
+  const m = /[?&]token=([^&\s)]+)/.exec(v);
+  return m ? decodeURIComponent(m[1]) : v;
+}
 
 /** 安全边界：仅允许回环地址 */
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);
@@ -152,6 +174,10 @@ export function normalizeConfig(raw: RawDshConfig): { config: DshConfig; errors:
   // executablePath：非字符串静默回退默认 ''；空字符串合法（表示用 PATH 里的 dsh）
   const executablePath = typeof raw.executablePath === 'string' ? raw.executablePath : DEFAULTS.executablePath;
 
+  // 外部访问令牌：非字符串静默回退默认 ''；接受完整 URL 或纯令牌，归一化为纯令牌
+  const externalToken =
+    typeof raw.externalToken === 'string' ? normalizeExternalToken(raw.externalToken) : DEFAULTS.externalToken;
+
   // v0.3.0 新布尔设置：沿用 bridgeEnabled 的缺省处理——仅接受布尔，否则回退默认（不记错误）
   const openInBrowser = typeof raw.openInBrowser === 'boolean' ? raw.openInBrowser : DEFAULTS.openInBrowser;
   const remoteEnabled = typeof raw.remoteEnabled === 'boolean' ? raw.remoteEnabled : DEFAULTS.remoteEnabled;
@@ -176,6 +202,7 @@ export function normalizeConfig(raw: RawDshConfig): { config: DshConfig; errors:
     config: {
       host, port, autoStart, stopOnExit, extraArgs, bridgeEnabled, workspaceRootIndex,
       silenceWarning, executablePath, openInBrowser, remoteEnabled, imageFallback, shortcuts,
+      externalToken,
     },
     errors,
   };
@@ -198,5 +225,6 @@ export function readConfig(): { config: DshConfig; errors: string[] } {
     remoteEnabled: ws.get<boolean>('remote.enabled'),
     imageFallback: ws.get<boolean>('image.fallback'),
     shortcuts: ws.get<Record<string, string>>('bridge.shortcuts'),
+    externalToken: ws.get<string>('externalToken'),
   });
 }

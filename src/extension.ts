@@ -60,6 +60,7 @@ function toManagerOptions(config: DshConfig): ManagerOptions {
     cwd: resolveWorkspaceRoot(vscode.workspace.workspaceFolders ?? [], config.workspaceRootIndex),
     executablePath: config.executablePath,
     openInBrowser: config.openInBrowser,
+    externalToken: config.externalToken, // 复用外部已启动实例的访问令牌（dsh.externalToken）
     timeoutMs: 3000,
     pollMs: 500,
   };
