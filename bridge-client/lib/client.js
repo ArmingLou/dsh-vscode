@@ -18,6 +18,14 @@ window.__ModuleLoader__.load({
     var module = { exports: {} };
     var exports = module.exports;
     /*__CORE_INLINE__*/
+    // —— 幂等安装保护：防止本模块被重复 materialize（如 HMR 热重载/重复注入）——
+    // 每次执行都会向 window 注册 keydown/contextmenu 等监听器，重复执行会让监听器
+    // 叠加，一次按键被处理多次 → 快捷键 cmd+1/cmd+2/cmd+3 偶发连续触发两次。
+    if (window.__dshVscodeBridgeInstalled === true) {
+      console.warn("[dsh-vscode-bridge] client.js 已安装，跳过重复注册（防快捷键双发）");
+      return module.exports;
+    }
+    window.__dshVscodeBridgeInstalled = true;
     // —— 验证标记：证明本 bundle 已在页面内 materialize 并执行（供 Task 0/9 回归用） ——
     window.__dshVscodeBridgeReady = true;
     console.log("[dsh-vscode-bridge] client.js executed");
@@ -31,6 +39,10 @@ window.__ModuleLoader__.load({
     // 未命中 → 放行给 DSH 页面自身（不干涉页面自己的快捷键）。
     let bridgeShortcuts = {};
 
+    // —— 快捷键转发去抖状态（防双发）——
+    let lastForwardedCombo = "";
+    let lastForwardedAt = 0;
+
     function hasShortcut(combo) {
       return (
         bridgeShortcuts !== null &&
@@ -40,7 +52,7 @@ window.__ModuleLoader__.load({
     }
 
     // 桥接包版本（与插件版本统一，随包发布；安装器按「版本不一致或 client.js 内容不一致」强制重装）
-    const BRIDGE_VERSION = "0.3.7";
+    const BRIDGE_VERSION = "0.3.8";
 
     // —— 剪贴板写桥接：VS Code webview 对跨源 iframe 的 navigator.clipboard.writeText 有权限拦截 ——
     // 背景：即使 iframe 声明 allow="clipboard-write"，VS Code（Electron）仍会拒绝写入
@@ -498,6 +510,17 @@ window.__ModuleLoader__.load({
       //    自动重复（按住不放）不转发，避免 toggle 类命令来回横跳；未命中的组合放行给页面。
       const combo = getShortcutCombo(e);
       if (combo !== null && e.repeat !== true && hasShortcut(combo)) {
+        // 防双发：同一组合键 300ms 内再次出现（监听器叠加导致同一事件被处理两次，
+        // 或 OS 重复键竞态）只转发一次；preventDefault 保持一致（事件已被接管）。
+        const now = Date.now();
+        if (combo === lastForwardedCombo && now - lastForwardedAt < 300) {
+          e.preventDefault();
+          e.stopPropagation();
+          console.warn(`[dsh-vscode-bridge] shortcut ${combo} 300ms 内重复触发，已忽略（防双发）`);
+          return;
+        }
+        lastForwardedCombo = combo;
+        lastForwardedAt = now;
         e.preventDefault();
         e.stopPropagation();
         hideMenu();

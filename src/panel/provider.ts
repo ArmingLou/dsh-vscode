@@ -29,6 +29,8 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
   private pendingExternalUrl: string | null = null;
   /** 渲染代数：递增使进行中的异步 URL 解析过期，防止乱序覆盖 */
   private renderGen = 0;
+  /** 桥接快捷键去抖：同一组合键上次转发时间（防一次按键双发消息导致 toggle 命令来回横跳） */
+  private lastShortcutAt = new Map<string, number>();
 
   /**
    * @param manager 服务管理器（面板与服务状态联动）
@@ -141,6 +143,15 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
         // 命令 id 只来自本扩展配置（绝不接受页面侧直传命令），未知命令仅记日志不打断操作。
         const cmd = this.shortcuts()[msg.combo];
         if (typeof cmd === 'string' && cmd !== '') {
+          // 防双发（v0.3.8）：同一组合键 300ms 内再次收到消息只执行一次——
+          // 实测部分环境一次按键会双发（监听器叠加/事件竞态），toggle 类命令双执行会来回横跳。
+          const now = Date.now();
+          const prev = this.lastShortcutAt.get(msg.combo);
+          this.lastShortcutAt.set(msg.combo, now);
+          if (prev !== undefined && now - prev < 300) {
+            console.warn(`[dsh] shortcut ${msg.combo} 300ms 内重复触发，已忽略（防双发）`);
+            return;
+          }
           void vscode.commands.executeCommand(cmd).then(undefined, (err) => {
             console.warn(`[dsh] shortcut ${msg.combo} -> command ${cmd} failed: ${String(err)}`);
           });

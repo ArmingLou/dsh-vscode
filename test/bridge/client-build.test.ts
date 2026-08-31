@@ -38,6 +38,8 @@ test('buildBridgeClient 内联产物语法合法且不含 export/占位符残留
     assert.ok(code.includes('rewriteRpcId'), 'v0.3.0 产物应包含降级重发响应 rpcId 改写');
     assert.ok(code.includes('copyViaBridge'), '产物应包含 writeText 接管逻辑');
     assert.ok(code.includes('dsh-vscode-bridge'), '产物应包含包名 dsh-vscode-bridge');
+    assert.ok(code.includes('__dshVscodeBridgeInstalled'), 'v0.3.8 产物应包含幂等安装保护（防快捷键双发）');
+    assert.ok(code.includes('lastForwardedCombo'), 'v0.3.8 产物应包含快捷键转发去抖状态（防双发）');
     // ③ 不含占位符（替换应已完成）
     assert.ok(!code.includes('/*__CORE_INLINE__*/'), '产物不应残留占位符');
     // ④ 不含 export 前缀残留（去 export 正则应生效）
