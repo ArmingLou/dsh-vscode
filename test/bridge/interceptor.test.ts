@@ -100,9 +100,32 @@ function loadBridge(opts: { fetch: (input: unknown, init: any) => Promise<Respon
     activeElement: null,
     // undo/redo 返回 false：模拟「React 受控输入框原生撤销栈为空」，强制走桥接手动手栈
     execCommand(cmd: string) { return cmd !== 'undo' && cmd !== 'redo'; },
-    createElement() { return { textContent: '', style: {}, append() {}, setAttribute() {}, addEventListener() {} }; },
-    head: { append() {} },
-    body: { append() {} },
+    // 可收集的 DOM 桩：append 记录 children、addEventListener 记录监听器（右键菜单测试用）
+    createElement() {
+      const el: any = {
+        textContent: '',
+        style: {},
+        children: [],
+        listeners: {},
+        append(...nodes: any[]) { for (const n of nodes) if (n && typeof n === 'object') this.children.push(n); },
+        setAttribute() {},
+        addEventListener(type: string, fn: (...a: any[]) => void) {
+          (el.listeners[type] ?? (el.listeners[type] = [])).push(fn);
+        },
+        getBoundingClientRect() { return { width: 0, height: 0 }; },
+        contains() { return false; },
+        classList: { add() {}, contains() { return false; } },
+      };
+      return el;
+    },
+    head: {
+      children: [],
+      append(...nodes: any[]) { for (const n of nodes) if (n && typeof n === 'object') this.children.push(n); },
+    },
+    body: {
+      children: [],
+      append(...nodes: any[]) { for (const n of nodes) if (n && typeof n === 'object') this.children.push(n); },
+    },
   };
 
   const sandbox: Record<string, any> = {
@@ -118,6 +141,12 @@ function loadBridge(opts: { fetch: (input: unknown, init: any) => Promise<Respon
     clearTimeout,
     // —— 撤销/重做测试用 DOM 桩 ——
     Event: class { type: string; bubbles: boolean; constructor(type: string, opts?: { bubbles?: boolean }) { this.type = type; this.bubbles = !!(opts && opts.bubbles); } },
+    // 合成组合键派发（右键菜单撤销/重做）用
+    KeyboardEvent: class {
+      type: string;
+      init: any;
+      constructor(type: string, init?: any) { this.type = type; this.init = init || {}; }
+    },
     HTMLTextAreaElement: {
       prototype: (() => {
         const proto: any = {};
@@ -456,55 +485,95 @@ test('模型看完即删：同会话下一条消息立即删除上一批；TTL �
   }
 });
 
-test('issue #6：Cmd+Z 撤销 / Cmd+Shift+Z 重做（原生 execCommand 失效时用手动栈兜底）', async () => {
+test('v0.3.2 撤销/重做（Cmd+Z 等）放行给页面自身处理，不拦截不本地仿真', async () => {
+  const fakeRealFetch = async (_input: unknown, _init: any) => jsonResponse(ACCEPT_BODY);
+  const b = loadBridge({ fetch: fakeRealFetch });
+  try {
+    b.apply();
+    b.emitWin('message', { kind: 'bridgeHello', token: 'tok', imageFallback: true });
+    const started = b.parentMessages.length;
+    const keydown = (k: any) => b.windowListeners.get('keydown')?.forEach((fn) => fn(k));
+    const ev = (over: any) => ({
+      key: '', code: '', metaKey: false, ctrlKey: false, altKey: false, shiftKey: false, repeat: false,
+      preventDefault() {}, stopPropagation() {}, ...over,
+    });
+
+    // ① Cmd+Z：放行——不 preventDefault、不 stopPropagation、不产生任何桥接消息
+    //    （DSH 输入框自带 draft 事务级撤销系统，keydown 冒泡到它的处理器执行 keyboard.undo）
+    let p1 = 0, s1 = 0;
+    keydown(ev({ key: 'z', code: 'KeyZ', metaKey: true, preventDefault() { p1 += 1; }, stopPropagation() { s1 += 1; } }));
+    assert.equal(p1, 0, 'Cmd+Z 不应 preventDefault（放行给页面自身撤销）');
+    assert.equal(s1, 0, 'Cmd+Z 不应 stopPropagation');
+    assert.equal(b.parentMessages.slice(started).length, 0, 'Cmd+Z 不应产生桥接消息');
+
+    // ② Cmd+Shift+Z（重做）与 Ctrl+Z 同样放行
+    let p2 = 0;
+    keydown(ev({ key: 'z', code: 'KeyZ', metaKey: true, shiftKey: true, preventDefault() { p2 += 1; } }));
+    assert.equal(p2, 0, 'Cmd+Shift+Z 应放行');
+    let p3 = 0;
+    keydown(ev({ key: 'z', code: 'KeyZ', ctrlKey: true, preventDefault() { p3 += 1; } }));
+    assert.equal(p3, 0, 'Ctrl+Z 应放行');
+
+    // ③ 对照：Cmd+C 仍被拦截走本地仿真（剪贴板桥接路径不受影响）
+    let p4 = 0;
+    keydown(ev({ key: 'c', code: 'KeyC', metaKey: true, preventDefault() { p4 += 1; } }));
+    assert.equal(p4, 1, 'Cmd+C 仍应被拦截（本地仿真）');
+  } finally {
+    rmSync(b.outDir, { recursive: true, force: true });
+  }
+});
+
+test('v0.3.2 右键菜单「撤销/重做」向焦点输入框派发合成组合键（由页面自身执行）', async () => {
   const fakeRealFetch = async (_input: unknown, _init: any) => jsonResponse(ACCEPT_BODY);
   const b = loadBridge({ fetch: fakeRealFetch });
   try {
     b.apply();
     b.emitWin('message', { kind: 'bridgeHello', token: 'tok', imageFallback: true });
 
-    // 假输入框（React 受控 textarea 的简化）：值存 _v，由桥接的 value setter 写入
+    // 焦点输入框（React 受控 textarea 简化桩）：记录派发的合成事件
+    const dispatched: any[] = [];
     const ta: any = {
       tagName: 'TEXTAREA',
-      _v: '',
+      _v: 'hello world',
       isContentEditable: false,
       isConnected: true,
-      selectionStart: 0,
-      selectionEnd: 0,
+      selectionStart: 5,
+      selectionEnd: 5,
       setSelectionRange() {},
-      dispatchEvent() {},
+      focus() {},
+      dispatchEvent(ev: any) { dispatched.push(ev); },
     };
-    Object.defineProperty(ta, 'value', {
-      get() { return this._v; },
-      set(v: string) { this._v = v; },
-    });
+    Object.defineProperty(ta, 'value', { get() { return this._v; }, set(v: string) { this._v = v; } });
     b.document.activeElement = ta;
 
-    // 模拟输入两段文本（第二段与第一段间隔 > 归组窗口，产生两条撤销记录）。
-    // 时序对齐真实浏览器：beforeinput 在改动前触发（此时 value 还是旧值），随后再应用改动。
-    const type = (text: string) => {
-      b.emitDoc('beforeinput', { target: ta }); // 改动前：此时 _v 为旧值，记录撤销点
-      ta._v = text;                             // 应用改动
-      b.emitDoc('input', { target: ta });       // 改动后：更新 last
-    };
-    type('hello');
-    await new Promise((r) => setTimeout(r, 600)); // 超过 400ms 归组窗口
-    type('hello world');
+    // 右键 → 自定义菜单出现（挂在 body 下，按钮带点击监听）。
+    // 注意：contextmenu 直接调 window 监听器（emitWin 会包一层 {data}，不适合事件桩）
+    b.windowListeners.get('contextmenu')?.forEach((fn) =>
+      fn({ clientX: 10, clientY: 10, preventDefault() {}, stopPropagation() {} }),
+    );
+    const menuEl = b.document.body.children[0];
+    assert.ok(menuEl, '菜单应被创建并挂到 body');
+    const undoBtn = menuEl.children.find((c: any) => c.textContent === '撤销');
+    const redoBtn = menuEl.children.find((c: any) => c.textContent === '重做');
+    assert.ok(undoBtn && redoBtn, '菜单应包含撤销/重做项');
 
-    const keydown = (k: any) => b.windowListeners.get('keydown')?.forEach((fn) => fn(k));
+    // 模拟真实浏览器：点击菜单按钮（mousedown）会把焦点从输入框抢到按钮上——
+    // 撤销/重做必须仍派发给「右键瞬间的输入框」（menuContextEditable），而非当前焦点
+    b.document.activeElement = menuEl;
 
-    // Cmd+Z：原生 execCommand('undo') 返回 false → 手动栈撤销一步 → hello
-    keydown({ key: 'z', metaKey: true, ctrlKey: false, shiftKey: false, preventDefault() {}, stopPropagation() {} });
-    assert.equal(ta._v, 'hello', '第一次撤销应回到 hello');
-    // 再 Cmd+Z：回到输入前空串
-    keydown({ key: 'z', metaKey: true, ctrlKey: false, shiftKey: false, preventDefault() {}, stopPropagation() {} });
-    assert.equal(ta._v, '', '第二次撤销应回到输入前空串');
-    // Cmd+Shift+Z：重做一步 → hello
-    keydown({ key: 'z', metaKey: true, ctrlKey: false, shiftKey: true, preventDefault() {}, stopPropagation() {} });
-    assert.equal(ta._v, 'hello', '重做应恢复 hello');
-    // 重做第二段 → hello world
-    keydown({ key: 'z', metaKey: true, ctrlKey: false, shiftKey: true, preventDefault() {}, stopPropagation() {} });
-    assert.equal(ta._v, 'hello world', '再次重做应恢复 hello world');
+    // 点「撤销」→ 向右键时焦点输入框派发合成 Cmd+Z（metaKey+ctrlKey，无 Shift）
+    undoBtn.listeners.click[0]();
+    assert.equal(dispatched.length, 1, '撤销应派发一次 keydown');
+    assert.equal(dispatched[0].type, 'keydown');
+    assert.equal(dispatched[0].init.key, 'z');
+    assert.equal(dispatched[0].init.metaKey, true, '应带 metaKey（mac 主修饰键）');
+    assert.equal(dispatched[0].init.ctrlKey, true, '应带 ctrlKey（win 主修饰键，DSH 检查 metaKey||ctrlKey）');
+    assert.equal(dispatched[0].init.shiftKey, false, '撤销不带 Shift');
+
+    // 点「重做」→ 合成 Cmd+Shift+Z（shiftKey=true）
+    redoBtn.listeners.click[0]();
+    assert.equal(dispatched.length, 2, '重做应再派发一次');
+    assert.equal(dispatched[1].init.shiftKey, true, '重做应带 Shift');
   } finally {
     rmSync(b.outDir, { recursive: true, force: true });
   }
@@ -672,24 +741,29 @@ test('v0.3.2 工具调用行（ToolRow）fileLink 点击：文本路径转发 op
     const started = b.parentMessages.length;
 
     // 模拟 DSH ToolCall DOM：容器带 data-tool，内部 fileLink 按钮无 title/aria-label，
-    // 文本形如「read · <路径>」（与 dsh-client-ui-tool 的 ToolRow 渲染一致）
-    const mkFileLink = (text: string) => {
-      const btn: any = {
-        classList: { contains: () => false },
-        getAttribute: () => null,
-        textContent: text,
-        closest: (sel: string) => {
-          if (sel === '[data-tool]') return toolRow;
-          if (sel === 'button') return btn;
-          return null;
-        },
-      };
+    // 文本形如「read · <路径>」。fileLinkStructure=true 时模拟真实层级：
+    // [data-tool] > disclosureRoot > fileLink 按钮（折叠行直接子级，Edit 行 basename 场景）
+    const mkFileLink = (text: string, opts?: { fileLinkStructure?: boolean }) => {
       const toolRow: any = {
         classList: { contains: () => false },
         getAttribute: (name: string) => (name === 'data-tool' ? 'read' : null),
         textContent: '',
         closest: () => null,
       };
+      const btn: any = {
+        classList: { contains: () => false },
+        getAttribute: () => null,
+        textContent: text,
+        parentElement: null,
+        closest: (sel: string) => {
+          if (sel === '[data-tool]') return toolRow;
+          if (sel === 'button') return btn;
+          return null;
+        },
+      };
+      if (opts?.fileLinkStructure) {
+        btn.parentElement = { parentElement: toolRow, textContent: '' };
+      }
       return btn;
     };
     const click = (target: any) => {
@@ -720,11 +794,23 @@ test('v0.3.2 工具调用行（ToolRow）fileLink 点击：文本路径转发 op
     assert.equal(openFiles().length, 3);
     assert.equal(openFiles()[2].path, '~/proj/a.ts');
 
-    // ④ 无路径形态的按钮（inspect/chevron 等）：不转发、不 preventDefault
-    const e4 = click(mkFileLink('查看轨迹'));
-    assert.equal(openFiles().length, 3, '非路径按钮不应转发');
-    assert.equal(e4.prevented, 0, '非路径按钮不应 preventDefault');
-    assert.equal(e4.stopped, 0, '非路径按钮不应 stopPropagation');
+    // ④ Edit 行根目录文件：相对化后只剩 basename（README.zh.md，无分隔符）——
+    //    文本判定不命中，由 fileLink 结构判定（折叠行直接子级）兜底
+    const e4 = click(mkFileLink('README.zh.md', { fileLinkStructure: true }));
+    assert.equal(openFiles().length, 4, 'basename 形态的 fileLink 应转发');
+    assert.equal(openFiles()[3].path, 'README.zh.md');
+    assert.equal(e4.prevented, 1, '结构命中应 preventDefault');
+
+    // ⑤ body 区按钮（复制等，非折叠行直接子级）：即使无分隔符也不拦截
+    const e5 = click(mkFileLink('复制'));
+    assert.equal(openFiles().length, 4, '非 fileLink 结构按钮不应转发');
+    assert.equal(e5.prevented, 0, '非 fileLink 结构按钮不应 preventDefault');
+    assert.equal(e5.stopped, 0, '非 fileLink 结构按钮不应 stopPropagation');
+
+    // ⑥ 无路径形态且在折叠行直接子级的空文本按钮（如装饰元素）：不转发
+    const e6 = click(mkFileLink('', { fileLinkStructure: true }));
+    assert.equal(openFiles().length, 4, '空文本按钮不应转发');
+    assert.equal(e6.prevented, 0);
   } finally {
     rmSync(b.outDir, { recursive: true, force: true });
   }

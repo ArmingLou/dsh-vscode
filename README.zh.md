@@ -97,8 +97,8 @@ npm run package        # 产出 dsh-vscode.vsix，再按方式二安装
 - 🔗 **外链跳转**：面板内点击外链，在系统默认浏览器中打开（而非被困在 iframe 内）；
 - 📂 **文件跳转**：点击面板内的文件路径（模型回复中的路径、产物列表、工具调用行如 `read · test/bridge/a.ts`），统一在当前 VS Code 窗口打开对应文件（而非用系统默认应用打开）；
 - 📋 **剪贴板复制**：面板内 DSH 的复制按钮（如代码块复制）改由扩展宿主写入系统剪贴板，绕开 VS Code 对 webview 内跨源 iframe 的剪贴板权限拦截。
-- ↩️ **撤销/重做（macOS Cmd+Z / Cmd+Shift+Z，Windows Ctrl+Z / Ctrl+Y）**：VS Code 会吞掉嵌套 iframe 内的标准快捷键；且 DSH 输入框为 React 受控组件、其原生撤销栈为空，`execCommand('undo')` 会失效。桥接在握手后为输入框维护**手动撤销/重做栈**（连续输入按 400ms 归组为一条记录），原生撤销可用时优先原生、失败时手动兜底——修复 issue #6「无法 Cmd+Z 撤销」。
-- ⌨️ **任意快捷键转发（v0.3.2）**：面板内被 VS Code 吞掉的组合键（如 `Cmd+1`、`Cmd+Esc`）按 `dsh.bridge.shortcuts` 映射转发给扩展宿主执行对应 VS Code 命令。默认内置 `Cmd+1/2/3`（切换辅助栏/面板/侧边栏，与作者 keybindings 一致）、`Cmd+Esc`（最大化面板）；可在设置里自由覆盖或新增任意组合键（如 `"alt+1": "workbench.view.explorer"`、`"cmd+`": "workbench.action.terminal.toggleTerminal"`）；编辑类快捷键（Cmd/Ctrl+C/V/A/X/Z）仍由页面内本地仿真优先。
+- ↩️ **撤销/重做（macOS Cmd+Z / Cmd+Shift+Z，Windows Ctrl+Z / Ctrl+Y）**：DSH 输入框自带 draft 事务级撤销系统，桥接对撤销/重做**放行不拦截**（快捷键事件直达页面处理，浏览器原生撤销对普通输入框照常生效）；右键菜单的「撤销/重做」改为向焦点输入框派发对应组合键，同样由页面自身执行。
+- ⌨️ **任意快捷键转发（v0.3.2）**：面板内被 VS Code 吞掉的组合键（如 `Cmd+1`、`Cmd+Esc`）按 `dsh.bridge.shortcuts` 映射转发给扩展宿主执行对应 VS Code 命令。默认内置 `Cmd+1/2/3`（切换辅助栏/面板/侧边栏，与作者 keybindings 一致）、`Cmd+Esc`（最大化面板）；可在设置里自由覆盖或新增任意组合键（如 `"alt+1": "workbench.view.explorer"`、`"cmd+`": "workbench.action.terminal.toggleTerminal"`）；编辑类快捷键（Cmd/Ctrl+C/V/A/X/Z）仍由页面内本地仿真优先（复制/粘贴/剪切/全选；撤销/重做放行页面自身处理）。
 
 ### 安装与卸载机制（透明披露）
 

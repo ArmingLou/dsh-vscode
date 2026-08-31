@@ -1,3 +1,12 @@
+## [0.3.4] - 2026-08-26
+
+### 修复
+
+- **撤销/重做（Cmd/Ctrl+Z、Cmd+Shift+Z、Ctrl+Y）无效**。根因：DSH 输入框自带 draft 事务级撤销系统（keydown 里 Cmd/Ctrl+Z/Y → `keyboard.undo()/redo()`），而桥接在捕获阶段把 Cmd+Z 拦截（`preventDefault`+`stopPropagation`）——事件到不了 DSH 的 keydown 处理器，其自带撤销被遮蔽；桥接本地执行的 `execCommand('undo')` 对 React 受控输入无效（原生撤销栈为空），旧的手动快照栈也因此失效。修复：**撤销/重做一律放行给页面自身处理**（快捷键事件不再拦截，浏览器原生撤销对普通输入框照常生效）；右键菜单「撤销/重做」改为向焦点输入框派发合成 Cmd/Ctrl+Z（重做带 Shift），由页面自身执行（合成事件不会触发浏览器默认动作，无双重撤销）；**菜单点击会抢走焦点（mousedown 聚焦），故在弹出菜单瞬间记录当时的编辑焦点，派发以它为 target**——否则合成 keydown 派发到菜单按钮上，到不了输入框的 keydown 处理器；移除已无用的手动撤销/重做栈（`inputHistory`/`manualUndo`/`manualRedo`）。
+
+- **点击对话中的文件路径统一改为当前 VS Code 窗口打开**（此前会调用 DSH 的 `host.openPath` 用系统默认应用打开）。覆盖三类路径元素：① 模型回复里的 `button.fileMention`；② 对话尾部「产物」列表的路径 chip；③ **工具调用行（ToolRow）的文件链接按钮**（如 `read · test/bridge/interceptor.test.ts`、`Edit · README.zh.md`，无 `title`/`aria-label` 属性，此前完全漏拦）。修复：文件路径按钮改为按「`fileMention` class、`title` 为绝对路径形态、工具行按钮文本为路径形态（去掉「工具名 · 」前缀、`~` 主目录缩写由扩展侧展开）、或工具行 fileLink 结构（折叠行直接子级按钮）」识别——结构判定覆盖相对化后只剩 basename 的**根目录文件**（如 `README.zh.md`，无路径分隔符）；统一转发扩展宿主 → `showTextDocument` 在当前窗口打开；普通按钮不受影响，未握手（普通浏览器）仍保持 DSH 原生行为。
+- **桥接版本同步 0.3.4**（扩展+桥接统一，随包发布触发强制重装）。
+
 ## [0.3.2] - 2026-08-26
 
 ### 新增
@@ -5,12 +14,8 @@
 - **快捷键桥接：面板内任意 VS Code 快捷键可用**。与 Cmd+C/V 修复同源（VS Code 只把快捷键转发给顶层 webview、嵌套 iframe 内的组合键全部被吞），桥接现在把 iframe 内按下的组合键转发给扩展宿主执行对应 VS Code 命令。新增设置 `dsh.bridge.shortcuts`（`{ 组合键: 命令 }` 映射）：
   - **默认内置**（与作者 keybindings 一致）：`Cmd+1` 切换辅助栏、`Cmd+2` 切换面板、`Cmd+3` 切换侧边栏、`Cmd+Esc` 最大化面板（Windows 对应 `Ctrl+` 前缀版本同设）；反引号键未内置默认映射，需要时自行添加（如 `"cmd+`": "workbench.action.terminal.toggleTerminal"`）；
   - **任意扩展**：组合键写法 `cmd`/`ctrl`/`alt`/`shift` + 按键（字母、`0-9`、`` ` ``、`escape`、`f1-f24` 等），如 `"alt+1": "workbench.view.explorer"`；条目覆盖默认、可自由新增，修改后自动重渲染面板生效；
-  - 编辑类快捷键（Cmd/Ctrl+C/V/A/X/Z）仍由页面内本地仿真优先（复制/粘贴/撤销等），不参与自定义映射；按住不放的自动重复不会重复触发 toggle 类命令。
+  - 编辑类快捷键（Cmd/Ctrl+C/V/A/X/Z）仍由页面内本地仿真优先（复制/粘贴/剪切/全选），不参与自定义映射；撤销/重做（Cmd+Z 等）放行给页面自身处理（见 0.3.4 修复）；按住不放的自动重复不会重复触发 toggle 类命令。
   - 配套桥接升至 `0.3.2`（扩展+桥接统一，触发强制重装），握手诊断日志新增 `shortcuts=N` 便于确认映射已下发。
-
-### 修复
-
-- **点击对话中的文件路径统一改为当前 VS Code 窗口打开**（此前会调用 DSH 的 `host.openPath` 用系统默认应用打开）。覆盖三类路径元素：① 模型回复里的 `button.fileMention`；② 对话尾部「产物」列表的路径 chip；③ **工具调用行（ToolRow）的文件链接按钮**（如 `read · test/bridge/interceptor.test.ts`，无 `title`/`aria-label` 属性，此前完全漏拦）。修复：文件路径按钮改为按「`fileMention` class、`title` 为绝对路径形态、或工具行按钮文本为路径形态」识别，路径一律取真实值（`title` 优先；工具行文本去掉「工具名 · 」前缀、`~` 主目录缩写由扩展侧展开）转发扩展宿主 → `showTextDocument` 在当前窗口打开；普通按钮不受影响，未握手（普通浏览器）仍保持 DSH 原生行为。
 
 ## [0.3.1] - 2026-08-24
 

@@ -40,7 +40,7 @@ window.__ModuleLoader__.load({
     }
 
     // 桥接包版本（与插件版本统一，随包发布；安装器按「版本不一致或 client.js 内容不一致」强制重装）
-    const BRIDGE_VERSION = "0.3.2";
+    const BRIDGE_VERSION = "0.3.4";
 
     // —— 剪贴板写桥接：VS Code webview 对跨源 iframe 的 navigator.clipboard.writeText 有权限拦截 ——
     // 背景：即使 iframe 声明 allow="clipboard-write"，VS Code（Electron）仍会拒绝写入
@@ -203,89 +203,45 @@ window.__ModuleLoader__.load({
     }
 
     // —— 撤销/重做（Cmd/Ctrl+Z、Cmd+Shift+Z / Ctrl+Y） ——
-    // 背景：VS Code 会吞掉 iframe 内快捷键（本桥接在 keydown 捕获阶段接管）；
-    // 且 DSH 输入框为 React 受控组件，其「原生撤销栈」通常为空，document.execCommand('undo')
-    // 会返回 false 且无效果（issue #6：macOS 无法 Cmd+Z 撤销）。因此握手后为每个可编辑元素
-    // 维护手动撤销/重做栈：原生 execCommand 生效时优先用原生，失败时用手动栈兜底。
-    const inputHistory = new Map(); // el -> { undo: string[], redo: string[], last: string, lastTs: number }
-    const UNDO_GROUP_MS = 400; // 连续输入归组窗口：窗口内的输入合并为一条撤销记录
-    const UNDO_MAX = 100; // 每元素撤销栈上限（防无限增长）
-    let programmaticWrite = false; // 我们自己的 writeEditableValue 期间抑制输入历史跟踪
+    // 原则：撤销/重做一律交给「页面自身」处理，桥接绝不本地模拟。
+    // 背景：DSH 输入框（React 受控 textarea）自带 draft 事务级撤销系统（keydown 里
+    // Cmd/Ctrl+Z/Y → keyboard.undo()/redo()），且浏览器对普通可编辑元素有原生撤销。
+    // 桥接若在捕获阶段拦截 Cmd+Z 会遮蔽页面自身的撤销（此前 issue #6 的手动快照栈
+    // 方案即因此失效：事件根本到不了 DSH 的 keydown 处理器）。因此：
+    //  - 快捷键 Cmd/Ctrl+Z / Cmd+Shift+Z / Ctrl+Y：放行原事件（不 preventDefault）；
+    //  - 右键菜单「撤销/重做」：向「右键瞬间的焦点可编辑元素」派发合成 Cmd/Ctrl+Z
+    //    （重做带 Shift），由页面（DSH keyboard.undo/redo 或浏览器原生）执行。合成事件
+    //    （untrusted）不会触发浏览器默认动作，不会造成双重撤销。
+    // 注意：点击菜单按钮会抢走焦点（mousedown 聚焦），此时 document.activeElement 已
+    // 不是输入框——因此必须在弹出菜单时记录当时的编辑焦点（menuContextEditable），
+    // 派发仍以它为 target（合成 keydown 从输入框冒泡到 React root，触发其 onKeyDown）。
+    let menuContextEditable = null; // 右键弹出菜单瞬间的焦点可编辑元素（撤销/重做派发目标）
 
-    // 跟踪可编辑元素的输入：beforeinput 在改动前触发，可拿到「改动前值」压入撤销栈
-    function bindUndoTracking() {
-      if (bindUndoTracking.bound) return; bindUndoTracking.bound = true;
-      document.addEventListener("beforeinput", (e) => {
-        if (bridgeToken === "" || programmaticWrite) return;
-        const el = e.target;
-        if (!isEditableElement(el) || typeof el.value !== "string") return;
-        const now = Date.now();
-        const rec = inputHistory.get(el);
-        if (!rec) {
-          // 首次输入：把「改动前值」（含空串）作为第一条撤销记录，保证能一步退回输入前
-          inputHistory.set(el, { undo: [el.value], redo: [], last: el.value, lastTs: now });
-          return;
-        }
-        if (now - rec.lastTs > UNDO_GROUP_MS) {
-          rec.undo.push(rec.last);
-          if (rec.undo.length > UNDO_MAX) rec.undo.shift();
-          rec.redo.length = 0; // 新输入使重做历史失效
-        }
-        rec.lastTs = now;
-      }, true);
-      document.addEventListener("input", (e) => {
-        if (bridgeToken === "" || programmaticWrite) return;
-        const el = e.target;
-        if (!isEditableElement(el) || typeof el.value !== "string") return;
-        const rec = inputHistory.get(el);
-        if (rec) rec.last = el.value;
-        else inputHistory.set(el, { undo: [el.value], redo: [], last: el.value, lastTs: Date.now() });
-      }, true);
-    }
-
-    // 清理已脱离文档的元素历史（防 Map 无限增长）
-    function pruneInputHistory() {
-      for (const [el] of inputHistory) {
-        if (el.isConnected === false) inputHistory.delete(el);
+    function dispatchUndoKey(redo) {
+      // 优先「右键瞬间的编辑焦点」（点击菜单按钮后焦点已被按钮抢走）；
+      // 元素已脱离文档或从未记录时，回退当前焦点可编辑元素
+      const el =
+        menuContextEditable !== null && menuContextEditable.isConnected !== false
+          ? menuContextEditable
+          : focusedEditable() || null;
+      if (el !== null && typeof el.focus === "function") {
+        try { el.focus(); } catch { /* 焦点失败不阻塞后续派发 */ }
       }
-    }
-
-    // 手动撤销：弹出撤销栈恢复值（原生 execCommand 失败时的兜底）
-    function manualUndo() {
-      const el = focusedEditable();
-      if (!el || typeof el.value !== "string") return false;
-      const rec = inputHistory.get(el);
-      if (!rec || rec.undo.length === 0) return false;
-      const prev = rec.undo.pop();
-      rec.redo.push(el.value);
-      programmaticWrite = true;
+      const target = el !== null ? el : document.activeElement || null;
+      if (target === null || typeof target.dispatchEvent !== "function") {
+        tryExecCommand(redo ? "redo" : "undo"); // 无派发目标：execCommand 最后兜底
+        return;
+      }
       try {
-        writeEditableValue(el, prev);
-      } finally {
-        programmaticWrite = false;
+        const init = {
+          key: "z", code: "KeyZ", bubbles: true, cancelable: true,
+          metaKey: true, ctrlKey: true, shiftKey: redo === true,
+        };
+        target.dispatchEvent(new KeyboardEvent("keydown", init));
+      } catch {
+        // 极老环境无 KeyboardEvent 构造：execCommand 兜底
+        tryExecCommand(redo ? "redo" : "undo");
       }
-      rec.last = prev;
-      pruneInputHistory();
-      return true;
-    }
-
-    // 手动重做（Cmd+Shift+Z / Ctrl+Y 兜底）
-    function manualRedo() {
-      const el = focusedEditable();
-      if (!el || typeof el.value !== "string") return false;
-      const rec = inputHistory.get(el);
-      if (!rec || rec.redo.length === 0) return false;
-      const next = rec.redo.pop();
-      rec.undo.push(el.value);
-      programmaticWrite = true;
-      try {
-        writeEditableValue(el, next);
-      } finally {
-        programmaticWrite = false;
-      }
-      rec.last = next;
-      pruneInputHistory();
-      return true;
     }
 
     // 执行一条被仿真的编辑命令（异步，粘贴/复制兜底需要桥接往返）
@@ -345,11 +301,10 @@ window.__ModuleLoader__.load({
           tryExecCommand("selectAll");
           break;
         case "undo":
-          // 优先原生撤销（内容最完整）；React 受控输入框原生撤销栈为空时用手动栈兜底
-          if (!tryExecCommand("undo")) manualUndo();
-          break;
         case "redo":
-          if (!tryExecCommand("redo")) manualRedo();
+          // 撤销/重做：不本地模拟（React 受控输入的原生撤销栈为空、快照栈会遮蔽
+          // DSH 自带撤销），交给页面自身执行——向焦点可编辑元素派发合成组合键
+          dispatchUndoKey(cmd === "redo");
           break;
       }
     }
@@ -430,6 +385,9 @@ window.__ModuleLoader__.load({
     // 在指定视口坐标显示菜单（自动翻转避免溢出窗口）
     function showMenuAt(x, y) {
       const menu = ensureMenu();
+      // 记录右键瞬间的焦点可编辑元素：菜单按钮点击（mousedown 聚焦）会抢走焦点，
+      // 撤销/重做派发必须回到「右键时正在编辑的元素」才能到达 DSH 的 keydown 处理器
+      menuContextEditable = focusedEditable();
       updateMenuEnabled();
       menu.style.display = "block";
       const rect = menu.getBoundingClientRect();
@@ -485,15 +443,23 @@ window.__ModuleLoader__.load({
         }
         // 工具调用行（DSH ToolCall）：容器带 data-tool 属性，文件链接按钮（无 title/aria-label）
         // 文本形如「read · <路径>」或直接「<路径>」（相对会话 cwd 或 ~ 缩写），onClick 同样走
-        // host.openPath（系统默认打开）。按文本路径形态识别，转发扩展宿主在当前窗口打开；
-        // 无路径形态的按钮（chevron/inspect 等）放行给页面。
+        // host.openPath（系统默认打开）。转发扩展宿主在当前窗口打开。
+        // 识别分两层：
+        //  ① 文本路径形态（extractToolLinkPath：去「工具名 · 」前缀、要求含路径分隔符）——
+        //     覆盖子目录/绝对/~ 路径（read 行通常命中）；
+        //  ② fileLink 结构（按钮是 ToolRow 折叠行的直接子级：parent 的 parent 是 [data-tool]
+        //     容器）——覆盖相对化后只剩 basename 的根目录文件（edit/write 行，如
+        //     「Edit · README.zh.md」，文本无分隔符）。chevron/inspect/复制等按钮不在该结构位置。
         const toolRow = target.closest("[data-tool]");
         if (toolRow && target.closest("button")) {
-          const path = extractToolLinkPath(target.closest("button").textContent);
-          if (path !== "") {
+          const btn = target.closest("button");
+          const text = (btn.textContent || "").trim();
+          const path = extractToolLinkPath(text);
+          const isFileLink = !!btn.parentElement && btn.parentElement.parentElement === toolRow && text !== "";
+          if (path !== "" || isFileLink) {
             e.preventDefault();
             e.stopPropagation();
-            parent.postMessage(buildOpenFileMessage(path), "*");
+            parent.postMessage(buildOpenFileMessage(path !== "" ? path : text), "*");
             return;
           }
         }
@@ -513,6 +479,13 @@ window.__ModuleLoader__.load({
       // ① 标准编辑命令（Cmd/Ctrl+C/V/A/X/Z、Shift+Insert）：本地仿真（execCommand + 剪贴板桥接兜底）
       const cmd = getShortcutCommand(e);
       if (cmd) {
+        // 撤销/重做（Cmd/Ctrl+Z、Cmd+Shift+Z）：放行给页面自身处理——
+        // DSH 输入框自带 draft 事务级撤销系统（keydown 里 z/y → keyboard.undo/redo），
+        // 拦截会遮蔽它（曾导致 Cmd+Z 无效）；其它可编辑元素由浏览器原生撤销处理。
+        if (cmd === "undo" || cmd === "redo") {
+          hideMenu();
+          return; // 不 preventDefault / 不 stopPropagation
+        }
         // 捕获阶段拦截：阻止事件继续传播，避免 DSH 自身处理器或 VS Code 二次处理产生冲突
         e.preventDefault();
         e.stopPropagation();
@@ -789,7 +762,6 @@ window.__ModuleLoader__.load({
     // —— 入口：立即可绑定的拦截先挂载；图片捕获在握手后才绑定 ——
     bindLinkInterception();
     bindImageCapture(); // 附件图片捕获常驻挂载（未握手/关闭时经 imageFallbackEnabled 过滤，零干扰）
-    bindUndoTracking(); // 撤销/重做历史跟踪常驻挂载（未握手时零干扰）
     interceptPromptFetch(); // fetch 拦截常驻挂载（内部用开关过滤，未握手/关闭时零干扰）
     bindPageCleanup();
     window.addEventListener("message", onParentMessage);
