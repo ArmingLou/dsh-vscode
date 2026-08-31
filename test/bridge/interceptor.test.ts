@@ -742,13 +742,19 @@ test('v0.3.2 工具调用行（ToolRow）fileLink 点击：文本路径转发 op
 
     // 模拟 DSH ToolCall DOM：容器带 data-tool，内部 fileLink 按钮无 title/aria-label，
     // 文本形如「read · <路径>」。fileLinkStructure=true 时模拟真实层级：
-    // [data-tool] > disclosureRoot > fileLink 按钮（折叠行直接子级，Edit 行 basename 场景）
+    // fileLink 按钮位于 [data-disclosure-row] 折叠行内（Edit 行 basename 场景）
     const mkFileLink = (text: string, opts?: { fileLinkStructure?: boolean }) => {
       const toolRow: any = {
         classList: { contains: () => false },
         getAttribute: (name: string) => (name === 'data-tool' ? 'read' : null),
         textContent: '',
         closest: () => null,
+      };
+      const foldRow: any = {
+        classList: { contains: () => false },
+        getAttribute: (name: string) => (name === 'data-disclosure-row' ? '' : null),
+        textContent: '',
+        closest: (sel: string) => (sel === '[data-tool]' ? toolRow : null),
       };
       const btn: any = {
         classList: { contains: () => false },
@@ -758,11 +764,12 @@ test('v0.3.2 工具调用行（ToolRow）fileLink 点击：文本路径转发 op
         closest: (sel: string) => {
           if (sel === '[data-tool]') return toolRow;
           if (sel === 'button') return btn;
+          if (sel === '[data-disclosure-row]') return opts?.fileLinkStructure ? foldRow : null;
           return null;
         },
       };
       if (opts?.fileLinkStructure) {
-        btn.parentElement = { parentElement: toolRow, textContent: '' };
+        btn.parentElement = foldRow;
       }
       return btn;
     };
@@ -811,6 +818,93 @@ test('v0.3.2 工具调用行（ToolRow）fileLink 点击：文本路径转发 op
     const e6 = click(mkFileLink('', { fileLinkStructure: true }));
     assert.equal(openFiles().length, 4, '空文本按钮不应转发');
     assert.equal(e6.prevented, 0);
+  } finally {
+    rmSync(b.outDir, { recursive: true, force: true });
+  }
+});
+
+test('v0.3.4 host.openPath RPC 统一拦截：转发扩展宿主并伪造成功响应（后端不被调用）', async () => {
+  const calls: { input: unknown; init: any }[] = [];
+  const fakeRealFetch = async (input: unknown, init: any) => {
+    calls.push({ input, init });
+    return jsonResponse(ACCEPT_BODY);
+  };
+  const b = loadBridge({ fetch: fakeRealFetch });
+  try {
+    b.apply();
+    b.emitWin('message', { kind: 'bridgeHello', token: 'tok', imageFallback: true });
+    const started = b.parentMessages.length;
+
+    // 模拟 DSH 的 callUnary（WebApiClient.doFetch = globalThis.fetch）：
+    // POST /api/host.openPath，请求体为 client-request 线格式
+    const out = await b.window.fetch('/api/host.openPath', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        type: 'client-request',
+        rpcId: 'rpc-1',
+        method: 'host.openPath',
+        payload: { path: '/ws/src/main.ts' },
+      }),
+    });
+    // ① 后端不被调用（系统默认应用不会弹出）
+    assert.equal(calls.length, 0, 'openPath 请求不应到达后端');
+    // ② 转发扩展宿主打开文件
+    const openFiles = b.parentMessages.slice(started).filter((m) => m.kind === 'openFile');
+    assert.equal(openFiles.length, 1, '应转发 openFile 消息');
+    assert.equal(openFiles[0].path, '/ws/src/main.ts');
+    // ③ 伪造 server-response 成功响应（rpcId 回显 + opened:true），DSH 的 rpcId 校验与 value 解析通过
+    const json = await out.json();
+    assert.equal(json.type, 'server-response');
+    assert.equal(json.rpcId, 'rpc-1', 'rpcId 必须回显（否则 DSH 抛 rpcId mismatch）');
+    assert.equal(json.result.ok, true);
+    assert.deepEqual(json.result.value, { opened: true }, 'value 须满足 hostOpenPathValueSchema');
+    assert.equal(out.status, 200);
+  } finally {
+    rmSync(b.outDir, { recursive: true, force: true });
+  }
+});
+
+test('v0.3.4 host.openPath 拦截与图片降级互不干扰：其它 RPC 原样透传', async () => {
+  const calls: { input: unknown; init: any }[] = [];
+  const fakeRealFetch = async (input: unknown, init: any) => {
+    calls.push({ input, init });
+    return jsonResponse(ACCEPT_BODY);
+  };
+  const b = loadBridge({ fetch: fakeRealFetch });
+  try {
+    b.apply();
+    b.emitWin('message', { kind: 'bridgeHello', token: 'tok', imageFallback: true });
+    const started = b.parentMessages.length;
+    // 普通 RPC（如 session.list）不受 openPath 前置拦截影响
+    const out = await b.window.fetch('/api/session.list', {
+      method: 'POST',
+      body: JSON.stringify({ type: 'client-request', rpcId: 'rpc-2', method: 'session.list', payload: {} }),
+    });
+    assert.equal(calls.length, 1, '普通 RPC 应到达后端');
+    assert.equal((await out.json()).result.ok, true);
+    assert.equal(b.parentMessages.slice(started).filter((m) => m.kind === 'openFile').length, 0, '不应转发 openFile');
+  } finally {
+    rmSync(b.outDir, { recursive: true, force: true });
+  }
+});
+
+test('v0.3.4 未握手时 host.openPath 不拦截（普通浏览器保持原生行为）', async () => {
+  const calls: { input: unknown; init: any }[] = [];
+  const fakeRealFetch = async (input: unknown, init: any) => {
+    calls.push({ input, init });
+    return jsonResponse(ACCEPT_BODY);
+  };
+  const b = loadBridge({ fetch: fakeRealFetch });
+  try {
+    b.apply(); // 不握手
+    const started = b.parentMessages.length;
+    await b.window.fetch('/api/host.openPath', {
+      method: 'POST',
+      body: JSON.stringify({ type: 'client-request', rpcId: 'rpc-3', method: 'host.openPath', payload: { path: '/ws/a.ts' } }),
+    });
+    assert.equal(calls.length, 1, '未握手应原样到达后端');
+    assert.equal(b.parentMessages.slice(started).filter((m) => m.kind === 'openFile').length, 0, '未握手不应转发');
   } finally {
     rmSync(b.outDir, { recursive: true, force: true });
   }

@@ -447,16 +447,17 @@ window.__ModuleLoader__.load({
         // 识别分两层：
         //  ① 文本路径形态（extractToolLinkPath：去「工具名 · 」前缀、要求含路径分隔符）——
         //     覆盖子目录/绝对/~ 路径（read 行通常命中）；
-        //  ② fileLink 结构（按钮是 ToolRow 折叠行的直接子级：parent 的 parent 是 [data-tool]
-        //     容器）——覆盖相对化后只剩 basename 的根目录文件（edit/write 行，如
-        //     「Edit · README.zh.md」，文本无分隔符）。chevron/inspect/复制等按钮不在该结构位置。
+        //  ② 折叠行结构（按钮位于 [data-disclosure-row] 行内）——覆盖相对化后只剩 basename
+        //     的根目录文件（edit/write 行，如「Edit · README.md」文本无分隔符）。
+        //     ToolRow 用 expandOnRowClick 时 chevron 渲染为 span，行内按钮只有 fileLink；
+        //     展开区（bodyWrap）的 inspect/复制等按钮在行外，天然被排除。
         const toolRow = target.closest("[data-tool]");
         if (toolRow && target.closest("button")) {
           const btn = target.closest("button");
           const text = (btn.textContent || "").trim();
           const path = extractToolLinkPath(text);
-          const isFileLink = !!btn.parentElement && btn.parentElement.parentElement === toolRow && text !== "";
-          if (path !== "" || isFileLink) {
+          const inFoldRow = text !== "" && btn.closest("[data-disclosure-row]") !== null;
+          if (path !== "" || inFoldRow) {
             e.preventDefault();
             e.stopPropagation();
             parent.postMessage(buildOpenFileMessage(path !== "" ? path : text), "*");
@@ -705,12 +706,34 @@ window.__ModuleLoader__.load({
       }
     }
 
-    // 拦截 prompt RPC：发送含图内容被「模型不支持图像输入」拒绝时，把图片落盘为文件、
-    // 以「原文 + 图片地址」重发，并用重发成功响应顶替被拒响应返回给 DSH——
-    // 用户视角：图片照常发出、模型正常回答，全程无感知，不再弹"不支持图像输入"报错。
+    // 拦截 RPC 传输：① host.openPath（统一接管文件打开）；② prompt RPC 的图片降级。
+    // DSH 的 ApiClient.doFetch 即 globalThis.fetch，本包装是页面上所有 RPC 的必经之路。
     function interceptPromptFetch() {
       const origFetch = window.fetch.bind(window);
       window.fetch = async (input, init) => {
+        // —— 前置拦截：host.openPath（DSH 所有「打开文件」入口的最终汇聚点，默认系统应用打开）——
+        // 一网打尽：无论 UI 元素形态（fileMention / 产物 chip / 工具行 fileLink / 未来新组件），
+        // 只要 DSH 发起 openPath 就接管——转发扩展宿主在当前窗口打开（showTextDocument），
+        // 并伪造 server-response 成功响应让 DSH 无感（rpcId 回显 + opened:true）；
+        // 后端不被调用 → 系统默认应用不会弹出。未握手（普通浏览器）不干涉。
+        if (bridgeToken !== "" && init && init.method === "POST" && typeof init.body === "string" && init.body !== "") {
+          try {
+            const parsed = JSON.parse(init.body);
+            if (
+              parsed && typeof parsed === "object" &&
+              parsed.method === "host.openPath" &&
+              parsed.payload && typeof parsed.payload.path === "string"
+            ) {
+              parent.postMessage(buildOpenFileMessage(parsed.payload.path), "*");
+              console.log("[dsh-vscode-bridge] openPath 接管：转发扩展宿主打开 " + parsed.payload.path);
+              return new Response(JSON.stringify({
+                type: "server-response",
+                rpcId: typeof parsed.rpcId === "string" ? parsed.rpcId : "rpc-id",
+                result: { ok: true, value: { opened: true } },
+              }), { status: 200, headers: { "content-type": "application/json" } });
+            }
+          } catch { /* 非 JSON/形状不符：放行 */ }
+        }
         const res = await origFetch(input, init);
         try {
           if (!imageFallbackEnabled || bridgeToken === "") return res;
