@@ -6,6 +6,9 @@ import {
   createProcessRunner,
   sanitizeCwd,
   findInPath,
+  findInPathPosix,
+  resolveLoginShellPath,
+  mergePath,
   binJsFromShim,
   windowsDshInvocation,
   type ChildProcessLike,
@@ -39,7 +42,10 @@ test('Linux/macOS：命令为 dsh，detached 为 true，参数顺序正确', () 
     calls.push({ cmd, args, opts });
     return new FakeChild();
   };
-  const runner = createProcessRunner(spawnImpl, 'linux');
+  const runner = createProcessRunner(spawnImpl, 'linux', 3000, () => false, {
+    path: '/usr/bin:/bin',
+    shell: '/bin/bash',
+  }, () => { throw new Error('no shell'); });
   runner.startDsh({ host: '127.0.0.1', port: 3080, extraArgs: ['--trusted-host', 'x:1'] });
   assert.equal(calls.length, 1);
   assert.equal(calls[0].cmd, 'dsh');
@@ -69,13 +75,15 @@ test('Windows：注入 PATH 命中 dsh.cmd 后以 node 直跑 bin.js 启动，de
 
 test('stopChild 先发 SIGTERM，graceMs 后补 SIGKILL', async () => {
   const child = new FakeChild();
-  const runner = createProcessRunner(undefined, 'linux', 20); // 缩短宽限期便于测试
+  const runner = createProcessRunner(undefined, 'linux', 20, undefined, undefined, undefined);
   await runner.stopChild(child);
   assert.deepEqual(child.killed, ['SIGTERM', 'SIGKILL']);
 });
 
 test('lastChild 记录最近一次启动的子进程（测试钩子）', () => {
-  const runner = createProcessRunner(() => new FakeChild(), 'linux');
+  const runner = createProcessRunner(() => new FakeChild(), 'linux', 3000, () => false, {
+    path: '', shell: undefined,
+  }, () => { throw new Error('test'); });
   const child = runner.startDsh({ host: '127.0.0.1', port: 3080, extraArgs: [] });
   assert.equal(runner.lastChild, child);
 });
@@ -101,15 +109,18 @@ test('startDsh 透传 cwd 到 spawn 选项（注入 exists=true）', () => {
     calls.push({ cmd, args, opts });
     return new FakeChild();
   };
-  // 注入 existsImpl 返回 true，避免真实文件系统上 /proj 不存在导致 cwd 被 sanitizeCwd 过滤
-  const runner = createProcessRunner(spawnImpl, 'linux', 3000, () => true);
+  const runner = createProcessRunner(spawnImpl, 'linux', 3000, () => true, {
+    path: '', shell: undefined,
+  }, () => { throw new Error('test'); });
   runner.startDsh({ host: '127.0.0.1', port: 3080, extraArgs: [], cwd: '/proj' });
   assert.equal(calls[0].opts.cwd, '/proj');
 });
 
 test('startDsh 未传 cwd 时 spawn 选项不含 cwd 键', () => {
   const calls: unknown[] = [];
-  const runner = createProcessRunner(((cmd, args, opts) => { calls.push(opts); return new FakeChild(); }) as SpawnFn, 'linux');
+  const runner = createProcessRunner(
+    ((cmd, args, opts) => { calls.push(opts); return new FakeChild(); }) as SpawnFn,
+    'linux', 3000, () => false, { path: '', shell: undefined }, () => { throw new Error('test'); });
   runner.startDsh({ host: '127.0.0.1', port: 3080, extraArgs: [] });
   const opts = calls[0] as Record<string, unknown>;
   assert.equal('cwd' in opts, false);
@@ -325,10 +336,192 @@ test('startDsh 默认追加 --no-open，openInBrowser=true 时不追加（v0.3.0
     calls.push({ args });
     return new FakeChild();
   };
-  const runner = createProcessRunner(spawnImpl, 'linux');
+  const runner = createProcessRunner(spawnImpl, 'linux', 3000, () => false, {
+    path: '', shell: undefined,
+  }, () => { throw new Error('test'); });
   runner.startDsh({ host: '127.0.0.1', port: 3080, extraArgs: [] });
   assert.equal(calls[0].args.at(-1), '--no-open');
   runner.startDsh({ host: '127.0.0.1', port: 3080, extraArgs: [], openInBrowser: true });
   assert.equal(calls[1].args.includes('--no-open'), false);
+});
+
+// —— resolveLoginShellPath / mergePath / findInPathPosix ——
+
+test('resolveLoginShellPath：bash/zsh/sh 通过 env.SHELL 解析成功', () => {
+  const fakePath = '/home/user/.nvm/versions/node/v20/bin:/usr/local/bin:/usr/bin';
+  const exec = () => fakePath;
+  assert.equal(resolveLoginShellPath('/bin/zsh', exec, '/usr/bin').path, fakePath);
+  assert.equal(resolveLoginShellPath('/bin/bash', exec, '/usr/bin').path, fakePath);
+  assert.equal(resolveLoginShellPath('/bin/sh', exec, '/usr/bin').path, fakePath);
+});
+
+test('resolveLoginShellPath：返回值含 usedShell（成功时非 null）', () => {
+  const fakePath = '/home/user/.nvm/versions/node/v20/bin:/usr/bin';
+  const exec = () => fakePath;
+  assert.equal(resolveLoginShellPath('/bin/zsh', exec, '/usr/bin').usedShell, '/bin/zsh');
+});
+
+test('resolveLoginShellPath：fish 等不支持的 shell 跳过 env.SHELL，但回退到默认候选', () => {
+  const fakePath = '/home/user/.nvm/versions/node/v20/bin:/usr/bin';
+  const calls: string[] = [];
+  const exec = (cmd: string) => { calls.push(cmd); return fakePath; };
+  const result = resolveLoginShellPath('/usr/local/bin/fish', exec, '/fallback');
+  assert.ok(calls.length >= 1);
+  assert.ok(!calls[0].includes('fish'));
+  assert.equal(result.path, fakePath);
+  assert.ok(result.usedShell !== null);
+});
+
+test('resolveLoginShellPath：shell 为 undefined 时回退到默认候选列表', () => {
+  const fakePath = '/home/user/.nvm/versions/node/v20/bin:/usr/bin';
+  const calls: string[] = [];
+  const exec = (cmd: string) => { calls.push(cmd); return fakePath; };
+  const result = resolveLoginShellPath(undefined, exec, '/fallback');
+  assert.ok(calls.length >= 1);
+  assert.ok(calls[0].includes('/bin/zsh') || calls[0].includes('/bin/bash'));
+  assert.equal(result.path, fakePath);
+  assert.ok(result.usedShell !== null);
+});
+
+test('resolveLoginShellPath：shell 为空字符串时回退到默认候选列表', () => {
+  const fakePath = '/home/user/.nvm/versions/node/v20/bin:/usr/bin';
+  const exec = () => fakePath;
+  const result = resolveLoginShellPath('', exec, '/fallback');
+  assert.equal(result.path, fakePath);
+  assert.ok(result.usedShell !== null);
+});
+
+test('resolveLoginShellPath：所有候选都失败时回退，usedShell 为 null', () => {
+  const exec = () => { throw new Error('boom'); };
+  const result = resolveLoginShellPath(undefined, exec, '/fallback');
+  assert.equal(result.path, '/fallback');
+  assert.equal(result.usedShell, null);
+});
+
+test('resolveLoginShellPath：所有候选 execSync 抛异常时静默回退', () => {
+  const exec = () => { throw new Error('boom'); };
+  const result = resolveLoginShellPath('/bin/zsh', exec, '/fallback');
+  assert.equal(result.path, '/fallback');
+  assert.equal(result.usedShell, null);
+});
+
+test('resolveLoginShellPath：输出不含 / 时跳过该候选继续尝试', () => {
+  let callCount = 0;
+  const exec = () => {
+    callCount++;
+    if (callCount === 1) return 'no-slashes-here';
+    return '/valid/path:/usr/bin';
+  };
+  const result = resolveLoginShellPath('/bin/zsh', exec, '/fallback');
+  assert.ok(callCount > 1);
+  assert.equal(result.path, '/valid/path:/usr/bin');
+});
+
+test('resolveLoginShellPath：env.SHELL 的 zsh 成功时不尝试默认候选', () => {
+  const fakePath = '/home/user/.nvm/versions/node/v20/bin:/usr/bin';
+  const calls: string[] = [];
+  const exec = (cmd: string) => { calls.push(cmd); return fakePath; };
+  const result = resolveLoginShellPath('/bin/zsh', exec, '/fallback');
+  assert.equal(calls.length, 1);
+  assert.equal(result.usedShell, '/bin/zsh');
+});
+
+test('resolveLoginShellPath：env.SHELL 的 zsh 失败后尝试 /bin/bash', () => {
+  let callCount = 0;
+  const exec = () => {
+    callCount++;
+    if (callCount === 1) throw new Error('zsh failed');
+    return '/home/user/.nvm/versions/node/v20/bin:/usr/bin';
+  };
+  const result = resolveLoginShellPath('/bin/zsh', exec, '/fallback');
+  assert.ok(callCount > 1);
+  assert.equal(result.usedShell, '/bin/bash');
+});
+
+test('resolveLoginShellPath：日志回调被调用', () => {
+  const logs: string[] = [];
+  const logFn = (line: string) => logs.push(line);
+  const fakePath = '/home/user/.nvm/versions/node/v20/bin:/usr/bin';
+  const exec = () => fakePath;
+  resolveLoginShellPath('/bin/zsh', exec, '/fallback', logFn);
+  assert.ok(logs.length >= 2);
+  assert.ok(logs[0].includes('[path-resolve]'));
+  assert.ok(logs.some((l) => l.includes('OK')));
+});
+
+test('mergePath：去重并保持 primary 优先', () => {
+  const result = mergePath('/a:/b:/c', '/b:/d', ':');
+  assert.equal(result, '/a:/b:/c:/d');
+});
+
+test('mergePath：空条目跳过', () => {
+  const result = mergePath(':/a::/b:', '/c', ':');
+  assert.equal(result, '/a:/b:/c');
+});
+
+test('mergePath：secondary 全部重复时仅输出 primary', () => {
+  const result = mergePath('/a:/b', '/a:/b', ':');
+  assert.equal(result, '/a:/b');
+});
+
+test('findInPathPosix：命中返回正确路径', () => {
+  const envPath = '/usr/bin:/usr/local/bin:/home/user/.nvm/versions/node/v20/bin';
+  const exists = (p: string) => p === '/home/user/.nvm/versions/node/v20/bin/dsh';
+  assert.equal(findInPathPosix('dsh', envPath, exists), '/home/user/.nvm/versions/node/v20/bin/dsh');
+});
+
+test('findInPathPosix：无命中返回 null', () => {
+  assert.equal(findInPathPosix('dsh', '/usr/bin:/usr/local/bin', () => false), null);
+});
+
+test('findInPathPosix：envPath 为 undefined 返回 null', () => {
+  assert.equal(findInPathPosix('dsh', undefined, () => true), null);
+});
+
+test('startDsh 非 Windows：executablePath 为空时从登录 shell PATH 解析绝对路径', () => {
+  const calls: { cmd: string; args: string[] }[] = [];
+  const spawnImpl: SpawnFn = (cmd, args) => {
+    calls.push({ cmd, args });
+    return new FakeChild();
+  };
+  const nvmBin = '/home/user/.nvm/versions/node/v20/bin';
+  const fakeShellPath = `${nvmBin}:/usr/local/bin:/usr/bin`;
+  const execImpl = () => fakeShellPath;
+  const existsImpl = (p: string) => p === `${nvmBin}/dsh`;
+  const runner = createProcessRunner(spawnImpl, 'darwin', 3000, existsImpl, {
+    path: '/usr/bin:/bin',
+    shell: '/bin/zsh',
+  }, execImpl);
+  runner.startDsh({ host: '127.0.0.1', port: 3080, extraArgs: [] });
+  assert.equal(calls[0].cmd, `${nvmBin}/dsh`);
+});
+
+test('startDsh 非 Windows：解析失败时回退裸名 dsh（不因探测失败变得更糟）', () => {
+  const calls: { cmd: string }[] = [];
+  const spawnImpl: SpawnFn = (cmd) => {
+    calls.push({ cmd });
+    return new FakeChild();
+  };
+  const execImpl = () => { throw new Error('no shell'); };
+  const runner = createProcessRunner(spawnImpl, 'linux', 3000, () => false, {
+    path: '/usr/bin',
+    shell: '/bin/bash',
+  }, execImpl);
+  runner.startDsh({ host: '127.0.0.1', port: 3080, extraArgs: [] });
+  assert.equal(calls[0].cmd, 'dsh');
+});
+
+test('startDsh 非 Windows：显式 executablePath 时跳过 PATH 解析', () => {
+  const calls: { cmd: string }[] = [];
+  const spawnImpl: SpawnFn = (cmd) => {
+    calls.push({ cmd });
+    return new FakeChild();
+  };
+  const runner = createProcessRunner(spawnImpl, 'darwin', 3000, () => true, {
+    path: '/usr/bin',
+    shell: '/bin/zsh',
+  }, () => '/should/not/be/called');
+  runner.startDsh({ host: '127.0.0.1', port: 3080, extraArgs: [], executablePath: '/opt/dsh' });
+  assert.equal(calls[0].cmd, '/opt/dsh');
 });
 

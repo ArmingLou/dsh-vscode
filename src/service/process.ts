@@ -1,8 +1,8 @@
 // src/service/process.ts — dsh web 子进程封装（跨平台）
 // 纯模块：spawn 通过参数注入，便于单测；不依赖 vscode。
-import { spawn, type SpawnOptions } from 'node:child_process';
+import { spawn, execSync, type SpawnOptions } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { win32 as win32Path } from 'node:path';
+import { posix as posixPath, win32 as win32Path } from 'node:path';
 
 /** 最小子进程接口（真实 ChildProcess 结构上兼容，测试可注入假实现） */
 export interface ChildProcessLike {
@@ -42,6 +42,8 @@ export interface RunnerEnv {
   /** Electron 运行时版本（仅 Electron 环境有值；真实 Node 下为 undefined）。
    *  扩展宿主是 Electron，process.execPath 指向 Code.exe，绝不能当作 node 使用。 */
   electronVersion?: string;
+  /** 用户 SHELL 环境变量（macOS/Linux 用于登录 shell PATH 解析；Windows 未使用） */
+  shell?: string;
 }
 
 /**
@@ -90,12 +92,148 @@ export function findInPath(
   existsImpl: (p: string) => boolean = existsSync,
 ): string | null {
   if (envPath === undefined) return null;
-  // Windows PATH 用 ';' 分隔；本函数即 Windows 查找语义，固定 ';'（注意盘符 'C:' 含冒号，
-  // 不可用 ':' 判定/拆分，否则会把 'C:\x' 误拆成 ['C', '\x']）
   for (const dir of envPath.split(';')) {
-    if (dir === '') continue; // 跳过空条目（PATH 首尾分隔符产生）
-    // 用 path.win32.join：须始终产出反斜杠路径（与运行平台无关）
+    if (dir === '') continue;
     const candidate = win32Path.join(dir, target);
+    if (existsImpl(candidate)) return candidate;
+  }
+  return null;
+}
+
+/** execSync 注入签名（便于单测注入假实现） */
+export type ExecSyncFn = (command: string) => string;
+
+/** 默认 execSync 实现：5 秒超时、UTF-8 编码 */
+export const defaultExecSync: ExecSyncFn = (cmd) =>
+  execSync(cmd, { encoding: 'utf8', timeout: 5000 });
+
+/** 支持的登录 shell basename 白名单（fish 等不保证 -l 语义，跳过） */
+const LOGIN_SHELL_WHITELIST = new Set(['bash', 'zsh', 'sh']);
+
+/** 默认候选 shell 路径（当 process.env.SHELL 缺失或不识别时逐个尝试） */
+const DEFAULT_CANDIDATE_SHELLS = ['/bin/zsh', '/bin/bash'];
+
+/** resolveLoginShellPath 诊断回调签名 */
+export type ResolveLogFn = (line: string) => void;
+
+/** resolveLoginShellPath 返回结构（含诊断信息） */
+export interface ResolveResult {
+  /** 解析后的 PATH 字符串；失败时为 fallbackPath */
+  path: string;
+  /** 成功用到的 shell 路径；全部失败为 null */
+  usedShell: string | null;
+}
+
+/**
+ * 构造候选 shell 列表：process.env.SHELL（若 basename ∈ 白名单）优先，再追加默认候选，去重去空。
+ */
+function buildShellCandidates(envShell: string | undefined): string[] {
+  const candidates: string[] = [];
+  if (envShell) {
+    const base = posixPath.basename(envShell);
+    if (LOGIN_SHELL_WHITELIST.has(base)) {
+      candidates.push(envShell);
+    }
+  }
+  for (const s of DEFAULT_CANDIDATE_SHELLS) {
+    if (!candidates.includes(s)) {
+      candidates.push(s);
+    }
+  }
+  return candidates;
+}
+
+/**
+ * 从用户登录 shell 解析 PATH（macOS / Linux 分支专用）。
+ *
+ * 背景：VS Code 从 Dock/Launchpad 启动时宿主进程不继承用户交互 shell
+ * （.zshrc / .zprofile / .bash_profile 等注入的 PATH），导致 nvm/asdf/fnm
+ * 等版本管理器 shim 目录不在 process.env.PATH 中。本函数通过运行
+ * `<shell> -l -c 'echo $PATH'` 获取登录 shell 的完整 PATH。
+ *
+ * 候选 shell 列表：process.env.SHELL（若 basename ∈ {bash,zsh,sh}）优先，
+ * 再追加 /bin/zsh、/bin/bash，去重去空。逐个尝试 `-l -c 'echo $PATH'`；
+ * 只要某个候选输出非空且含 '/' 即返回该 PATH。全部失败才回退 fallbackPath。
+ *
+ * 任何失败（shell 不存在、执行超时、输出异常）均静默回退 fallbackPath。
+ *
+ * @param shell        用户 SHELL 环境变量（如 '/bin/zsh'）；undefined 时仍尝试默认候选
+ * @param execSyncImpl execSync 注入（默认 defaultExecSync）
+ * @param fallbackPath 回退 PATH（通常为 process.env.PATH）
+ * @param logFn        诊断日志回调（可选；不传则不输出诊断）
+ * @returns 解析结果（含 path 与 usedShell）
+ */
+export function resolveLoginShellPath(
+  shell: string | undefined,
+  execSyncImpl: ExecSyncFn,
+  fallbackPath: string,
+  logFn?: ResolveLogFn,
+): ResolveResult {
+  const candidates = buildShellCandidates(shell);
+  logFn?.(`[path-resolve] SHELL=${shell ?? '(空)'} candidates=[${candidates.join(', ')}]`);
+  for (const candidate of candidates) {
+    try {
+      const output = execSyncImpl(`"${candidate}" -l -c 'echo $PATH'`);
+      const loginPath = output.trim();
+      if (loginPath && loginPath.includes('/')) {
+        logFn?.(`[path-resolve] shell=${candidate} OK, loginPath=${loginPath.length > 200 ? loginPath.slice(0, 200) + '...' : loginPath}`);
+        return { path: loginPath, usedShell: candidate };
+      }
+      logFn?.(`[path-resolve] shell=${candidate} output invalid (empty or no '/'), skipping`);
+    } catch (e) {
+      logFn?.(`[path-resolve] shell=${candidate} failed: ${String(e).slice(0, 120)}`);
+    }
+  }
+  logFn?.(`[path-resolve] all candidates failed, fallback to host PATH`);
+  return { path: fallbackPath, usedShell: null };
+}
+
+/**
+ * 合并两条 PATH 并去重（保留 primary 的顺序优先）。
+ *
+ * 典型场景：primary 为登录 shell PATH（含 nvm 目录），secondary 为宿主进程 PATH；
+ * 合并后登录 shell 目录优先，宿主独有的目录追加其后，去重防止重复搜索。
+ *
+ * @param primary    优先 PATH
+ * @param secondary  补充 PATH
+ * @param separator  分隔符（POSIX 为 ':'，Windows 为 ';'）
+ * @returns 去重后的合并 PATH
+ */
+export function mergePath(primary: string, secondary: string, separator: string): string {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const entry of primary.split(separator)) {
+    if (entry === '' || seen.has(entry)) continue;
+    seen.add(entry);
+    result.push(entry);
+  }
+  for (const entry of secondary.split(separator)) {
+    if (entry === '' || seen.has(entry)) continue;
+    seen.add(entry);
+    result.push(entry);
+  }
+  return result.join(separator);
+}
+
+/**
+ * 在 PATH 的目录列表中查找可执行文件（POSIX 查找语义，用 ':' 分隔符 + posix.join）。
+ *
+ * 与 findInPath（Windows 版，';' 分隔 + win32.join）对称，供 macOS / Linux 分支使用。
+ *
+ * @param target     待查找的文件名（如 'dsh'）
+ * @param envPath    环境变量 PATH 的字符串值（':' 分隔）
+ * @param existsImpl 存在性校验（默认 node:fs.existsSync）
+ * @returns 命中的完整路径，未命中返回 null
+ */
+export function findInPathPosix(
+  target: string,
+  envPath: string | undefined,
+  existsImpl: (p: string) => boolean = existsSync,
+): string | null {
+  if (envPath === undefined) return null;
+  for (const dir of envPath.split(':')) {
+    if (dir === '') continue;
+    const candidate = posixPath.join(dir, target);
     if (existsImpl(candidate)) return candidate;
   }
   return null;
@@ -223,10 +361,12 @@ export function createProcessRunner(
   platform: string = process.platform,
   graceMs = 3000,
   existsImpl: (p: string) => boolean = existsSync,
-  env: RunnerEnv = { execPath: process.execPath, path: process.env.PATH ?? '' },
+  env: RunnerEnv = { execPath: process.execPath, path: process.env.PATH ?? '', shell: process.env.SHELL },
+  execSyncImpl: ExecSyncFn = defaultExecSync,
 ): ProcessRunner {
   let lastChild: ChildProcessLike | null = null;
   let lastStart: { command: string; args: string[] } | null = null;
+  let cachedResolve: ResolveResult | null = null;
 
   return {
     startDsh({ host, port, extraArgs, cwd, executablePath, openInBrowser }) {
@@ -280,8 +420,17 @@ export function createProcessRunner(
         spawnArgs = [...argsPrefix, ...webArgs];
         child = spawnImpl(command, spawnArgs, spawnOptions);
       } else {
-        // 非 Windows 分支完全不变：仍 spawn 'dsh'（或显式 executablePath）
-        command = executablePath && executablePath.length > 0 ? executablePath : 'dsh';
+        if (executablePath && executablePath.length > 0) {
+          command = executablePath;
+        } else {
+          const hostPath = env.path ?? process.env.PATH ?? '';
+          if (cachedResolve === null) {
+            cachedResolve = resolveLoginShellPath(env.shell ?? process.env.SHELL, execSyncImpl, hostPath);
+          }
+          const merged = mergePath(cachedResolve.path, hostPath, ':');
+          const found = findInPathPosix('dsh', merged, existsImpl);
+          command = found ?? 'dsh';
+        }
         spawnArgs = webArgs;
         child = spawnImpl(command, spawnArgs, spawnOptions);
       }

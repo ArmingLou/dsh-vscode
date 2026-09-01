@@ -381,11 +381,20 @@ export class ServiceManager {
         this.deps.log('[process] 已捕获 dsh web 访问令牌（新版 dsh 动态生成）');
         if (this.snapshot.state === 'ready') {
           this.set({ url: this.url() }); // 就绪后令牌才到：刷新地址
-          // 令牌更新（理论罕见：同一进程重复打印）：让代理重新交换会话 Cookie
           if (this.proxy) {
+            // 令牌更新（理论罕见：同一进程重复打印）：让代理重新交换会话 Cookie
             void this.proxy.setToken?.(token).catch((err) =>
               this.deps.log(`[proxy] 令牌刷新失败: ${String(err)}`),
             );
+          } else {
+            // 竞态补建：令牌晚于就绪到达时，首次 ensureProxy 因无令牌跳过，
+            // 此时代理仍为空——补建代理并刷新嵌入地址，否则面板回退直连会 401 白屏
+            void (async () => {
+              await this.ensureProxy();
+              if (this.snapshot.state === 'ready') {
+                this.set({ embedUrl: this.proxy?.url ?? null });
+              }
+            })();
           }
         }
       }
@@ -515,7 +524,10 @@ export class ServiceManager {
    */
   private async ensureProxy(): Promise<void> {
     const token = this.authToken;
-    if (!token) return; // 旧版 dsh：无令牌，无需代理
+    if (!token) {
+      this.deps.log('[proxy] 令牌未解析到（新版 dsh 启动行尚未输出）或旧版无令牌，跳过建代理');
+      return;
+    }
     const key = `${token}@${this.opts.host}:${this.opts.port}`;
     if (this.proxy && this.proxyKey === key) return; // 已就绪
     await this.stopProxy();

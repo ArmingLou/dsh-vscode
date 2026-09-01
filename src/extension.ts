@@ -6,7 +6,7 @@ import { readFileSync } from 'node:fs';
 import { initI18n, t } from './i18n';
 import { readConfig, type DshConfig } from './config';
 import { probeService } from './service/detect';
-import { createProcessRunner, findInPath } from './service/process';
+import { createProcessRunner, findInPath, resolveLoginShellPath, mergePath, findInPathPosix, defaultExecSync, type ResolveResult } from './service/process';
 import { ServiceManager, type ManagerOptions } from './service/manager';
 import { DshPanelProvider } from './panel/provider';
 import { StatusBarController } from './statusbar';
@@ -96,11 +96,10 @@ function resolveNpmGlobalNodeModules(config: DshConfig): string | undefined {
  * 定位 dsh 可执行文件并读取其版本（Windows 由 dsh.cmd 推导 bin.js 后读包内 package.json）。
  * 用于环境信息头：问题报告据此核对 dsh 安装位置与版本，无需再追问用户环境。
  */
-function describeDshExecutable(config: DshConfig): { path: string | null; version: string | null } {
+function describeDshExecutable(config: DshConfig, logFn: (line: string) => void): { path: string | null; version: string | null } {
   let shim: string | null = null;
   let binJs: string | null = null;
   if (process.platform === 'win32') {
-    // Windows：显式 executablePath 优先；否则 PATH 找 dsh.cmd → 推导 bin.js 绝对路径
     shim = config.executablePath && !config.executablePath.endsWith('.js')
       ? config.executablePath
       : findInPath('dsh.cmd', process.env.PATH ?? '');
@@ -110,12 +109,29 @@ function describeDshExecutable(config: DshConfig): { path: string | null; versio
         : join(dirname(shim), 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
     }
   } else {
-    // 非 Windows：显式路径记录路径；否则只记录命令名（版本读取依赖具体安装布局，跳过）
-    shim = config.executablePath && config.executablePath.length > 0 ? config.executablePath : 'dsh';
+    if (config.executablePath && config.executablePath.length > 0) {
+      shim = config.executablePath;
+      logFn(`[dsh-locate] executablePath=${shim}, skipping PATH resolution`);
+    } else {
+      const hostPath = process.env.PATH ?? '';
+      const resolve: ResolveResult = resolveLoginShellPath(process.env.SHELL, defaultExecSync, hostPath, logFn);
+      const merged = mergePath(resolve.path, hostPath, ':');
+      const found = findInPathPosix('dsh', merged);
+      logFn(`[dsh-locate] usedShell=${resolve.usedShell ?? '(无)'} findInPathPosix=${found ?? '(未命中)'} shim=${found ?? 'dsh'}`);
+      shim = found ?? 'dsh';
+    }
+    if (shim && shim !== 'dsh') {
+      try {
+        const versionOutput = defaultExecSync(`"${shim}" --version`).trim();
+        const firstLine = versionOutput.split('\n')[0];
+        if (firstLine) return { path: shim, version: firstLine };
+      } catch {
+        // 版本探测失败按未知处理
+      }
+    }
   }
   if (binJs) {
     try {
-      // bin.js 上两级即 @deepseek-ai/dsh 包根，读其 package.json 的 version
       const version = JSON.parse(readFileSync(join(dirname(dirname(binJs)), 'package.json'), 'utf8')).version;
       return { path: shim, version };
     } catch {
@@ -141,7 +157,7 @@ export function activate(context: vscode.ExtensionContext): void {
   appendLog(`平台: ${process.platform} (${process.arch})`);
   const electronVersion = (process.versions as { electron?: string }).electron;
   appendLog(`宿主 Node: ${process.version}${electronVersion ? ` / Electron ${electronVersion}` : ''}`);
-  const dshInfo = describeDshExecutable(config);
+  const dshInfo = describeDshExecutable(config, appendLog);
   appendLog(`dsh 可执行文件: ${dshInfo.path ?? '未定位'}`);
   appendLog(`dsh 版本: ${dshInfo.version ?? '未知'}`);
   appendLog(
