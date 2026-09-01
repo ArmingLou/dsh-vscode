@@ -1,8 +1,9 @@
 // src/service/process.ts — dsh web 子进程封装（跨平台）
 // 纯模块：spawn 通过参数注入，便于单测；不依赖 vscode。
 import { spawn, execSync, type SpawnOptions } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readdirSync } from 'node:fs';
 import { posix as posixPath, win32 as win32Path } from 'node:path';
+import { homedir } from 'node:os';
 
 /** 最小子进程接口（真实 ChildProcess 结构上兼容，测试可注入假实现） */
 export interface ChildProcessLike {
@@ -44,6 +45,8 @@ export interface RunnerEnv {
   electronVersion?: string;
   /** 用户 SHELL 环境变量（macOS/Linux 用于登录 shell PATH 解析；Windows 未使用） */
   shell?: string;
+  /** 用户 home 目录（默认 node:os.homedir()；单测可注入） */
+  homeDir?: string;
 }
 
 /**
@@ -125,6 +128,106 @@ export interface ResolveResult {
 }
 
 /**
+ * 直接扫描常见版本管理器/安装目录查找 dsh（不依赖 shell）。
+ *
+ * 场景：VS Code 从 Dock/Launchpad 启动时宿主 PATH 最小化，且登录 shell (-l) 不 source
+ * .zshrc（用户的 nvm 通常在 .zshrc 里加载），导致 shell PATH 解析也拿不到 nvm 目录。
+ * 本函数绕过 shell，用 node:fs 直接扫描已知目录，返回第一个存在的 dsh 路径。
+ *
+ * 扫描顺序：
+ * 1) nvm: ~/.nvm/versions/node/\<version\>/bin/dsh（按版本目录名降序取最新）
+ * 2) ~/.local/bin/dsh
+ * 3) asdf: ~/.asdf/shims/dsh
+ * 4) fnm: ~/.fnm/node-versions/\<version\>/installation/bin/dsh（降序取最新）
+ * 5) /opt/homebrew/bin/dsh、/usr/local/bin/dsh（brew/various）
+ *
+ * @param existsImpl 存在性校验（默认 node:fs.existsSync；单测可注入）
+ * @param readdirImpl 目录读取（默认 node:fs.readdirSync；单测可注入）
+ * @param homedirVal 用户 home 目录（默认 node:os.homedir()；单测可注入）
+ * @param logFn 诊断日志回调（可选）
+ * @returns 命中的 dsh 绝对路径；全部未命中返回 null
+ */
+export function scanCommonDshLocations(
+  existsImpl: (p: string) => boolean = existsSync,
+  readdirImpl: (dir: string) => string[] = (dir) => readdirSync(dir),
+  homedirVal: string = homedir(),
+  logFn?: ResolveLogFn,
+): string | null {
+  const home = homedirVal;
+  const hits: string[] = [];
+
+  // 1) nvm: ~/.nvm/versions/node/*/bin/dsh — 按版本目录降序取最新
+  const nvmDir = posixPath.join(home, '.nvm', 'versions', 'node');
+  let nvmTried = false;
+  try {
+    const versions = readdirImpl(nvmDir);
+    nvmTried = true;
+    const sorted = versions
+      .filter((v) => v.startsWith('v'))
+      .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+    for (const v of sorted) {
+      const candidate = posixPath.join(nvmDir, v, 'bin', 'dsh');
+      if (existsImpl(candidate)) {
+        logFn?.(`[dsh-scan] nvm hit: ${candidate}`);
+        hits.push(candidate);
+      }
+    }
+    if (hits.length > 0) return hits[0];
+  } catch {
+    // nvm 目录不存在或不可读，跳过
+  }
+  logFn?.(`[dsh-scan] nvm: ${nvmTried ? 'no dsh in versions' : 'dir not found'}`);
+
+  // 2) ~/.local/bin/dsh
+  const localBin = posixPath.join(home, '.local', 'bin', 'dsh');
+  if (existsImpl(localBin)) {
+    logFn?.(`[dsh-scan] local hit: ${localBin}`);
+    return localBin;
+  }
+
+  // 3) asdf: ~/.asdf/shims/dsh
+  const asdfShim = posixPath.join(home, '.asdf', 'shims', 'dsh');
+  if (existsImpl(asdfShim)) {
+    logFn?.(`[dsh-scan] asdf hit: ${asdfShim}`);
+    return asdfShim;
+  }
+
+  // 4) fnm: ~/.fnm/node-versions/*/installation/bin/dsh — 降序取最新
+  const fnmDir = posixPath.join(home, '.fnm', 'node-versions');
+  let fnmTried = false;
+  try {
+    const versions = readdirImpl(fnmDir);
+    fnmTried = true;
+    const sorted = versions
+      .filter((v) => v.startsWith('v'))
+      .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+    for (const v of sorted) {
+      const candidate = posixPath.join(fnmDir, v, 'installation', 'bin', 'dsh');
+      if (existsImpl(candidate)) {
+        logFn?.(`[dsh-scan] fnm hit: ${candidate}`);
+        hits.push(candidate);
+      }
+    }
+    if (hits.length > 0) return hits[0];
+  } catch {
+    // fnm 目录不存在或不可读，跳过
+  }
+  logFn?.(`[dsh-scan] fnm: ${fnmTried ? 'no dsh in versions' : 'dir not found'}`);
+
+  // 5) brew/various: /opt/homebrew/bin/dsh, /usr/local/bin/dsh
+  const brewDirs = ['/opt/homebrew/bin/dsh', '/usr/local/bin/dsh'];
+  for (const candidate of brewDirs) {
+    if (existsImpl(candidate)) {
+      logFn?.(`[dsh-scan] brew hit: ${candidate}`);
+      return candidate;
+    }
+  }
+
+  logFn?.(`[dsh-scan] all scan locations exhausted, no dsh found`);
+  return null;
+}
+
+/**
  * 构造候选 shell 列表：process.env.SHELL（若 basename ∈ 白名单）优先，再追加默认候选，去重去空。
  */
 function buildShellCandidates(envShell: string | undefined): string[] {
@@ -144,16 +247,35 @@ function buildShellCandidates(envShell: string | undefined): string[] {
 }
 
 /**
+ * 判断候选 shell 的 rc 文件名（bash → .bashrc，zsh → .zshrc，sh → 无）。
+ */
+function rcFileForShell(shellPath: string): string | null {
+  const base = posixPath.basename(shellPath);
+  if (base === 'zsh') return '.zshrc';
+  if (base === 'bash') return '.bashrc';
+  return null;
+}
+
+/**
  * 从用户登录 shell 解析 PATH（macOS / Linux 分支专用）。
  *
  * 背景：VS Code 从 Dock/Launchpad 启动时宿主进程不继承用户交互 shell
  * （.zshrc / .zprofile / .bash_profile 等注入的 PATH），导致 nvm/asdf/fnm
- * 等版本管理器 shim 目录不在 process.env.PATH 中。本函数通过运行
- * `<shell> -l -c 'echo $PATH'` 获取登录 shell 的完整 PATH。
+ * 等版本管理器 shim 目录不在 process.env.PATH 中。
+ *
+ * 解析顺序（逐个候选 shell 尝试，首个成功即返回）：
+ * 1. **source rc 文件**：`<shell> -c 'source ~/.zshrc >/dev/null 2>&1; echo $PATH'`
+ *    - zsh source ~/.zshrc，bash source ~/.bashrc。
+ *    - 登录 shell (-l) 不 source .zshrc（用户的 nvm 通常在 .zshrc 里加载），
+ *      而 source .zshrc 能拿到 nvm 目录。
+ *    - 风险隔离：`>/dev/null 2>&1` 抑制 rc 文件的标准输出（如代理脚本/oh-my-zsh
+ *      可能输出文字）；execSync 已有 5s 超时防卡死；任何异常均静默跳过。
+ * 2. **登录 shell 回退**：`<shell> -l -c 'echo $PATH'`（旧行为，含 .zprofile/.zlogin
+ *    但不含 .zshrc）。
+ * 3. 全部候选 shell 失败后回退 fallbackPath。
  *
  * 候选 shell 列表：process.env.SHELL（若 basename ∈ {bash,zsh,sh}）优先，
- * 再追加 /bin/zsh、/bin/bash，去重去空。逐个尝试 `-l -c 'echo $PATH'`；
- * 只要某个候选输出非空且含 '/' 即返回该 PATH。全部失败才回退 fallbackPath。
+ * 再追加 /bin/zsh、/bin/bash，去重去空。
  *
  * 任何失败（shell 不存在、执行超时、输出异常）均静默回退 fallbackPath。
  *
@@ -172,16 +294,35 @@ export function resolveLoginShellPath(
   const candidates = buildShellCandidates(shell);
   logFn?.(`[path-resolve] SHELL=${shell ?? '(空)'} candidates=[${candidates.join(', ')}]`);
   for (const candidate of candidates) {
+    // 1) 优先 source rc 文件（.zshrc / .bashrc）
+    const rcFile = rcFileForShell(candidate);
+    if (rcFile) {
+      try {
+        const output = execSyncImpl(`"${candidate}" -c 'source ~/${rcFile} >/dev/null 2>&1; echo $PATH'`);
+        const rcPath = output.trim();
+        if (rcPath && rcPath.includes('/')) {
+          const hasNvm = rcPath.includes('.nvm/versions/node');
+          logFn?.(`[path-resolve] shell=${candidate} source ~/.${rcFile} OK, hasNvm=${hasNvm}, path=${rcPath.length > 200 ? rcPath.slice(0, 200) + '...' : rcPath}`);
+          return { path: rcPath, usedShell: candidate };
+        }
+        logFn?.(`[path-resolve] shell=${candidate} source ~/.${rcFile} output invalid (empty or no '/'), trying -l fallback`);
+      } catch (e) {
+        logFn?.(`[path-resolve] shell=${candidate} source ~/.${rcFile} failed: ${String(e).slice(0, 120)}, trying -l fallback`);
+      }
+    }
+
+    // 2) 回退到登录 shell -l -c（旧行为）
     try {
       const output = execSyncImpl(`"${candidate}" -l -c 'echo $PATH'`);
       const loginPath = output.trim();
       if (loginPath && loginPath.includes('/')) {
-        logFn?.(`[path-resolve] shell=${candidate} OK, loginPath=${loginPath.length > 200 ? loginPath.slice(0, 200) + '...' : loginPath}`);
+        const hasNvm = loginPath.includes('.nvm/versions/node');
+        logFn?.(`[path-resolve] shell=${candidate} -l OK, hasNvm=${hasNvm}, loginPath=${loginPath.length > 200 ? loginPath.slice(0, 200) + '...' : loginPath}`);
         return { path: loginPath, usedShell: candidate };
       }
-      logFn?.(`[path-resolve] shell=${candidate} output invalid (empty or no '/'), skipping`);
+      logFn?.(`[path-resolve] shell=${candidate} -l output invalid (empty or no '/'), skipping`);
     } catch (e) {
-      logFn?.(`[path-resolve] shell=${candidate} failed: ${String(e).slice(0, 120)}`);
+      logFn?.(`[path-resolve] shell=${candidate} -l failed: ${String(e).slice(0, 120)}`);
     }
   }
   logFn?.(`[path-resolve] all candidates failed, fallback to host PATH`);
@@ -363,6 +504,7 @@ export function createProcessRunner(
   existsImpl: (p: string) => boolean = existsSync,
   env: RunnerEnv = { execPath: process.execPath, path: process.env.PATH ?? '', shell: process.env.SHELL },
   execSyncImpl: ExecSyncFn = defaultExecSync,
+  readdirImpl: (dir: string) => string[] = (dir) => readdirSync(dir),
 ): ProcessRunner {
   let lastChild: ChildProcessLike | null = null;
   let lastStart: { command: string; args: string[] } | null = null;
@@ -429,7 +571,12 @@ export function createProcessRunner(
           }
           const merged = mergePath(cachedResolve.path, hostPath, ':');
           const found = findInPathPosix('dsh', merged, existsImpl);
-          command = found ?? 'dsh';
+          if (found) {
+            command = found;
+          } else {
+            const scanned = scanCommonDshLocations(existsImpl, readdirImpl, env.homeDir ?? homedir());
+            command = scanned ?? 'dsh';
+          }
         }
         spawnArgs = webArgs;
         child = spawnImpl(command, spawnArgs, spawnOptions);
@@ -443,8 +590,17 @@ export function createProcessRunner(
     async stopChild(child) {
       if (child.pid === undefined) return;
       child.kill('SIGTERM');
+      // Unix 上 detached 子进程在独立进程组，额外向整组发信号防残留子进程（dsh web 可 spawn 子进程）
+      if (platform !== 'win32' && child.pid > 0) {
+        try { process.kill(-child.pid, 'SIGTERM'); } catch { /* 进程组可能已退出 */ }
+      }
       await new Promise((resolve) => setTimeout(resolve, graceMs));
       child.kill('SIGKILL');
+      if (platform !== 'win32' && child.pid > 0) {
+        try { process.kill(-child.pid, 'SIGKILL'); } catch { /* 已退出，忽略 */ }
+      }
+      // 等待端口释放：SIGKILL 后内核需回收 socket，短暂等待避免紧接的 restart 端口冲突
+      await new Promise((resolve) => setTimeout(resolve, 200));
     },
 
     get lastChild() {

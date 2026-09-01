@@ -8,6 +8,7 @@ import { isRemoteName } from '../remote';
 import { t } from '../i18n';
 import {
   loadingPage,
+  connectingPage,
   errorPage,
   disconnectedPage,
   stoppedPage,
@@ -241,13 +242,20 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
     const s = this.manager.getSnapshot();
     if (s.state === 'ready' && isRemoteName(vscode.env.remoteName) && this.remoteEnabled()) {
       const gen = ++this.renderGen;
-      // 面板嵌入用地址：新版 dsh 优先代理地址（webview 无 Cookie 也能访问）；本地原样
-      const raw = s.embedUrl ?? s.url ?? this.rawUrl();
+      const hasProxy = s.embedUrl !== null;
+      const hasToken = s.url !== null && /\?token=/.test(s.url);
+      const raw = hasProxy ? s.embedUrl! : hasToken ? null : (s.url ?? this.rawUrl());
+      if (raw === null) {
+        ++this.renderGen;
+        this.pendingExternalUrl = null;
+        this.render();
+        return;
+      }
       const resolved = await this.resolveExternalUrl(raw);
-      if (gen !== this.renderGen) return; // 期间状态又变，丢弃过期结果
+      if (gen !== this.renderGen) return;
       this.pendingExternalUrl = resolved;
     } else {
-      ++this.renderGen; // 使进行中的解析过期
+      ++this.renderGen;
       this.pendingExternalUrl = null;
     }
     this.render();
@@ -275,23 +283,38 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
       switch (s.state) {
         case 'ready':
           this.wasConnected = true;
-          // iframe/CSP 使用解析后的本地可达 URL（远程=隧道；本地=代理地址或原地址）。
-          // frameHosts 以实际 iframe 地址的 origin 为准，保证 CSP 放行（代理端口与 dsh 端口不同）。
           {
-            const displayUrl = this.pendingExternalUrl ?? s.embedUrl ?? s.url ?? this.rawUrl();
-            const frameOrigin =
-              this.pendingExternalUrl !== null
-                ? new URL(this.pendingExternalUrl).origin
-                : s.embedUrl !== null
-                  ? new URL(s.embedUrl).origin
+            const hasProxy = s.embedUrl !== null;
+            const hasToken = s.url !== null && /\?token=/.test(s.url);
+            if (hasProxy) {
+              const displayUrl = this.pendingExternalUrl ?? s.embedUrl!;
+              const frameOrigin =
+                this.pendingExternalUrl !== null
+                  ? new URL(this.pendingExternalUrl).origin
+                  : new URL(s.embedUrl!).origin;
+              ctx.frameHosts = [frameOrigin];
+              html = readyPage(displayUrl, ctx, {
+                token: this.bridgeToken,
+                enabled: this.bridgeEnabled(),
+                imageFallback: this.imageFallback(),
+                shortcuts: this.shortcuts(),
+              });
+            } else if (hasToken) {
+              html = connectingPage(t, ctx);
+            } else {
+              const displayUrl = this.pendingExternalUrl ?? s.url ?? this.rawUrl();
+              const frameOrigin =
+                this.pendingExternalUrl !== null
+                  ? new URL(this.pendingExternalUrl).origin
                   : null;
-            if (frameOrigin !== null) ctx.frameHosts = [frameOrigin];
-            html = readyPage(displayUrl, ctx, {
-              token: this.bridgeToken,
-              enabled: this.bridgeEnabled(), // 由 dsh.bridge.enabled 配置驱动（Task 7 接入）
-              imageFallback: this.imageFallback(), // v0.3.0：降级开关随握手消息带给桥接客户端
-              shortcuts: this.shortcuts(), // v0.3.2：快捷键映射随握手消息带给桥接客户端（拦截哪些组合键）
-            });
+              if (frameOrigin !== null) ctx.frameHosts = [frameOrigin];
+              html = readyPage(displayUrl, ctx, {
+                token: this.bridgeToken,
+                enabled: this.bridgeEnabled(),
+                imageFallback: this.imageFallback(),
+                shortcuts: this.shortcuts(),
+              });
+            }
           }
           break;
         case 'failed':

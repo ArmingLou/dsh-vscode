@@ -97,12 +97,16 @@ export interface ManagerDeps {
   proxyFactory?: (opts: { target: DshProxyTarget; token: string }) => DshProxyLike;
 }
 
-/** 启动总超时默认值（毫秒） */
-const DEFAULT_START_TIMEOUT_MS = 15000;
+/** 启动总超时默认值（毫秒）——dsh 冷启动约 14s，留 4x 余量覆盖慢机/多实例；按用户决定固定 60s */
+const DEFAULT_START_TIMEOUT_MS = 60000;
 /** 就绪后健康探测间隔默认值（毫秒） */
 const DEFAULT_HEALTH_INTERVAL_MS = 30000;
 /** 「崩溃后换端口重启」的最大轮数（防死循环；超过后报启动崩溃） */
 const PORT_FALLBACK_MAX_ROUNDS = 3;
+/** ensureProxy 失败重试次数 */
+const PROXY_RETRY_ATTEMPTS = 3;
+/** ensureProxy 重试间隔（毫秒） */
+const PROXY_RETRY_DELAY_MS = 1000;
 
 export class ServiceManager {
   private snapshot: ServiceSnapshot = { state: 'idle', url: null, embedUrl: null, error: null, owned: false };
@@ -130,17 +134,23 @@ export class ServiceManager {
   private proxy: DshProxyLike | null = null;
   /** 代理对应的令牌（重建判据：令牌/端口变化时重启代理并重新交换） */
   private proxyKey: string | null = null;
+  /** 配置中设定的原始端口（不含运行时 fallback），reconfigure 用来判定端口是否真正变更 */
+  private originalPort: number;
   private disposed = false;
   /** 父进程退出时杀掉子进程，防止僵尸（stopOnExit=false 时移除） */
   private parentExitHook = (): void => {
     try {
-      this.child?.kill('SIGKILL');
+      if (this.child?.pid) {
+        try { process.kill(-this.child.pid, 'SIGKILL'); } catch { /* 非 Unix 或进程组已退出 */ }
+        this.child.kill('SIGKILL');
+      }
     } catch {
       /* 进程可能已退出，忽略 */
     }
   };
 
   constructor(private opts: ManagerOptions, private deps: ManagerDeps) {
+    this.originalPort = opts.port;
     process.once('exit', this.parentExitHook);
   }
 
@@ -379,23 +389,17 @@ export class ServiceManager {
       if (token !== null && token !== this.authToken) {
         this.authToken = token;
         this.deps.log('[process] 已捕获 dsh web 访问令牌（新版 dsh 动态生成）');
-        if (this.snapshot.state === 'ready') {
-          this.set({ url: this.url() }); // 就绪后令牌才到：刷新地址
-          if (this.proxy) {
-            // 令牌更新（理论罕见：同一进程重复打印）：让代理重新交换会话 Cookie
-            void this.proxy.setToken?.(token).catch((err) =>
-              this.deps.log(`[proxy] 令牌刷新失败: ${String(err)}`),
-            );
-          } else {
-            // 竞态补建：令牌晚于就绪到达时，首次 ensureProxy 因无令牌跳过，
-            // 此时代理仍为空——补建代理并刷新嵌入地址，否则面板回退直连会 401 白屏
-            void (async () => {
-              await this.ensureProxy();
-              if (this.snapshot.state === 'ready') {
-                this.set({ embedUrl: this.proxy?.url ?? null });
-              }
-            })();
-          }
+        if (this.proxy && this.proxyKey === `${token}@${this.opts.host}:${this.opts.port}`) {
+          void this.proxy.setToken?.(token).catch((err) =>
+            this.deps.log(`[proxy] 令牌刷新失败: ${String(err)}`),
+          );
+        } else {
+          void (async () => {
+            await this.ensureProxy();
+            if (this.snapshot.state === 'ready') {
+              this.set({ url: this.url(), embedUrl: this.proxy?.url ?? null });
+            }
+          })();
         }
       }
     });
@@ -520,7 +524,8 @@ export class ServiceManager {
    * 确保面板嵌入代理就绪（幂等）：有令牌且令牌/端口未变时复用，否则重建并重新交换会话 Cookie。
    * 新版 dsh 的 SameSite=Strict 会话 Cookie 在 VS Code webview（跨站子框架）中无法回传，
    * 面板必须经代理访问；旧版 dsh（无令牌）不需要代理，直接返回。
-   * 代理启动失败不回退状态：记录日志，面板回退直连（表现为授权页，日志可排查）。
+   * 代理启动失败时重试最多 PROXY_RETRY_ATTEMPTS 次（dsh 可能尚未完全就绪导致交换失败），
+   * 全部失败则记录日志，面板将显示"正在连接"占位页而非 401 白屏。
    */
   private async ensureProxy(): Promise<void> {
     const token = this.authToken;
@@ -529,19 +534,27 @@ export class ServiceManager {
       return;
     }
     const key = `${token}@${this.opts.host}:${this.opts.port}`;
-    if (this.proxy && this.proxyKey === key) return; // 已就绪
+    if (this.proxy && this.proxyKey === key) return;
     await this.stopProxy();
     const factory = this.deps.proxyFactory ?? createDefaultProxyFactory(this.deps.log);
-    try {
-      const proxy = factory({ target: { host: this.opts.host, port: this.opts.port }, token });
-      await proxy.start();
-      this.proxy = proxy;
-      this.proxyKey = key;
-      this.deps.log(`[proxy] 面板嵌入代理已启动: ${proxy.url}（webview 无 Cookie 访问）`);
-    } catch (err) {
-      this.proxy = null;
-      this.proxyKey = null;
-      this.deps.log(`[proxy] 面板嵌入代理启动失败，面板回退直连（新版 dsh 将显示授权页）: ${String(err)}`);
+    for (let attempt = 1; attempt <= PROXY_RETRY_ATTEMPTS; attempt++) {
+      try {
+        const proxy = factory({ target: { host: this.opts.host, port: this.opts.port }, token });
+        await proxy.start();
+        this.proxy = proxy;
+        this.proxyKey = key;
+        this.deps.log(`[proxy] 面板嵌入代理已启动: ${proxy.url}（webview 无 Cookie 访问）`);
+        return;
+      } catch (err) {
+        this.proxy = null;
+        this.proxyKey = null;
+        if (attempt < PROXY_RETRY_ATTEMPTS) {
+          this.deps.log(`[proxy] 面板嵌入代理启动失败（第 ${attempt}/${PROXY_RETRY_ATTEMPTS} 次），${PROXY_RETRY_DELAY_MS}ms 后重试: ${String(err)}`);
+          await new Promise((r) => setTimeout(r, PROXY_RETRY_DELAY_MS));
+        } else {
+          this.deps.log(`[proxy] 面板嵌入代理启动失败（已重试 ${PROXY_RETRY_ATTEMPTS} 次），面板将显示"正在连接"占位页: ${String(err)}`);
+        }
+      }
     }
   }
 
@@ -569,8 +582,14 @@ export class ServiceManager {
 
   /** 应用新配置；仅 host/port 变化且自启服务在跑时自动重启（其余项原地生效） */
   reconfigure(opts: ManagerOptions): Promise<ServiceSnapshot> {
-    const targetChanged = this.opts.host !== opts.host || this.opts.port !== opts.port;
+    const portActuallyChanged = opts.port !== this.originalPort;
+    const hostChanged = this.opts.host !== opts.host;
+    const targetChanged = hostChanged || portActuallyChanged;
     const tokenChanged = this.opts.externalToken !== opts.externalToken;
+    this.originalPort = opts.port;
+    if (!portActuallyChanged && this.opts.port !== opts.port) {
+      opts = { ...opts, port: this.opts.port };
+    }
     this.opts = opts;
     if (targetChanged) {
       if (this.child) return this.restart();

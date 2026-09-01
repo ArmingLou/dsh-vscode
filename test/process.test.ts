@@ -8,6 +8,7 @@ import {
   findInPath,
   findInPathPosix,
   resolveLoginShellPath,
+  scanCommonDshLocations,
   mergePath,
   binJsFromShim,
   windowsDshInvocation,
@@ -426,15 +427,15 @@ test('resolveLoginShellPath：env.SHELL 的 zsh 成功时不尝试默认候选',
   assert.equal(result.usedShell, '/bin/zsh');
 });
 
-test('resolveLoginShellPath：env.SHELL 的 zsh 失败后尝试 /bin/bash', () => {
+test('resolveLoginShellPath：env.SHELL 的 zsh source+login 都失败后尝试 /bin/bash', () => {
   let callCount = 0;
   const exec = () => {
     callCount++;
-    if (callCount === 1) throw new Error('zsh failed');
+    if (callCount <= 2) throw new Error('zsh failed');
     return '/home/user/.nvm/versions/node/v20/bin:/usr/bin';
   };
   const result = resolveLoginShellPath('/bin/zsh', exec, '/fallback');
-  assert.ok(callCount > 1);
+  assert.ok(callCount > 2);
   assert.equal(result.usedShell, '/bin/bash');
 });
 
@@ -523,5 +524,84 @@ test('startDsh 非 Windows：显式 executablePath 时跳过 PATH 解析', () =>
   }, () => '/should/not/be/called');
   runner.startDsh({ host: '127.0.0.1', port: 3080, extraArgs: [], executablePath: '/opt/dsh' });
   assert.equal(calls[0].cmd, '/opt/dsh');
+});
+
+// —— scanCommonDshLocations ——
+
+test('scanCommonDshLocations：nvm 目录命中返回最新版本的 dsh 路径', () => {
+  const home = '/home/test';
+  const exists = (p: string) => p === '/home/test/.nvm/versions/node/v22.0.0/bin/dsh' || p === '/home/test/.nvm/versions/node/v20.0.0/bin/dsh';
+  const readdir = (_dir: string) => ['v18.0.0', 'v20.0.0', 'v22.0.0'];
+  const result = scanCommonDshLocations(exists, readdir, home);
+  assert.equal(result, '/home/test/.nvm/versions/node/v22.0.0/bin/dsh');
+});
+
+test('scanCommonDshLocations：nvm 不存在时回退 ~/.local/bin/dsh', () => {
+  const home = '/home/test';
+  const exists = (p: string) => p === '/home/test/.local/bin/dsh';
+  const readdir = (_dir: string) => { throw new Error('not found'); };
+  const result = scanCommonDshLocations(exists, readdir, home);
+  assert.equal(result, '/home/test/.local/bin/dsh');
+});
+
+test('scanCommonDshLocations：asdf 命中', () => {
+  const home = '/home/test';
+  const exists = (p: string) => p === '/home/test/.asdf/shims/dsh';
+  const readdir = (_dir: string) => { throw new Error('not found'); };
+  const result = scanCommonDshLocations(exists, readdir, home);
+  assert.equal(result, '/home/test/.asdf/shims/dsh');
+});
+
+test('scanCommonDshLocations：fnm 目录命中', () => {
+  const home = '/home/test';
+  const exists = (p: string) => p === '/home/test/.fnm/node-versions/v22.0.0/installation/bin/dsh';
+  const readdir = (dir: string) => {
+    if (dir.includes('.fnm')) return ['v22.0.0'];
+    throw new Error('not found');
+  };
+  const result = scanCommonDshLocations(exists, readdir, home);
+  assert.equal(result, '/home/test/.fnm/node-versions/v22.0.0/installation/bin/dsh');
+});
+
+test('scanCommonDshLocations：brew 路径命中', () => {
+  const home = '/home/test';
+  const exists = (p: string) => p === '/opt/homebrew/bin/dsh';
+  const readdir = (_dir: string) => { throw new Error('not found'); };
+  const result = scanCommonDshLocations(exists, readdir, home);
+  assert.equal(result, '/opt/homebrew/bin/dsh');
+});
+
+test('scanCommonDshLocations：所有位置均未命中返回 null', () => {
+  const result = scanCommonDshLocations(() => false, () => { throw new Error('nope'); }, '/home/test');
+  assert.equal(result, null);
+});
+
+test('scanCommonDshLocations：日志回调被调用', () => {
+  const logs: string[] = [];
+  const logFn = (line: string) => logs.push(line);
+  scanCommonDshLocations(() => false, () => { throw new Error('nope'); }, '/home/test', logFn);
+  assert.ok(logs.some((l) => l.includes('[dsh-scan]')));
+});
+
+test('startDsh 非 Windows：findInPathPosix 未命中但 scanCommonDshLocations 命中时使用扫描路径', () => {
+  const calls: { cmd: string }[] = [];
+  const spawnImpl: SpawnFn = (cmd) => {
+    calls.push({ cmd });
+    return new FakeChild();
+  };
+  const nvmPath = '/home/user/.nvm/versions/node/v22.0.0/bin';
+  const execImpl = () => { throw new Error('no shell'); };
+  const existsImpl = (p: string) => p === `${nvmPath}/dsh`;
+  const readdirImpl = (dir: string) => {
+    if (dir.includes('.nvm')) return ['v22.0.0'];
+    throw new Error('not found');
+  };
+  const runner = createProcessRunner(spawnImpl, 'linux', 3000, existsImpl, {
+    path: '/usr/bin',
+    shell: '/bin/bash',
+    homeDir: '/home/user',
+  }, execImpl, readdirImpl);
+  runner.startDsh({ host: '127.0.0.1', port: 3080, extraArgs: [] });
+  assert.equal(calls[0].cmd, `${nvmPath}/dsh`);
 });
 

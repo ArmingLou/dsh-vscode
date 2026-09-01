@@ -6,7 +6,7 @@ import { readFileSync } from 'node:fs';
 import { initI18n, t } from './i18n';
 import { readConfig, type DshConfig } from './config';
 import { probeService } from './service/detect';
-import { createProcessRunner, findInPath, resolveLoginShellPath, mergePath, findInPathPosix, defaultExecSync, type ResolveResult } from './service/process';
+import { createProcessRunner, findInPath, resolveLoginShellPath, mergePath, findInPathPosix, scanCommonDshLocations, defaultExecSync, type ResolveResult } from './service/process';
 import { ServiceManager, type ManagerOptions } from './service/manager';
 import { DshPanelProvider } from './panel/provider';
 import { StatusBarController } from './statusbar';
@@ -116,9 +116,18 @@ function describeDshExecutable(config: DshConfig, logFn: (line: string) => void)
       const hostPath = process.env.PATH ?? '';
       const resolve: ResolveResult = resolveLoginShellPath(process.env.SHELL, defaultExecSync, hostPath, logFn);
       const merged = mergePath(resolve.path, hostPath, ':');
+      const hasNvm = merged.includes('.nvm/versions/node');
+      logFn(`[dsh-locate] usedShell=${resolve.usedShell ?? '(无)'} hasNvm=${hasNvm} in merged PATH`);
       const found = findInPathPosix('dsh', merged);
-      logFn(`[dsh-locate] usedShell=${resolve.usedShell ?? '(无)'} findInPathPosix=${found ?? '(未命中)'} shim=${found ?? 'dsh'}`);
-      shim = found ?? 'dsh';
+      if (found) {
+        logFn(`[dsh-locate] findInPathPosix=${found} shim=${found}`);
+        shim = found;
+      } else {
+        logFn(`[dsh-locate] findInPathPosix=(未命中), scanning common locations...`);
+        const scanned = scanCommonDshLocations(undefined, undefined, undefined, logFn);
+        shim = scanned ?? 'dsh';
+        logFn(`[dsh-locate] scanCommonDshLocations=${scanned ?? '(未命中)'} shim=${shim}`);
+      }
     }
     if (shim && shim !== 'dsh') {
       try {

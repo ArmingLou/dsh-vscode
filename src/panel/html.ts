@@ -245,6 +245,18 @@ export function loadingPage(t: T, ctx: PageCtx): string {
   return shell(ctx, t('panel.loading'), '', `<div class="center"><div class="spinner"></div><p>${t('panel.loading')}</p></div>`);
 }
 
+/** 新版 dsh 代理未就绪时的占位页：iframe 直连会 401（SameSite Cookie 不可达），显示连接中 + 浏览器打开按钮 */
+export function connectingPage(t: T, ctx: PageCtx): string {
+  return shell(
+    ctx,
+    t('panel.connecting'),
+    '',
+    `<div class="center"><div class="spinner"></div><p>${t('panel.connecting')}</p>
+<button data-action="openExternal">${t('panel.openExternal')}</button>
+<button data-action="showLogs">${t('panel.showLogs')}</button></div>`,
+  );
+}
+
 /** 启动失败占位页：原因 + 重试 + 查看日志 */
 export function errorPage(t: T, ctx: PageCtx, message: string): string {
   return shell(

@@ -6,6 +6,7 @@ const messages = {
   en: {
     // 面板占位页
     'panel.loading': 'Starting DSH service…',
+    'panel.connecting': 'Establishing secure connection…',
     'panel.errorTitle': 'Failed to start DSH service',
     'panel.disconnectedTitle': 'DSH service disconnected',
     'panel.reconnect': 'Reconnect',
@@ -54,6 +55,7 @@ const messages = {
   },
   zh: {
     'panel.loading': '正在启动 DSH 服务…',
+    'panel.connecting': '正在建立安全连接…',
     'panel.errorTitle': 'DSH 服务启动失败',
     'panel.disconnectedTitle': 'DSH 服务已断开',
     'panel.reconnect': '重新连接',
