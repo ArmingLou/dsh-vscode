@@ -11,6 +11,9 @@ const messages = {
     'panel.disconnectedTitle': 'DSH service disconnected',
     'panel.reconnect': 'Reconnect',
     'panel.retry': 'Retry',
+    'panel.troubleHint': 'The DSH page did not load (blank or unresponsive).',
+    'panel.troubleReload': 'Reload Page',
+    'panel.troubleRetryBridge': 'Retry Bridge Install',
     'panel.openExternal': 'Open in Browser',
     'panel.remoteDisabled': 'SSH Remote support is disabled. Enable "dsh.remote.enabled" in settings, then reload the window.',
     'panel.openSettings': 'Open Settings',
@@ -43,6 +46,19 @@ const messages = {
     'info.stopped': 'DSH service stopped.',
     'msg.portFallback':
       'Port {port} is occupied by another program. Temporarily using port {fallback} for this session (your dsh.port setting is unchanged).',
+    // 端口冲突强制三选一（modal）
+    'msg.portConflict':
+      'DSH web is already running at {authority} (possibly started from another terminal or window) and this window cannot authenticate with it. Choose how to proceed:',
+    'msg.portConflictDetail':
+      '"Enter Token" reuses that instance: paste the full URL with token from its startup output (e.g. "dsh web: http://127.0.0.1:3080/?token=…"). "Use Another Port" starts a new instance on a free port. "Retry" re-detects the port.',
+    'msg.portConflictTokenFailed':
+      'The token did not work for {authority} (invalid token, or the instance has changed). Choose how to proceed:',
+    'conflict.enterToken': 'Enter Token',
+    'conflict.useOtherPort': 'Use Another Port',
+    'conflict.retry': 'Retry',
+    'conflict.tokenPrompt':
+      'Paste the full URL with token from the DSH startup output (e.g. "dsh web: http://{authority}/?token=…") or the raw token.',
+    'conflict.tokenPlaceholder': 'http://127.0.0.1:3080/?token=… or raw token',
     'msg.logsCopied': 'DSH logs copied to the clipboard. Paste them into your bug report.',
     'msg.imageCacheCleaned': 'Cleaned up {count} image-fallback temp file(s) from the workspace.',
     // 桥接状态与警告
@@ -60,6 +76,9 @@ const messages = {
     'panel.disconnectedTitle': 'DSH 服务已断开',
     'panel.reconnect': '重新连接',
     'panel.retry': '重试',
+    'panel.troubleHint': 'DSH 页面未正常加载（空白或无响应）？可重试，或查看日志排查。',
+    'panel.troubleReload': '重新加载页面',
+    'panel.troubleRetryBridge': '重试安装桥接',
     'panel.openExternal': '在浏览器中打开',
     'panel.remoteDisabled': 'SSH Remote 支持未开启。请在设置中开启 "dsh.remote.enabled" 后重载窗口。',
     'panel.openSettings': '打开设置',
@@ -88,6 +107,19 @@ const messages = {
     'info.stopped': 'DSH 服务已停止。',
     'msg.portFallback':
       '端口 {port} 被其他程序占用，本次会话临时改用端口 {fallback}（dsh.port 设置未更改，重启 VS Code 后恢复）。',
+    // 端口冲突强制三选一（modal）
+    'msg.portConflict':
+      '检测到 {authority} 上已有 dsh web 实例在运行（可能由其他终端/窗口启动），本窗口无法通过其认证。请选择处理方式：',
+    'msg.portConflictDetail':
+      '「输入令牌重试」复用该实例：粘贴其启动输出中带令牌的完整 URL（如 "dsh web: http://127.0.0.1:3080/?token=…"）；「使用其他端口」在空闲端口启动新实例；「重试」重新探测该端口。',
+    'msg.portConflictTokenFailed':
+      '提供的令牌对 {authority} 无效（令牌错误或实例已变化）。请选择处理方式：',
+    'conflict.enterToken': '输入令牌重试',
+    'conflict.useOtherPort': '使用其他端口启动实例',
+    'conflict.retry': '按原流程重试',
+    'conflict.tokenPrompt':
+      '粘贴 DSH 启动输出中带令牌的完整 URL（如 "dsh web: http://{authority}/?token=…"）或纯令牌。',
+    'conflict.tokenPlaceholder': 'http://127.0.0.1:3080/?token=… 或纯令牌',
     'msg.logsCopied': 'DSH 日志已复制到剪贴板，请粘贴到问题报告中。',
     'msg.imageCacheCleaned': '已清理 {count} 张图片降级临时缓存。',
     'bridge.warnDegraded':

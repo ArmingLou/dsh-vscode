@@ -4,10 +4,10 @@ import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { readFileSync } from 'node:fs';
 import { initI18n, t } from './i18n';
-import { readConfig, type DshConfig } from './config';
+import { readConfig, normalizeExternalToken, type DshConfig } from './config';
 import { probeService } from './service/detect';
 import { createProcessRunner, findInPath, resolveLoginShellPath, mergePath, findInPathPosix, scanCommonDshLocations, defaultExecSync, type ResolveResult } from './service/process';
-import { ServiceManager, type ManagerOptions } from './service/manager';
+import { ServiceManager, type ManagerOptions, type SessionCookieStore } from './service/manager';
 import { DshPanelProvider } from './panel/provider';
 import { StatusBarController } from './statusbar';
 import { resolveWorkspaceRoot } from './workspaceRoot';
@@ -44,10 +44,15 @@ function appendLog(line: string): void {
 
 /** globalState 键：用户点击「不再提示」后置 true，持久静默桥接降级警告 */
 const BRIDGE_SILENCE_KEY = 'dsh.bridgeWarningSilenced';
-/** 握手超时（毫秒）：面板打开且服务就绪后，此时间内无任何 bridgeAck 视为握手失败 */
-const HANDSHAKE_TIMEOUT_MS = 3000;
-/** 激活后评估桥接状态的延迟（毫秒）：略大于握手超时，给握手回执留出时间 */
-const BRIDGE_EVAL_DELAY_MS = 3500;
+/**
+ * 握手超时（毫秒）：面板打开且服务就绪后，此时间内无任何 bridgeAck 视为握手失败。
+ * 曾为 3s：重装/冷启动时 dsh web 首屏需引导十余个 client 模块再初始化 UI，
+ * 3 秒内来不及握手，导致误报「bridge 未激活」+ 面板首屏白屏（实测 07:45 热启动 1s 内
+ * 握手成功、14:16 冷启动 3s 超时）。放宽到 20s，并配合「超时后自动重载面板重试一次」。
+ */
+const HANDSHAKE_TIMEOUT_MS = 20000;
+/** 激活后评估桥接状态的延迟（毫秒）：给握手回执留出时间（不小于握手超时+重试余量） */
+const BRIDGE_EVAL_DELAY_MS = 22000;
 
 /** DshConfig → ManagerOptions（探测 3s、轮询 0.5s，与规格一致） */
 function toManagerOptions(config: DshConfig): ManagerOptions {
@@ -186,6 +191,7 @@ export function activate(context: vscode.ExtensionContext): void {
   let evalTimer: NodeJS.Timeout | undefined;
   let panelOpened = false; // 是否已有面板打开过（触发握手超时的前提之一）
   let warningShown = false; // 本次会话是否已弹过降级警告（防止重复弹）
+  let handshakeRetries = 0; // 握手超时后的自动重载重试次数（每个就绪周期最多 1 次；防无限重载）
 
   /** 桥接安装参数（dshHome / bridgeSourceDir 全插件共用，避免三处重复拼接；Windows 装配第三安装目标） */
   const installOpts = {
@@ -233,21 +239,49 @@ export function activate(context: vscode.ExtensionContext): void {
     if (manager?.getSnapshot().state !== 'ready') return;
     handshakeTimer = setTimeout(() => {
       handshakeTimer = undefined;
-      // 3 秒内无任何 bridgeAck → 判定握手失败（degraded）
+      // 超时内无任何 bridgeAck → 先自动重载重试一次（冷启动首屏可能未完成，
+      // 模块引导慢/中途 404 会导致页面白屏且握手必然超时），再判失败（degraded）
       if (handshakeOk === undefined) {
+        if (handshakeRetries < 1) {
+          handshakeRetries += 1;
+          appendLog('[bridge] handshake timeout，重载面板重试一次（冷启动首屏可能未完成）');
+          refreshPanels(); // 重渲染 = iframe 重载：DSH 页面重新引导并再次握手
+          startHandshakeTimeout();
+          return;
+        }
         appendLog('[bridge] handshake timeout');
         handshakeOk = false;
+        setBridgeTroubleAll(true); // 点亮页面内「加载异常」提示条（提供手动重试入口，不再无声白屏）
         evaluateAndWarn(); // 握手刚失败，立即评估（不必再等固定延迟）
       }
     }, HANDSHAKE_TIMEOUT_MS);
   }
 
-  /** 面板握手回执回调（两个面板共享）：记录结果并取消超时（握手已发生，无论成败） */
+  /** 握手回执回调（两个面板共享）：记录结果、取消超时、同步提示条（握手已发生，无论成败） */
   function onBridgeAck(ok: boolean, version?: string): void {
     // 日志带桥接版本：页面里跑的是哪个版本的桥接代码一目了然（排查“装了新版还在跑旧行为”用）
     appendLog(`[bridge] handshake ${ok ? 'ok' : 'failed'}${version ? ` (bridge v${version})` : ''}`);
     handshakeOk = ok;
+    handshakeRetries = 0; // 新握手周期重置自动重载计数
     clearHandshakeTimer();
+    if (ok) {
+      setBridgeTroubleAll(false); // 握手成功：隐藏「加载异常」提示条（页面已正常工作）
+    } else {
+      setBridgeTroubleAll(true); // 页面已加载但桥接失败：点亮提示条供「重试安装桥接」
+      evaluateAndWarn();
+    }
+  }
+
+  /** 重渲染两个面板（iframe 重载；供握手超时自动重试与外部调用） */
+  function refreshPanels(): void {
+    panelPrimary?.refresh();
+    panelSecondary?.refresh();
+  }
+
+  /** 同步两个面板的「页面加载异常」提示条显隐（纯 postMessage，不重载 iframe） */
+  function setBridgeTroubleAll(trouble: boolean): void {
+    panelPrimary?.setTrouble(trouble);
+    panelSecondary?.setTrouble(trouble);
   }
 
   /** 任一面板首次打开：标记已打开并尝试启动握手超时（幂等，不重复建定时器） */
@@ -299,7 +333,9 @@ export function activate(context: vscode.ExtensionContext): void {
       install = safeInstallBridge();
       // 重置握手状态：重启后 iframe 重载会重新握手，onBridgeAck 会写入新结果
       handshakeOk = undefined;
+      handshakeRetries = 0;
       clearHandshakeTimer();
+      setBridgeTroubleAll(false); // 重试期间隐藏「加载异常」提示条（iframe 即将重载重握手）
       // 清警告静默（globalState 标志），允许后续再次弹出降级警告
       await context.globalState.update(BRIDGE_SILENCE_KEY, false);
       warningShown = false;
@@ -324,13 +360,95 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   }
 
+  /** globalState 键：持久化代理会话 Cookie（按 authority 分键，跨窗口共享） */
+  const proxyCookieKey = (host: string, port: number): string => `dsh.proxyCookie@${host}:${port}`;
+  /**
+   * 会话 Cookie 持久化：接 context.globalState（用户级存储，跨窗口共享；
+   * workspaceState 不跨窗口，不满足复用要求）。dsh 的会话 Cookie 由机器级持久
+   * secret（~/.dsh/.credentials.yaml）签名，同一 authority 的 Cookie 跨 dsh 重启/
+   * 跨实例有效——持久化后，其他窗口/下次会话在拿不到外来实例令牌时也能复用该实例。
+   */
+  const cookieStore: SessionCookieStore = {
+    load: (host, port) => context.globalState.get<string>(proxyCookieKey(host, port)) ?? null,
+    save: async (host, port, cookie) => {
+      await context.globalState.update(proxyCookieKey(host, port), cookie);
+    },
+    clear: async (host, port) => {
+      await context.globalState.update(proxyCookieKey(host, port), undefined);
+    },
+  };
+
+  /**
+   * 探测出口：接入 detect 级诊断日志（非 dsh 判定时记录 HTTP 状态码/响应体片段/错误信息，
+   * 定位真实环境中的探测分类偏差——如 401 认证提示文案变化、代理劫持导致的 down）。
+   */
+  const probeWithDiag = (host: string, port: number, timeoutMs?: number, token?: string, cookie?: string) =>
+    probeService(host, port, timeoutMs, token, cookie, (line) => appendLog(line));
+
   manager = new ServiceManager(toManagerOptions(config), {
-    probeService,
+    probeService: probeWithDiag,
     processRunner: createProcessRunner(),
     log: (line) => appendLog(line),
     // 端口被占用自动临时替换成功：弹窗告知用户新端口（仅本次会话，配置未变）
     onPortFallback: (requested, fallback) => {
       void vscode.window.showInformationMessage(t('msg.portFallback', { port: requested, fallback }));
+    },
+    cookieStore,
+    // 端口冲突强制三选一（dsh-unauthenticated 且 Cookie 复用落空时）：
+    // modal 弹窗，ESC/关闭立即重弹直到用户明确选择；等待期间不落任何回退。
+    askPortConflict: async (info) => {
+      const authority = `${info.host}:${info.port}`;
+      const enterToken = t('conflict.enterToken');
+      const useOtherPort = t('conflict.useOtherPort');
+      const retry = t('conflict.retry');
+      appendLog(`[process] ${authority} 疑似被其他终端/窗口启动的 dsh web 占用（未认证），弹出三选一等待用户决策`);
+      for (;;) {
+        // 流程已被叫停（stop）：不再打扰用户（停止重弹），返回任意决策（manager 会丢弃并保持 idle）
+        if (info.isCancelled()) return { kind: 'other-port' };
+        const message = info.tokenAttemptFailed
+          ? t('msg.portConflictTokenFailed', { authority })
+          : t('msg.portConflict', { authority });
+        const choice = await vscode.window.showWarningMessage(
+          message,
+          { modal: true, detail: t('msg.portConflictDetail') },
+          enterToken,
+          useOtherPort,
+          retry,
+        );
+        if (info.isCancelled()) return { kind: 'other-port' };
+        if (choice === enterToken) {
+          const input = await vscode.window.showInputBox({
+            prompt: t('conflict.tokenPrompt', { authority }),
+            placeHolder: t('conflict.tokenPlaceholder'),
+            ignoreFocusOut: true, // 点击别处不关闭：令牌粘贴过程不因失焦而丢失
+          });
+          if (info.isCancelled()) return { kind: 'other-port' };
+          // 复用 externalToken 归一化逻辑：兼容完整 URL / 整行启动日志 / 纯令牌
+          const token = input === undefined ? '' : normalizeExternalToken(input);
+          if (token === '') continue; // 输入框取消或空输入：回到三选一
+          appendLog(`[process] 用户选择以令牌复用 ${authority}（输入已归一化），交由服务管理器验证`);
+          return { kind: 'token', token };
+        }
+        if (choice === useOtherPort) {
+          appendLog(`[process] 用户选择换端口启动新实例（${authority} 被其他 dsh 实例占用）`);
+          return { kind: 'other-port' };
+        }
+        if (choice === retry) {
+          appendLog(`[process] 用户选择按原流程重试（重新探测 ${authority}）`);
+          return { kind: 'retry' };
+        }
+        // ESC / 关闭弹窗：立即重新弹出三选一（循环直到明确选择，不落任何回退）
+      }
+    },
+    // 「输入令牌重试」验证有效（303 命中）后：写入 dsh.externalToken 设置（用户级），
+    // 后续会话/其他窗口可直接复用该实例；无效令牌绝不写入。
+    onPersistExternalToken: (token) => {
+      void vscode.workspace.getConfiguration('dsh')
+        .update('externalToken', token, vscode.ConfigurationTarget.Global)
+        .then(
+          () => appendLog('[process] 已写入 dsh.externalToken 设置（用户级）：后续会话可直接复用该实例'),
+          (err: unknown) => appendLog(`[process] 写入 dsh.externalToken 设置失败: ${String(err)}`),
+        );
     },
   });
   manager.setExitBehavior(!config.stopOnExit);
@@ -368,6 +486,9 @@ export function activate(context: vscode.ExtensionContext): void {
     resolveExternalUrl, // resolveExternalUrl：远程窗口的 URL 隧道解析
     imageFallbackGetter, // imageFallback：dsh.image.fallback 驱动图片降级
     shortcutsGetter, // shortcuts：dsh.bridge.shortcuts 驱动 iframe 内快捷键转发
+    () => {
+      void retryBridge(); // 「重新加载异常提示条」的「重试安装桥接」按钮 → 重装桥接并重启服务
+    },
   );
   const panelSecondary = new DshPanelProvider(
     manager,
@@ -379,6 +500,9 @@ export function activate(context: vscode.ExtensionContext): void {
     resolveExternalUrl,
     imageFallbackGetter,
     shortcutsGetter,
+    () => {
+      void retryBridge();
+    },
   );
   // 复制网址命令读取主面板的展示 URL（远程=隧道本地 URL）
   getDisplayUrl = () => panelPrimary.getDisplayUrl();

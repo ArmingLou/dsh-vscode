@@ -44,6 +44,7 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
    * @param resolveExternalUrl URL→本地可达 URL 解析器（远程走 asExternalUri 隧道；默认原样返回）
    * @param imageFallback 是否启用非视觉模型图片降级（v0.3.0，默认开）
    * @param shortcuts 桥接快捷键映射 getter（v0.3.2：组合键 → VS Code 命令 id，随握手下发 iframe）
+   * @param onBridgeRetry 「重试安装桥接」按钮回调（v0.3.9：页面加载异常提示条按钮；可选）
    */
   constructor(
     private manager: ServiceManager,
@@ -55,6 +56,7 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
     private resolveExternalUrl: (url: string) => Promise<string> = async (u) => u,
     private imageFallback: () => boolean = () => true,
     private shortcuts: () => Record<string, string> = () => ({}),
+    private onBridgeRetry?: () => void,
   ) {
     // 订阅状态变化，重绘面板（iframe 与占位页由状态驱动，无白屏路径）
     manager.onChange(() => void this.handleStateChange());
@@ -139,6 +141,14 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
         // 握手回执：通知注入的回调（Task 7 据此评估桥接状态；version 供日志确认桥接代码版本）
         this.onBridgeAck?.(msg.ok, msg.version);
         break;
+      case 'reloadPage':
+        // 页面加载异常提示条「重新加载页面」：重渲染 = iframe 重载（DSH 页面重新引导并再次握手）
+        this.refresh();
+        break;
+      case 'retryBridgeInstall':
+        // 页面加载异常提示条「重试安装桥接」：交给入口注入的回调（重新安装 + 重启服务）
+        this.onBridgeRetry?.();
+        break;
       case 'bridgeShortcut': {
         // 快捷键桥接（v0.3.2）：iframe 内命中的组合键 → 按 dsh.bridge.shortcuts 映射执行 VS Code 命令。
         // 命令 id 只来自本扩展配置（绝不接受页面侧直传命令），未知命令仅记日志不打断操作。
@@ -167,6 +177,11 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
   /** 配置变更后重渲染（快捷键映射变化时由入口调用；iframe 随重渲染重载并重新握手） */
   refresh(): void {
     this.render();
+  }
+
+  /** 页面加载异常提示条显隐（纯 postMessage，不重载 iframe；入口在握手超时/失败/恢复时调用） */
+  setTrouble(trouble: boolean): void {
+    void this.view?.webview.postMessage({ type: 'setBridgeTrouble', trouble });
   }
 
   /** 桥接落盘/删除依赖：图片缓存写文件/删文件（node:fs/promises）与回执投递（webview.postMessage） */
@@ -298,7 +313,7 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
                 enabled: this.bridgeEnabled(),
                 imageFallback: this.imageFallback(),
                 shortcuts: this.shortcuts(),
-              });
+              }, t);
             } else if (hasToken) {
               html = connectingPage(t, ctx);
             } else {
@@ -313,7 +328,7 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
                 enabled: this.bridgeEnabled(),
                 imageFallback: this.imageFallback(),
                 shortcuts: this.shortcuts(),
-              });
+              }, t);
             }
           }
           break;

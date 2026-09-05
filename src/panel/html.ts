@@ -24,7 +24,9 @@ export type PanelMessage =
   | { type: 'bridgeSaveImageAck'; requestId: string; ok: boolean; path?: string }
   | { type: 'bridgeDeleteImages'; requestId: string; paths: string[] }
   | { type: 'bridgeDeleteImagesAck'; requestId: string; ok: boolean }
-  | { type: 'bridgeShortcut'; combo: string; key?: string; code?: string };
+  | { type: 'bridgeShortcut'; combo: string; key?: string; code?: string }
+  | { type: 'reloadPage' }
+  | { type: 'retryBridgeInstall' };
 
 /** 渲染上下文 */
 export interface PageCtx {
@@ -58,6 +60,11 @@ button:hover { background: var(--vscode-button-hoverBackground); }
 .spinner { width: 28px; height: 28px; border: 3px solid var(--vscode-progressBar-background); border-top-color: transparent; border-radius: 50%; margin: 0 auto 12px; animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 iframe.frame { position: fixed; inset: 0; width: 100%; height: 100%; border: none; }
+/* 页面加载异常提示条：悬浮在 iframe 底部（默认隐藏，扩展侧握手失败/超时后 postMessage 显示） */
+.trouble-bar { position: fixed; left: 0; right: 0; bottom: 0; display: flex; align-items: center; gap: 8px; padding: 6px 10px; z-index: 10; font-size: 12px; background: var(--vscode-notifications-background, var(--vscode-editorWidget-background)); border-top: 1px solid var(--vscode-widget-border, color-mix(in srgb, currentColor 25%, transparent)); color: var(--vscode-foreground); }
+.trouble-bar[hidden] { display: none; }
+.trouble-bar .trouble-text { flex: 1; min-width: 0; opacity: 0.95; }
+.trouble-bar button { padding: 3px 10px; margin: 0; }
 `;
 
 /** 按钮点击 → postMessage 的内联脚本（nonce 放行） */
@@ -69,6 +76,29 @@ document.addEventListener('click', (e) => {
   vscode.postMessage({ type: btn.dataset.action });
 });
 `;
+
+/**
+ * 页面加载异常提示条控制脚本（与 BUTTON_SCRIPT 共用其声明的 vscode 变量）。
+ * 扩展侧在握手超时/失败后 postMessage {type:'setBridgeTrouble',trouble}，
+ * 此处切换底部提示条显隐（纯 DOM 操作，不重载 iframe、不打断已加载的 DSH 页面）。
+ */
+const TROUBLE_BAR_SCRIPT = `
+window.addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || d.type !== 'setBridgeTrouble') return;
+  const bar = document.getElementById('trouble-bar');
+  if (bar) bar.hidden = !d.trouble;
+});
+`;
+
+/** 页面加载异常提示条（初始隐藏；按钮走 BUTTON_SCRIPT 的 data-action → postMessage） */
+function troubleBar(t: T): string {
+  return `<div id="trouble-bar" class="trouble-bar" hidden>
+<span class="trouble-text">${t('panel.troubleHint')}</span>
+<button data-action="reloadPage">${t('panel.troubleReload')}</button>
+<button data-action="retryBridgeInstall">${t('panel.troubleRetryBridge')}</button>
+</div>`;
+}
 
 /**
  * 桥接握手脚本（内联，nonce 放行，紧随 BUTTON_SCRIPT 之后、共用其声明的 vscode）。
@@ -311,7 +341,12 @@ export function stoppedPage(t: T, ctx: PageCtx): string {
  * 桥接启用时注入握手脚本，让顶层 webview 与 DSH 页面 iframe 建立握手并转发跳转/剪贴板消息。
  * @param bridge 桥接配置（可选，向后兼容既有调用）：token 为握手凭据，enabled 为是否注入握手脚本
  */
-export function readyPage(url: string, ctx: PageCtx, bridge?: { token: string; enabled: boolean; imageFallback?: boolean; shortcuts?: Record<string, string> }): string {
+export function readyPage(
+  url: string,
+  ctx: PageCtx,
+  bridge?: { token: string; enabled: boolean; imageFallback?: boolean; shortcuts?: Record<string, string> },
+  t?: T,
+): string {
   // 桥接启用时注入握手脚本；未传入或 enabled=false 时保持向后兼容，不注入
   const extraScripts = bridge?.enabled
     ? `<script nonce="${ctx.nonce}">${bridgeHandshakeScript(
@@ -321,11 +356,15 @@ export function readyPage(url: string, ctx: PageCtx, bridge?: { token: string; e
         bridge.shortcuts ?? {},
       )}</script>`
     : '';
+  // 提示条控制脚本始终注入（提示条本身始终渲染但默认隐藏，扩展侧可随时点亮）
+  const troubleScript = `<script nonce="${ctx.nonce}">${TROUBLE_BAR_SCRIPT}</script>`;
+  // 翻译函数未传入时提示条文案降级为英文原键（不影响 iframe 主体功能）
+  const tt: T = t ?? ((key) => key);
   return shell(
     ctx,
     'DSH',
     'frame-body',
-    `<iframe id="dsh-frame" class="frame" allow="clipboard-write" src="${url}"></iframe>`,
-    extraScripts,
+    `<iframe id="dsh-frame" class="frame" allow="clipboard-write" src="${url}"></iframe>${troubleBar(tt)}`,
+    extraScripts + troubleScript,
   );
 }

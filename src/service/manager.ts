@@ -77,14 +77,48 @@ export function extractAuthToken(output: string): string | null {
   }
 }
 
+/** 端口冲突决策回调收到的上下文 */
+export interface PortConflictInfo {
+  host: string;
+  port: number;
+  /** 上一次「输入令牌重试」未命中（令牌无效或实例已变化）：弹窗文案应提示用户 */
+  tokenAttemptFailed: boolean;
+  /** 决策等待期间流程是否已被叫停（stop）：回调应停止重弹并立即返回任意决策（结果会被丢弃） */
+  isCancelled: () => boolean;
+}
+
+/** 端口冲突决策结果（'token' 携带用户输入并按 externalToken 规则归一化后的令牌） */
+export type PortConflictDecision =
+  | { kind: 'token'; token: string }
+  | { kind: 'other-port' }
+  | { kind: 'retry' };
+
 /** 注入依赖 */
 export interface ManagerDeps {
-  probeService: (host: string, port: number, timeoutMs?: number, token?: string) => Promise<ProbeResult>;
+  probeService: (host: string, port: number, timeoutMs?: number, token?: string, cookie?: string) => Promise<ProbeResult>;
   processRunner: ProcessRunner;
   /** 日志出口（扩展里接到 Output Channel） */
   log: (line: string) => void;
   /** 端口被占用时自动临时替换成功后的通知回调（扩展里弹窗告知用户新端口） */
   onPortFallback?: (requestedPort: number, fallbackPort: number) => void;
+  /**
+   * 端口冲突强制决策回调（dsh-unauthenticated 且 Cookie 复用落空、autoStart=true 时）：
+   * 扩展里弹 modal 三选一——「输入令牌重试」/「使用其他端口启动实例」/「按原流程重试」，
+   * ESC/关闭必须重弹直到用户明确选择（等待期间不落任何回退）；令牌输入与归一化也在
+   * 回调内完成，选择 'token' 时返回归一化后的令牌交由 manager 验证。
+   * 未注入时维持旧行为：直接走「自动换端口」回退（旧装配/部分单测）。
+   */
+  askPortConflict?: (info: PortConflictInfo) => Promise<PortConflictDecision>;
+  /**
+   * 「输入令牌重试」探测命中（303 令牌交换）后的持久化钩子：把确认有效的令牌写入
+   * dsh.externalToken 设置（用户级；扩展实现）。仅在验证有效后调用——无效令牌
+   * 绝不写入设置，避免污染后续会话。
+   */
+  onPersistExternalToken?: (token: string) => void | Promise<void>;
+  /** 会话 Cookie 持久化存取（复用外来实例；缺省为不持久化） */
+  cookieStore?: SessionCookieStore;
+  /** 崩溃自愈 Cookie 复用的宽限重试间隔（毫秒，默认 1000；单测注入小值缩短用例耗时） */
+  cookieGraceDelayMs?: number;
   /** 就绪后的健康探测间隔（毫秒，默认 30000；≤0 关闭探测） */
   healthIntervalMs?: number;
   /** 启动总超时（毫秒，默认 15000） */
@@ -94,7 +128,20 @@ export interface ManagerDeps {
    * 新版 dsh 的 SameSite=Strict 会话 Cookie 在 VS Code webview（跨站子框架）中无法回传，
    * 面板必须经扩展宿主代理访问；旧版 dsh 无令牌时不需要代理。
    */
-  proxyFactory?: (opts: { target: DshProxyTarget; token: string }) => DshProxyLike;
+  proxyFactory?: (opts: { target: DshProxyTarget; token: string; initialCookie?: string }) => DshProxyLike;
+}
+
+/**
+ * 会话 Cookie 持久化存取（按 host:port 分键）。
+ * 扩展里接 context.globalState（用户级、跨窗口共享）；单测注入内存实现。
+ * 背景：dsh 的会话 Cookie 由机器级持久 secret 签名（~/.dsh/.credentials.yaml），
+ * 同一 authority 的 Cookie 跨 dsh 重启/跨实例/跨窗口有效——持久化后，
+ * 其他窗口/下次会话在拿不到外来实例令牌的情况下也能复用该实例。
+ */
+export interface SessionCookieStore {
+  load(host: string, port: number): string | null | Promise<string | null>;
+  save(host: string, port: number, cookie: string): void | Promise<void>;
+  clear(host: string, port: number): void | Promise<void>;
 }
 
 /** 启动总超时默认值（毫秒）——dsh 冷启动约 14s，留 4x 余量覆盖慢机/多实例；按用户决定固定 60s */
@@ -107,6 +154,21 @@ const PORT_FALLBACK_MAX_ROUNDS = 3;
 const PROXY_RETRY_ATTEMPTS = 3;
 /** ensureProxy 重试间隔（毫秒） */
 const PROXY_RETRY_DELAY_MS = 1000;
+/**
+ * 崩溃自愈 Cookie 复用的宽限重试次数：多窗口同时冷启动时，赢家（另一窗口的 dsh）
+ * 绑定端口后约 1 秒内才把会话 Cookie 持久化并同步到本窗口，输家（EADDRINUSE 崩溃方）
+ * 的自愈可能抢在发布之前——留出宽限窗口重试，仍落空才走「自动换端口」回退。
+ */
+const COOKIE_REUSE_GRACE_ATTEMPTS = 3;
+/** 崩溃自愈 Cookie 复用的宽限重试间隔（毫秒） */
+const COOKIE_REUSE_GRACE_DELAY_MS = 1000;
+
+/** resolvePortConflict 的内部结果（manager 私有流转，不对外） */
+export type PortConflictResolution =
+  | { outcome: 'reused' }   // 已以用户令牌复用进入 ready
+  | { outcome: 'retry' }    // 调用方完整重跑探测决策
+  | { outcome: 'fallback' } // 调用方走「自动换端口」回退
+  | { outcome: 'stopped' }; // 决策等待期间被叫停：保持 stop() 已设置的 idle
 
 export class ServiceManager {
   private snapshot: ServiceSnapshot = { state: 'idle', url: null, embedUrl: null, error: null, owned: false };
@@ -125,11 +187,15 @@ export class ServiceManager {
   private childStderr = '';
   /** 最近一次启动子进程的 stdout 缓冲（有界，用于解析 "dsh web: ...?token=..." 启动行） */
   private childStdout = '';
-  /**
-   * 当前子进程的访问令牌（新版 dsh 每次启动动态生成，从 stdout 启动行解析）。
+  /** 当前子进程的访问令牌（新版 dsh 每次启动动态生成，从 stdout 启动行解析）。
    * 令牌与进程绑定：子进程退出/重启/停止后必须清空，否则用旧令牌探测新进程会误判。
    */
   private authToken: string | null = null;
+  /**
+   * 复用外来实例的会话 Cookie（无令牌场景）：探测/健康探测/代理注入均使用；
+   * 由持久化存储加载并经探测验证后生效，随服务停止/目标变化清空（存储中的凭据另行管理）。
+   */
+  private sessionCookie: string | null = null;
   /** 面板嵌入代理（仅新版 dsh 有令牌时存在；随服务停止/重启销毁） */
   private proxy: DshProxyLike | null = null;
   /** 代理对应的令牌（重建判据：令牌/端口变化时重启代理并重新交换） */
@@ -150,6 +216,13 @@ export class ServiceManager {
   };
 
   constructor(private opts: ManagerOptions, private deps: ManagerDeps) {
+    // externalToken 空串/纯空白 = 未配置（VS Code 设置默认 ''，归一化后仍为 ''）：
+    // 统一归一化为 undefined。否则空串会流入探测（'' ?? undefined 仍为 ''），
+    // 使 detect 的「无令牌 401 → dsh-unauthenticated」判据被破坏，疑似 dsh 实例
+    // 被误判 foreign → 静默换端口、不弹三选一（真实环境未配置时必现）。
+    if (opts.externalToken !== undefined && opts.externalToken.trim() === '') {
+      this.opts = { ...opts, externalToken: undefined };
+    }
     this.originalPort = opts.port;
     process.once('exit', this.parentExitHook);
   }
@@ -213,6 +286,9 @@ export class ServiceManager {
     if (this.child) {
       await this.stopOwned();
     } else {
+      // 复用的外来实例（含 Cookie 会话）脱钩：只清内存引用，
+      // 持久化凭据保留（实例仍在运行，其 Cookie 下次启动验证后仍可复用）
+      this.sessionCookie = null;
       await this.stopProxy(); // 复用外部服务也可能有代理（理论罕见，防泄漏）
       this.set({ state: 'idle', url: null, embedUrl: null, owned: false, error: null });
     }
@@ -230,6 +306,7 @@ export class ServiceManager {
     const child = this.child;
     this.child = null;
     this.authToken = null; // 子进程将停止，其访问令牌随之失效
+    this.sessionCookie = null; // 自启实例不走 Cookie 会话，防御性清空
     try {
       await this.deps.processRunner.stopChild(child);
     } catch (err) {
@@ -240,29 +317,54 @@ export class ServiceManager {
 
   /**
    * 完整启动流程：探测 → 复用 / 启动 → 等待就绪。
+   * 阶段一（探测与冲突决策）以循环组织：「按原流程重试」决策由此完整重跑——
+   * 实例可能已消失（down → 原端口自启），仍被占用则重新走 Cookie 复用 → 三选一决策。
    *
    * @param portFallbackRounds 已发生的「崩溃后换端口重启」轮数（递归调用时递增；
    *                            达到上限后不再换端口，直接报启动崩溃，防止死循环）
    */
   private async doStart(portFallbackRounds = 0): Promise<ServiceSnapshot> {
-    this.set({ state: 'detecting', error: null });
-    // 探测令牌：自启子进程解析出的令牌优先；未配置/未解析时用外部令牌（复用终端已启动的实例）
-    const probe = await this.deps.probeService(
-      this.opts.host, this.opts.port, this.opts.timeoutMs,
-      this.authToken ?? this.opts.externalToken ?? undefined,
-    );
-    if (probe === 'dsh') {
-      // 已有服务在跑：直接复用（外部实例需配置 externalToken 才能通过探测；自启实例走等待循环）
-      if (this.stopRequested) return this.getSnapshot(); // 探测期间被叫停，不覆盖用户的停止意图
-      this.authToken = this.opts.externalToken ?? null; // 复用外部实例：其令牌来自配置
-      await this.ensureProxy(); // 外部实例同样需要面板嵌入代理（webview 无 Cookie）
-      this.set({ state: 'ready', url: this.url(), embedUrl: this.proxy?.url ?? null, owned: false });
-      this.startHealthWatch(); // 复用外部服务也要周期探测，失联时回 idle
-      return this.getSnapshot();
+    let probe: ProbeResult;
+    for (;;) {
+      this.set({ state: 'detecting', error: null });
+      // 探测令牌：自启子进程解析出的令牌优先；未配置/未解析时用外部令牌（复用终端已启动的实例）
+      probe = await this.deps.probeService(
+        this.opts.host, this.opts.port, this.opts.timeoutMs,
+        this.authToken ?? this.opts.externalToken ?? undefined,
+      );
+      this.deps.log(`[process] 初始探测 ${this.opts.host}:${this.opts.port} → ${probe}（令牌：${this.authToken ? '自启实例令牌' : this.opts.externalToken ? 'externalToken' : '无'}）`);
+      if (probe === 'dsh') {
+        // 已有服务在跑：直接复用（外部实例需配置 externalToken 才能通过探测；自启实例走等待循环）
+        if (this.stopRequested) return this.getSnapshot(); // 探测期间被叫停，不覆盖用户的停止意图
+        this.authToken = this.opts.externalToken ?? null; // 复用外部实例：其令牌来自配置
+        this.sessionCookie = null; // 令牌复用：会话走令牌交换，不再使用旧 Cookie
+        await this.ensureProxy(); // 外部实例同样需要面板嵌入代理（webview 无 Cookie）
+        this.set({ state: 'ready', url: this.url(), embedUrl: this.proxy?.url ?? null, owned: false });
+        this.startHealthWatch(); // 复用外部服务也要周期探测，失联时回 idle
+        return this.getSnapshot();
+      }
+      if (probe === 'dsh-unauthenticated') {
+        // 「疑似 dsh 未认证」（无令牌 401 + dsh 认证提示）：端口上很可能是其他终端/窗口启动的
+        // dsh 实例（其令牌只打印在该进程 stdout，插件拿不到）。先尝试用持久化会话 Cookie 复用
+        // （owned=false，不杀他人进程）；复用落空则进入强制三选一决策。
+        if (this.stopRequested) return this.getSnapshot(); // 探测期间被叫停
+        this.deps.log(`[process] ${this.opts.host}:${this.opts.port} 疑似其他终端/窗口启动的 dsh web（未认证 401），尝试以持久化会话 Cookie 复用`);
+        if (await this.tryReuseWithCookie()) return this.getSnapshot();
+        if (this.stopRequested) return this.getSnapshot(); // Cookie 探测期间被叫停
+        // Cookie 复用落空 → 强制决策（仅 autoStart=true 弹窗；false 保持 err.portOccupied 语义）。
+        // 未注入决策回调时维持旧行为：直接走下方「自动换端口」回退。
+        if (this.opts.autoStart) {
+          const decision = await this.resolvePortConflict();
+          if (decision.outcome === 'reused' || decision.outcome === 'stopped') return this.getSnapshot();
+          if (decision.outcome === 'retry') continue; // 完整重跑探测决策
+          // 'fallback'（选择「使用其他端口」）→ 落入下方换端口回退
+        }
+      }
+      break;
     }
-    if (probe === 'foreign') {
-      // 端口被其他程序占用：自动临时替换为第一个空闲端口（仅本次会话生效，不写配置）。
-      // 不自动启动时替换端口没有意义，保持原「端口被占用」提示。
+    if (probe === 'dsh-unauthenticated' || probe === 'foreign') {
+      // 端口被其他程序占用（或经用户决策选择换端口）：自动临时替换为第一个空闲端口
+      // （仅本次会话生效，不写配置）。不自动启动时替换端口没有意义，保持原「端口被占用」提示。
       if (this.opts.autoStart) {
         const fallback = await findFreePort(
           this.opts.host, this.opts.port, PORT_FALLBACK_ATTEMPTS, this.deps.probeService, this.opts.timeoutMs,
@@ -445,6 +547,7 @@ export class ServiceManager {
         this.child = null;
         this.authToken = null; // 子进程已退出，其令牌随之失效；残留实例是别的进程，令牌未知
         const reuse = await this.deps.probeService(this.opts.host, this.opts.port, this.opts.timeoutMs, this.authToken ?? undefined);
+        this.deps.log(`[process] 子进程退出后的自愈探测 ${this.opts.host}:${this.opts.port} → ${reuse}`);
         // 自愈探测期间被叫停：保留 stop() 已设置的状态（idle），绝不覆盖为 failed
         if (this.stopRequested) return this.getSnapshot();
         if (reuse === 'dsh') {
@@ -452,6 +555,21 @@ export class ServiceManager {
           this.set({ state: 'ready', url: this.url(), embedUrl: this.proxy?.url ?? null, owned: false });
           this.startHealthWatch();
           return this.getSnapshot();
+        }
+        if (reuse === 'dsh-unauthenticated') {
+          // 多窗口同时冷启动的竞态自愈：本窗口子进程因端口被「另一窗口刚绑定的 dsh」
+          // 抢占（EADDRINUSE）而崩溃。对方令牌只打印在其 stdout，但对方就绪后会立刻
+          // 把会话 Cookie 持久化到共享存储——本进程崩溃通常晚于对方绑定数秒（Cookie
+          // 多半已就绪），先以 Cookie 复用（含宽限重试，吸收「绑定→发布」的短暂窗口
+          // 与跨窗口存储同步延迟）；落空则与主路径一致走强制三选一决策（不静默换端口）。
+          if (await this.tryReuseWithCookieGrace()) return this.getSnapshot();
+          if (this.stopRequested) return this.getSnapshot(); // 宽限重试期间被叫停
+          if (this.opts.autoStart) {
+            const decision = await this.resolvePortConflict();
+            if (decision.outcome === 'reused' || decision.outcome === 'stopped') return this.getSnapshot();
+            if (decision.outcome === 'retry') return this.doStart(portFallbackRounds); // 完整重跑探测决策
+            // 'fallback'（选择「使用其他端口」）→ 落入下方换端口重启
+          }
         }
         // 换端口重启：端口在启动期间被抢占，自动改用第一个空闲端口（仅本次会话，
         // 弹窗告知）；带轮数上限防死循环（每次崩溃都换新端口重启，最多 3 轮）。
@@ -491,11 +609,149 @@ export class ServiceManager {
     }
   }
 
+  /**
+   * 用持久化会话 Cookie 尝试复用「疑似 dsh 未认证」的实例（owned=false，不杀他人进程）。
+   * 探测命中（200 + __DSH_BOOT__）→ 以该 Cookie 建面板代理进入 ready；
+   * Cookie 陈旧（探测仍 401）或实例不在 → 清除存储并返回 false（调用方继续引导 + 换端口回退）。
+   */
+  private async tryReuseWithCookie(): Promise<boolean> {
+    const store = this.deps.cookieStore;
+    if (!store) return false;
+    let cookie: string | null = null;
+    try {
+      cookie = await store.load(this.opts.host, this.opts.port);
+    } catch (err) {
+      this.deps.log(`[process] 读取持久化会话 Cookie 失败: ${String(err)}`);
+      return false;
+    }
+    if (!cookie) {
+      // 决策链日志：Cookie 复用不可用的原因（该 host:port 从未持久化或已清除）
+      this.deps.log(`[process] 无持久化会话 Cookie（${this.opts.host}:${this.opts.port}），Cookie 复用不可用`);
+      return false;
+    }
+    // 只记录 Cookie 名（dsh-auth-*），不落凭据值
+    this.deps.log(`[process] 读取持久化会话 Cookie（${this.opts.host}:${this.opts.port}）：命中 ${cookie.split('=')[0]}`);
+    const result = await this.deps.probeService(
+      this.opts.host, this.opts.port, this.opts.timeoutMs, undefined, cookie,
+    );
+    this.deps.log(`[process] 以持久化会话 Cookie 探测 ${this.opts.host}:${this.opts.port} → ${result}`);
+    if (result !== 'dsh') {
+      // Cookie 陈旧（401）或实例已失联：视为失效并清除存储，继续后续决策/回退
+      this.deps.log('[process] 持久化会话 Cookie 已失效（探测未命中），清除后继续');
+      await this.forgetSessionCookie();
+      return false;
+    }
+    this.deps.log(`[process] 以持久化会话 Cookie 复用 ${this.opts.host}:${this.opts.port} 上已有的 dsh 实例`);
+    this.sessionCookie = cookie;
+    this.authToken = null; // 无令牌复用：健康探测/代理均走 Cookie 会话
+    await this.ensureProxy();
+    this.set({ state: 'ready', url: this.url(), embedUrl: this.proxy?.url ?? null, owned: false });
+    this.startHealthWatch();
+    return true;
+  }
+
+  /**
+   * 崩溃自愈场景的 Cookie 复用（带宽限重试）：多窗口同时冷启动时，本窗口子进程因
+   * 端口被「另一窗口刚绑定的 dsh」抢占（EADDRINUSE）而崩溃；对方就绪后会立刻把
+   * 会话 Cookie 持久化到共享存储，但「绑定端口 → 发布 Cookie」之间存在短暂窗口，
+   * 跨窗口 globalState 同步亦有延迟——首次读取落空时在宽限窗口内重试，
+   * 仍落空返回 false（调用方继续引导 + 换端口回退，保持既有行为）。
+   */
+  private async tryReuseWithCookieGrace(): Promise<boolean> {
+    const delayMs = this.deps.cookieGraceDelayMs ?? COOKIE_REUSE_GRACE_DELAY_MS;
+    for (let attempt = 1; attempt <= COOKIE_REUSE_GRACE_ATTEMPTS; attempt++) {
+      if (await this.tryReuseWithCookie()) return true;
+      if (this.stopRequested) return false; // 宽限等待期间被叫停：不再重试
+      if (attempt < COOKIE_REUSE_GRACE_ATTEMPTS && delayMs > 0) {
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
+    return false;
+  }
+
+  /**
+   * 端口冲突强制决策（主路径与崩溃自愈路径共用的最终决策点）。
+   * 前置条件：探测为 dsh-unauthenticated 且持久化 Cookie 复用已落空（autoStart=true）。
+   * - 'token'：以用户提供的令牌重探目标端口；命中（303 令牌交换）→ 复用（owned=false），
+   *   经 onPersistExternalToken 把确认有效的令牌持久化到 dsh.externalToken 设置（用户级）；
+   *   未命中 → 携 tokenAttemptFailed 重弹三选一（提示令牌无效或实例已变化）；
+   * - 'retry'：返回 retry，调用方完整重跑探测决策（实例可能已消失 → 原端口自启）；
+   * - 'other-port'：返回 fallback，调用方走「自动换端口」回退（仅此选择才换端口）。
+   * 未注入 askPortConflict 时直接返回 fallback（维持既有自动回退行为，旧装配/单测）。
+   * 决策等待期间被叫停（stopRequested）返回 stopped：调用方保持 stop() 已设置的 idle，
+   * 绝不落任何回退；isCancelled 供回调在用户交互间隙检测叫停并停止重弹。
+   */
+  private async resolvePortConflict(): Promise<PortConflictResolution> {
+    const ask = this.deps.askPortConflict;
+    if (!ask) return { outcome: 'fallback' };
+    let tokenAttemptFailed = false;
+    for (;;) {
+      if (this.stopRequested) return { outcome: 'stopped' };
+      const decision = await ask({
+        host: this.opts.host,
+        port: this.opts.port,
+        tokenAttemptFailed,
+        isCancelled: () => this.stopRequested,
+      });
+      if (this.stopRequested) return { outcome: 'stopped' }; // 弹窗期间被叫停：丢弃用户选择
+      if (decision.kind === 'token') {
+        const result = await this.deps.probeService(
+          this.opts.host, this.opts.port, this.opts.timeoutMs, decision.token,
+        );
+        this.deps.log(`[process] 以用户提供的令牌探测 ${this.opts.host}:${this.opts.port} → ${result}`);
+        if (result === 'dsh') {
+          this.authToken = decision.token; // 复用外来实例：令牌来自用户输入（已验证有效）
+          this.sessionCookie = null; // 令牌复用：会话走令牌交换
+          await this.ensureProxy();
+          this.set({ state: 'ready', url: this.url(), embedUrl: this.proxy?.url ?? null, owned: false });
+          this.startHealthWatch();
+          this.deps.log(`[process] 以用户提供的令牌复用 ${this.opts.host}:${this.opts.port} 上已有的 dsh 实例`);
+          // 持久化 dsh.externalToken（尽力而为：失败仅记日志，不影响本次会话）
+          try {
+            await this.deps.onPersistExternalToken?.(decision.token);
+          } catch (err) {
+            this.deps.log(`[process] 持久化 dsh.externalToken 失败: ${String(err)}`);
+          }
+          return { outcome: 'reused' };
+        }
+        tokenAttemptFailed = true; // 令牌无效或实例已变化：再弹三选一并提示
+        continue;
+      }
+      if (decision.kind === 'retry') return { outcome: 'retry' };
+      return { outcome: 'fallback' };
+    }
+  }
+
+  /** 持久化会话 Cookie（尽力而为：失败仅记日志，不影响启动流程） */
+  private async persistSessionCookie(cookie: string): Promise<void> {
+    const store = this.deps.cookieStore;
+    if (!store) return;
+    try {
+      await store.save(this.opts.host, this.opts.port, cookie);
+      this.deps.log(`[proxy] 会话 Cookie 已持久化（${this.opts.host}:${this.opts.port}，可供其他窗口/下次会话复用）`);
+    } catch (err) {
+      this.deps.log(`[proxy] 会话 Cookie 持久化失败: ${String(err)}`);
+    }
+  }
+
+  /** 清除持久化会话 Cookie（尽力而为：探测 401/实例失联即视为失效） */
+  private async forgetSessionCookie(): Promise<void> {
+    const store = this.deps.cookieStore;
+    if (!store) return;
+    try {
+      await store.clear(this.opts.host, this.opts.port);
+      this.deps.log(`[proxy] 已清除持久化会话 Cookie（${this.opts.host}:${this.opts.port}）`);
+    } catch (err) {
+      this.deps.log(`[proxy] 清除持久化会话 Cookie 失败: ${String(err)}`);
+    }
+  }
+
   /** 就绪状态下子进程意外退出：回到 idle（面板据此显示"已断开"） */
   private handleUnexpectedExit(child: ChildProcessLike): void {
     if (this.child !== child) return; // 已被 stopOwned 接管或已替换
     this.child = null;
     this.authToken = null; // 子进程退出，其访问令牌随之失效
+    this.sessionCookie = null; // 防御性清空（自启实例不走 Cookie 会话）
     void this.stopProxy(); // 代理随令牌一起销毁
     if (this.snapshot.state === 'ready') {
       this.clearHealthWatch();
@@ -509,11 +765,22 @@ export class ServiceManager {
     const interval = this.deps.healthIntervalMs ?? DEFAULT_HEALTH_INTERVAL_MS;
     if (interval <= 0) return;
     this.healthTimer = setInterval(() => {
-      // 健康探测必须携带访问令牌：新版 dsh 未带令牌返回 401，会被误判为「服务失联」而回到 idle
-      void this.deps.probeService(this.opts.host, this.opts.port, this.opts.timeoutMs, this.authToken ?? undefined).then((result) => {
+      // 健康探测必须携带访问令牌（或复用外来实例时的会话 Cookie）：
+      // 新版 dsh 未认证返回 401，会被误判为「服务失联」而回到 idle
+      void this.deps.probeService(
+        this.opts.host, this.opts.port, this.opts.timeoutMs,
+        this.authToken ?? undefined,
+        this.authToken === null ? this.sessionCookie ?? undefined : undefined,
+      ).then((result) => {
         if (result !== 'dsh' && this.snapshot.state === 'ready') {
           this.clearHealthWatch(); // 已回 idle，定时器自清理，不空转
           void this.stopProxy(); // 服务失联：代理一并销毁
+          // 复用外来实例（Cookie 会话）失效：同步清除持久化 Cookie，
+          // 避免下次启动再拿失效凭据探测（持久化凭据只在验证有效时保留）
+          if (!this.child && this.sessionCookie !== null) {
+            this.sessionCookie = null;
+            void this.forgetSessionCookie();
+          }
           this.set({ state: 'idle', url: null, embedUrl: null, owned: false, error: null });
         }
       });
@@ -521,29 +788,45 @@ export class ServiceManager {
   }
 
   /**
-   * 确保面板嵌入代理就绪（幂等）：有令牌且令牌/端口未变时复用，否则重建并重新交换会话 Cookie。
+   * 确保面板嵌入代理就绪（幂等）：令牌/端口未变时复用，否则重建并重新交换会话 Cookie。
    * 新版 dsh 的 SameSite=Strict 会话 Cookie 在 VS Code webview（跨站子框架）中无法回传，
    * 面板必须经代理访问；旧版 dsh（无令牌）不需要代理，直接返回。
+   * 复用外来实例（无令牌但有会话 Cookie）时代理以预置 Cookie 启动，跳过令牌交换。
+   * 令牌交换成功后把会话 Cookie 持久化（同 authority 的 Cookie 跨 dsh 重启/跨窗口有效，
+   * 其他窗口/下次会话无令牌也能据此复用该实例）。
    * 代理启动失败时重试最多 PROXY_RETRY_ATTEMPTS 次（dsh 可能尚未完全就绪导致交换失败），
    * 全部失败则记录日志，面板将显示"正在连接"占位页而非 401 白屏。
    */
   private async ensureProxy(): Promise<void> {
     const token = this.authToken;
-    if (!token) {
+    const cookie = this.sessionCookie;
+    if (!token && !cookie) {
       this.deps.log('[proxy] 令牌未解析到（新版 dsh 启动行尚未输出）或旧版无令牌，跳过建代理');
       return;
     }
-    const key = `${token}@${this.opts.host}:${this.opts.port}`;
+    // key 含令牌或 Cookie 会话标记：任一变化时重建代理并重新交换
+    const key = token
+      ? `${token}@${this.opts.host}:${this.opts.port}`
+      : `cookie@${this.opts.host}:${this.opts.port}`;
     if (this.proxy && this.proxyKey === key) return;
     await this.stopProxy();
     const factory = this.deps.proxyFactory ?? createDefaultProxyFactory(this.deps.log);
     for (let attempt = 1; attempt <= PROXY_RETRY_ATTEMPTS; attempt++) {
       try {
-        const proxy = factory({ target: { host: this.opts.host, port: this.opts.port }, token });
+        const proxy = factory({
+          target: { host: this.opts.host, port: this.opts.port },
+          token: token ?? '',
+          // 预置 Cookie 仅用于无令牌的复用场景；有令牌时必须走令牌交换
+          initialCookie: token ? undefined : cookie ?? undefined,
+        });
         await proxy.start();
         this.proxy = proxy;
         this.proxyKey = key;
         this.deps.log(`[proxy] 面板嵌入代理已启动: ${proxy.url}（webview 无 Cookie 访问）`);
+        if (token) {
+          const session = proxy.sessionCookie;
+          if (typeof session === 'string' && session) await this.persistSessionCookie(session);
+        }
         return;
       } catch (err) {
         this.proxy = null;
@@ -596,12 +879,14 @@ export class ServiceManager {
       // 复用外部服务时只更新地址展示，实际可达性由下次 ensureRunning 重新探测
       if (this.snapshot.state === 'ready') {
         // 目标端口变化但无自启子进程：代理目标失效，销毁后由下次就绪重建
+        this.sessionCookie = null; // 旧地址的会话 Cookie 不再适用（新地址凭据由下次复用时验证）
         void this.stopProxy();
         this.set({ url: this.url(), embedUrl: null });
       }
     } else if (tokenChanged && !this.child && this.snapshot.state === 'ready') {
       // 外部令牌变化（复用外部实例场景）：立即换令牌刷新地址与代理（下次探测用新令牌）
       this.authToken = this.opts.externalToken ?? null;
+      this.sessionCookie = null; // 令牌模式：会话改为令牌交换，不再使用旧 Cookie
       void (async () => {
         await this.ensureProxy(); // key 含令牌：变化时自动重建代理并重新交换
         this.set({ url: this.url(), embedUrl: this.proxy?.url ?? null });

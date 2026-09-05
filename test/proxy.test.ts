@@ -226,6 +226,55 @@ test('令牌错误：交换失败，start() 抛错（调用方回退直连）', 
   }
 });
 
+test('无令牌且无预置 Cookie：start() 抛错（无凭据可建会话）', async () => {
+  const dsh = await serveFakeDsh();
+  const proxy = new DshProxy({ target: { host: '127.0.0.1', port: dsh.port } });
+  try {
+    await assert.rejects(() => proxy.start(), /token exchange failed/);
+  } finally {
+    await proxy.stop();
+    await dsh.close();
+  }
+});
+
+test('预置会话 Cookie 启动：跳过令牌交换（令牌错误也不交换），直接以 Cookie 注入访问', async () => {
+  const dsh = await serveFakeDsh();
+  // 先手动完成一次令牌交换拿会话 Cookie（模拟上一窗口持久化的凭据）
+  const ex = await fetch(`http://127.0.0.1:${dsh.port}/?token=${dsh.token}`, { redirect: 'manual' });
+  const cookie = ex.headers.getSetCookie().find((c) => c.startsWith('dsh-auth-'))!.split(';')[0];
+  // 故意给错误令牌：若 start() 仍尝试交换必然失败 → 证明预置 Cookie 跳过了交换
+  const proxy = new DshProxy({ target: { host: '127.0.0.1', port: dsh.port }, token: 'WRONG-TOKEN', initialCookie: cookie });
+  try {
+    await proxy.start();
+    assert.equal(proxy.sessionCookie, cookie, '会话应为预置 Cookie');
+    const res = await fetch(proxy.url);
+    assert.equal(res.status, 200);
+    assert.ok((await res.text()).includes('__DSH_BOOT__'));
+    const forwarded = dsh.requests.find((r) => r.url === '/');
+    assert.ok(forwarded?.headers['cookie']?.includes('dsh-auth-test='), '应注入预置会话 Cookie');
+  } finally {
+    await proxy.stop();
+    await dsh.close();
+  }
+});
+
+test('预置 Cookie 失效且无令牌：401 后降级 502，不发起无效交换（不死循环）', async () => {
+  const dsh = await serveFakeDsh();
+  const logs: string[] = [];
+  const proxy = new DshProxy({ target: { host: '127.0.0.1', port: dsh.port }, initialCookie: 'dsh-auth-test=STALE', log: (l) => logs.push(l) });
+  try {
+    await proxy.start();
+    const res = await fetch(proxy.url);
+    assert.equal(res.status, 502, '上游 401 且无法重新交换 → 降级 502');
+    assert.ok(logs.some((l) => l.includes('无访问令牌')), '应记日志说明无法重新交换');
+    // 请求有界：上游只收到 1 次转发（exchange 因无令牌直接短路，不发请求）
+    assert.equal(dsh.requests.filter((r) => r.url === '/').length, 1);
+  } finally {
+    await proxy.stop();
+    await dsh.close();
+  }
+});
+
 test('stop() 后端口关闭', async () => {
   const dsh = await serveFakeDsh();
   const proxy = new DshProxy({ target: { host: '127.0.0.1', port: dsh.port }, token: dsh.token });

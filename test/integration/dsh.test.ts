@@ -40,7 +40,15 @@ test('真实 dsh web：启动/复用/停止/意外退出全流程', { skip: !has
     const token1 = u1.searchParams.get('token') ?? '';
     assert.ok(token1 !== '', '新版 dsh 应解析出访问令牌');
     assert.equal(await probeService('127.0.0.1', port, 3000, token1), 'dsh');
-    assert.equal(await probeService('127.0.0.1', port, 3000), 'foreign', '无令牌探测新版 dsh 应视为 foreign（401）');
+    assert.equal(await probeService('127.0.0.1', port, 3000), 'dsh-unauthenticated', '无令牌探测新版 dsh → 疑似 dsh 未认证（401 + 认证提示）');
+
+    // 1a) 会话 Cookie 探测（跨窗口复用路径）：无令牌但带有效会话 Cookie → dsh
+    const exch = await fetch(`http://127.0.0.1:${port}/?token=${token1}`, { redirect: 'manual' });
+    const sessionCookie = exch.headers.getSetCookie().find((c) => c.startsWith('dsh-auth-'))?.split(';')[0];
+    assert.ok(sessionCookie, '令牌交换应签发会话 Cookie');
+    assert.equal(await probeService('127.0.0.1', port, 3000, undefined, sessionCookie), 'dsh', '带会话 Cookie 探测应命中 dsh');
+    // 失效 Cookie（伪造值）：仍是未认证 401 → dsh-unauthenticated
+    assert.equal(await probeService('127.0.0.1', port, 3000, undefined, 'dsh-auth-fake=stale'), 'dsh-unauthenticated');
 
     // 1b) 面板嵌入代理：无 Cookie 客户端（模拟 VS Code webview）经代理也能拿到 DSH 页面
     assert.ok(s1.embedUrl, '新版 dsh 应提供面板嵌入代理地址');

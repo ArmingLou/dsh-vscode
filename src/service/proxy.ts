@@ -25,8 +25,16 @@ export interface DshProxyTarget {
 /** 代理配置 */
 export interface DshProxyOptions {
   target: DshProxyTarget;
-  /** 进程访问令牌（用于令牌交换，换取会话 Cookie） */
-  token: string;
+  /**
+   * 进程访问令牌（用于令牌交换，换取会话 Cookie）。
+   * 复用已有会话（initialCookie）时可不传；缺失时无法重新交换（401 自愈降级）。
+   */
+  token?: string;
+  /**
+   * 预置会话 Cookie（name=value；复用外来实例场景）：提供时 start() 跳过令牌交换直接注入。
+   * 来源为上层持久化的上次会话凭据（dsh 的 Cookie 由机器级持久 secret 签名，跨重启有效）。
+   */
+  initialCookie?: string;
   log?: (line: string) => void;
 }
 
@@ -76,9 +84,17 @@ export class DshProxy {
     return this.port;
   }
 
-  /** 令牌交换 + 监听本地端口；交换失败抛错（调用方回退直连并记录日志） */
+  /** 当前会话 Cookie（name=value；未建立会话时为 null）——令牌交换成功后供上层持久化复用 */
+  get sessionCookie(): string | null {
+    return this.cookie;
+  }
+
+  /** 令牌交换（或采用预置 Cookie）+ 监听本地端口；交换失败抛错（调用方回退直连并记录日志） */
   async start(): Promise<void> {
-    if (!(await this.exchange())) {
+    if (this.opts.initialCookie !== undefined) {
+      // 预置会话（复用外来实例）：跳过令牌交换，直接以该 Cookie 注入
+      this.cookie = this.opts.initialCookie;
+    } else if (!(await this.exchange())) {
       throw new Error('dsh proxy: token exchange failed (expected 303 + dsh-auth cookie)');
     }
     const server = createServer((req, res) => void this.forward(req, res));
@@ -120,8 +136,13 @@ export class DshProxy {
   /**
    * 令牌交换：GET /?token=X → 303 Location:/ + Set-Cookie: dsh-auth-*。
    * 该 303 只在令牌有效时发出；Set-Cookie 即会话凭据（HttpOnly，仅本代理持有）。
+   * 无令牌（复用外来实例会话）时无法交换：返回 false 由调用方降级，绝不发起无效请求。
    */
   private async exchange(): Promise<boolean> {
+    if (!this.opts.token) {
+      this.opts.log?.('[proxy] 无访问令牌（复用外来实例会话），无法重新交换会话 Cookie');
+      return false;
+    }
     const { host, port } = this.opts.target;
     const url = `http://${host}:${port}/?token=${encodeURIComponent(this.opts.token)}`;
     try {
@@ -342,6 +363,8 @@ function forwardResponseHeaders(headers: IncomingMessage['headers']): Record<str
 export interface DshProxyLike {
   /** 面板嵌入地址（http://127.0.0.1:port/） */
   readonly url: string;
+  /** 当前会话 Cookie（可选实现；令牌交换成功后供上层持久化，跨窗口复用外来实例） */
+  readonly sessionCookie?: string | null;
   start(): Promise<void>;
   stop(): Promise<void>;
   /** 令牌变更后重新交换会话 Cookie（可选实现） */
@@ -350,6 +373,6 @@ export interface DshProxyLike {
 
 /** 默认代理工厂（管理器未注入时使用；把扩展日志接到代理日志） */
 export function createDefaultProxyFactory(log: (line: string) => void) {
-  return (opts: { target: DshProxyTarget; token: string }): DshProxyLike =>
+  return (opts: { target: DshProxyTarget; token: string; initialCookie?: string }): DshProxyLike =>
     new DshProxy({ ...opts, log });
 }

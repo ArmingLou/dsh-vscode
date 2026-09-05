@@ -1,7 +1,13 @@
 // test/manager.test.ts — 服务管理器状态机的单元测试（假探测 + 假子进程）
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ServiceManager, isNoOpenStderr, extractAuthToken, type ManagerDeps } from '../src/service/manager';
+import {
+  ServiceManager,
+  isNoOpenStderr,
+  extractAuthToken,
+  type ManagerDeps,
+  type PortConflictDecision,
+} from '../src/service/manager';
 import type { ProbeResult } from '../src/service/detect';
 import type { ChildProcessLike, ProcessRunner } from '../src/service/process';
 
@@ -46,10 +52,13 @@ interface Harness {
   spawnOpenInBrowser: boolean[]; // 每次 startDsh 传入的 openInBrowser（用于断言 --no-open 兜底）
   probeCount: number;           // 探测调用次数，用于断言定时器已清理
   probeTokens: (string | null)[]; // 每次探测收到的访问令牌（null=未带令牌）
+  probeCookies: (string | null)[]; // 每次探测收到的会话 Cookie（null=未带 Cookie）
   states: string[];             // 记录状态变化序列
   proxyStarts: number;          // 假代理 start() 次数（断言代理生命周期）
   proxyStops: number;           // 假代理 stop() 次数
-  proxyCreations: { target: { host: string; port: number }; token: string }[]; // 每次创建的 target/token
+  proxyCreations: { target: { host: string; port: number }; token: string; initialCookie?: string }[]; // 每次创建的 target/token/cookie
+  cookieJar: Map<string, string>; // 内存会话 Cookie 存储（键 host:port；模拟 globalState）
+  persistTokenCalls: string[];    // onPersistExternalToken 收到的令牌记录（'token' 决策验证有效后）
 }
 
 function makeHarness(opts?: Partial<Parameters<ServiceManager['reconfigure']>[0]>, depsOpts?: Partial<ManagerDeps>): Harness {
@@ -61,14 +70,18 @@ function makeHarness(opts?: Partial<Parameters<ServiceManager['reconfigure']>[0]
     spawnOpenInBrowser: [],
     probeCount: 0,
     probeTokens: [],
+    probeCookies: [],
     states: [],
     proxyStarts: 0,
     proxyStops: 0,
     proxyCreations: [],
+    cookieJar: new Map(),
+    persistTokenCalls: [],
   };
-  const probeService = async (_host: string, _port: number, _timeoutMs?: number, token?: string): Promise<ProbeResult> => {
+  const probeService = async (_host: string, _port: number, _timeoutMs?: number, token?: string, cookie?: string): Promise<ProbeResult> => {
     h.probeCount += 1;
     h.probeTokens.push(token ?? null);
+    h.probeCookies.push(cookie ?? null);
     return h.probeQueue.length > 1 ? h.probeQueue.shift()! : h.probeQueue[0];
   };
   const processRunner: ProcessRunner = {
@@ -87,10 +100,12 @@ function makeHarness(opts?: Partial<Parameters<ServiceManager['reconfigure']>[0]
     lastStart: { command: 'node', args: ['bin.js', 'web', '--host', '127.0.0.1', '--port', '3080'] },
   };
   // 默认注入假代理：记录创建参数与生命周期（不占真实端口，保持测试隔离）
-  const fakeProxyFactory = (opts: { target: { host: string; port: number }; token: string }) => {
-    h.proxyCreations.push({ target: { ...opts.target }, token: opts.token });
+  const fakeProxyFactory = (opts: { target: { host: string; port: number }; token: string; initialCookie?: string }) => {
+    h.proxyCreations.push({ target: { ...opts.target }, token: opts.token, initialCookie: opts.initialCookie });
     return {
       url: `http://127.0.0.1:${59000 + h.proxyCreations.length}/`,
+      // 模拟真实代理：令牌交换后持有会话 Cookie（供上层持久化）；预置 Cookie 模式直接透传
+      sessionCookie: opts.initialCookie ?? (opts.token ? `session-${opts.token}` : null),
       start: async () => {
         h.proxyStarts += 1;
       },
@@ -105,7 +120,22 @@ function makeHarness(opts?: Partial<Parameters<ServiceManager['reconfigure']>[0]
       host: '127.0.0.1', port: 3080, extraArgs: [], autoStart: true,
       timeoutMs: 100, pollMs: 5, ...opts,
     },
-    { probeService, processRunner, log: () => {}, startTimeoutMs: 50, proxyFactory: fakeProxyFactory, ...depsOpts },
+    {
+      probeService,
+      processRunner,
+      log: () => {},
+      startTimeoutMs: 50,
+      proxyFactory: fakeProxyFactory,
+      // 内存会话 Cookie 存储（模拟 globalState；跨复用路径断言用）
+      cookieStore: {
+        load: (host, port) => h.cookieJar.get(`${host}:${port}`) ?? null,
+        save: (host, port, cookie) => { h.cookieJar.set(`${host}:${port}`, cookie); },
+        clear: (host, port) => { h.cookieJar.delete(`${host}:${port}`); },
+      },
+      // 记录 'token' 决策验证有效后的持久化回调（默认无副作用；需要决策的用例在 depsOpts 注入 askPortConflict）
+      onPersistExternalToken: (token) => { h.persistTokenCalls.push(token); },
+      ...depsOpts,
+    },
   );
   h.manager.onChange((s) => h.states.push(s.state));
   return h;
@@ -637,6 +667,35 @@ test('externalToken 无效（探测 foreign）：回退自动换端口启动插�
   h.manager.dispose();
 });
 
+test('externalToken 空串（设置默认值，未配置）→ 归一化为无令牌：401 疑似 dsh → 弹三选一而非静默换端口', async () => {
+  // 回归：真实环境 dsh.externalToken 默认 ''，曾使探测携带 token='' → 401 无令牌识别
+  // 判据失效 → 疑似 dsh 被误判 foreign → 静默换端口且不弹三选一。
+  const probeTokens: (string | null)[] = [];
+  let asked = 0;
+  let call = 0;
+  const h = makeHarness({ externalToken: '' }, {
+    probeService: async (_host, _port, _timeout, t) => {
+      probeTokens.push(t ?? null);
+      call += 1;
+      // 第 1 次初始探测 → 疑似 dsh 未认证；第 2 次为 findFreePort 候选（down=空闲）；
+      // 之后为等待循环（无令牌旧版语义 dsh → ready）
+      return call === 1 ? 'dsh-unauthenticated' : call === 2 ? 'down' : 'dsh';
+    },
+    askPortConflict: async () => {
+      asked += 1;
+      return { kind: 'other-port' }; // 明确选择「使用其他端口」才允许换端口
+    },
+  });
+  const s = await h.manager.ensureRunning();
+  assert.equal(probeTokens[0], undefined, '空串 externalToken 必须归一化为 undefined（无令牌探测）');
+  assert.equal(asked, 1, '空串不得破坏 dsh-unauthenticated 识别：应弹一次三选一');
+  assert.equal(s.state, 'ready');
+  assert.equal(s.owned, true, '选择使用其他端口后才启动自有实例');
+  assert.equal(h.spawnCount, 1);
+  assert.equal(s.url, 'http://127.0.0.1:3081/');
+  h.manager.dispose();
+});
+
 test('启动行跨 chunk 到达：令牌仍能解析（有界缓冲累计）', async () => {
   const token = 'SPLIT123';
   const h = makeHarness(undefined, {
@@ -678,6 +737,408 @@ test('重启后旧令牌失效：新进程需重新解析令牌（探测不带�
   assert.equal(s2.state, 'ready');
   assert.equal(s2.url, 'http://127.0.0.1:3080/?token=TOKEN2'); // 新令牌生效
   assert.ok(probeTokens.includes('TOKEN2'), '就绪探测应携带新令牌');
+  h.manager.dispose();
+});
+
+test('自有实例令牌交换成功：会话 Cookie 自动持久化（跨窗口复用的凭据来源）', async () => {
+  const token = 'OWN-TOKEN';
+  const h = makeHarness(undefined, {
+    probeService: async (_host, _port, _timeout, t) => (t === token ? 'dsh' : 'down'),
+  });
+  const p = h.manager.ensureRunning();
+  await new Promise((r) => setTimeout(r, 5));
+  h.child?.emitStdout(`dsh web: http://127.0.0.1:3080/?token=${token}\n`);
+  const s = await p;
+  assert.equal(s.state, 'ready');
+  assert.equal(h.cookieJar.get('127.0.0.1:3080'), `session-${token}`, '交换出的会话 Cookie 应持久化到存储');
+  await h.manager.stop(); // 收尾停掉子进程：dispose 才会移除父进程 exit 钩子（避免监听器累积告警）
+  h.manager.dispose();
+});
+
+test('dsh-unauthenticated：持久化 Cookie 命中 → 复用（owned=false），代理以 Cookie 启动，无需决策', async () => {
+  const h = makeHarness({}, { healthIntervalMs: 30 });
+  h.cookieJar.set('127.0.0.1:3080', 'dsh-auth-keep=1');
+  // 首探（无令牌）→ dsh-unauthenticated；Cookie 探测 → dsh（命中后健康探测持续返回 dsh）
+  h.probeQueue = ['dsh-unauthenticated', 'dsh'];
+  const s = await h.manager.ensureRunning();
+  assert.equal(s.state, 'ready');
+  assert.equal(s.owned, false, '复用外来实例，插件不拥有它');
+  assert.equal(s.url, 'http://127.0.0.1:3080/', '无令牌复用：地址为裸地址（浏览器直开不可用，面板经代理）');
+  assert.equal(h.spawnCount, 0, '不应启动子进程');
+  assert.equal(h.proxyCreations[0].initialCookie, 'dsh-auth-keep=1', '代理应以持久化 Cookie 预置启动');
+  assert.equal(h.proxyCreations[0].token, '', '无令牌复用：代理不走令牌交换');
+  // 健康探测携带会话 Cookie（否则 401 被误判为失联）
+  const before = h.probeCount;
+  await new Promise((r) => setTimeout(r, 70));
+  const healthCookies = h.probeCookies.slice(before);
+  assert.ok(healthCookies.length > 0, '应有健康探测发生');
+  assert.ok(healthCookies.every((c) => c === 'dsh-auth-keep=1'), '健康探测必须携带会话 Cookie');
+  // stop() 只脱钩不清持久化凭据（实例仍在运行，下次启动验证后仍可复用）
+  await h.manager.stop();
+  assert.equal(h.manager.getSnapshot().state, 'idle');
+  assert.equal(h.cookieJar.get('127.0.0.1:3080'), 'dsh-auth-keep=1', '停止复用不应清除持久化凭据');
+  h.manager.dispose();
+});
+
+test('dsh-unauthenticated：Cookie 失效 → 清除存储、三选一选择「使用其他端口」、回退启动自有实例并持久化新会话', async () => {
+  const token = 'NEW-TOKEN';
+  const probeCalls: { port: number; token: string | null; cookie: string | null }[] = [];
+  const askCalls: { host: string; port: number; tokenAttemptFailed: boolean }[] = [];
+  const h = makeHarness({}, {
+    probeService: async (_host, port, _timeout, t, cookie) => {
+      probeCalls.push({ port, token: t ?? null, cookie: cookie ?? null });
+      if (port === 3080) return 'dsh-unauthenticated'; // 3080 上的外来 dsh：无令牌 401，旧 Cookie 也失效
+      return t === token ? 'dsh' : 'down'; // 自有实例（3081）：解析出令牌后才就绪
+    },
+    askPortConflict: async (info) => {
+      askCalls.push({ host: info.host, port: info.port, tokenAttemptFailed: info.tokenAttemptFailed });
+      return { kind: 'other-port' };
+    },
+  });
+  h.cookieJar.set('127.0.0.1:3080', 'dsh-auth-stale=1');
+  const p = h.manager.ensureRunning();
+  await new Promise((r) => setTimeout(r, 5)); // 等待 spawn 完成、等待循环已开始
+  h.child?.emitStdout(`dsh web: http://127.0.0.1:3081/?token=${token}\n`);
+  const s = await p;
+  assert.equal(s.state, 'ready');
+  assert.equal(s.owned, true, '选择换端口后应启动插件自有实例');
+  assert.equal(s.url, `http://127.0.0.1:3081/?token=${token}`, '运行时替换为临时端口');
+  assert.equal(h.spawnCount, 1);
+  assert.equal(h.cookieJar.has('127.0.0.1:3080'), false, '失效的持久化 Cookie 应清除');
+  assert.equal(h.cookieJar.get('127.0.0.1:3081'), `session-${token}`, '自有实例交换出的会话应持久化');
+  assert.deepEqual(askCalls, [{ host: '127.0.0.1', port: 3080, tokenAttemptFailed: false }], 'Cookie 落空应弹一次三选一');
+  assert.ok(probeCalls.some((c) => c.port === 3080 && c.cookie === 'dsh-auth-stale=1'), '应先用存储的旧 Cookie 探测');
+  await h.manager.stop(); // 收尾停掉子进程：dispose 才会移除父进程 exit 钩子（避免监听器累积告警）
+  h.manager.dispose();
+});
+
+test('dsh-unauthenticated：未注入决策回调（旧装配）→ 维持旧行为直接换端口回退', async () => {
+  const h = makeHarness();
+  // 首探 → dsh-unauthenticated（无 Cookie 可试）→ 候选 3081 down → spawn 后等待循环 dsh
+  h.probeQueue = ['dsh-unauthenticated', 'down', 'dsh'];
+  const s = await h.manager.ensureRunning();
+  assert.equal(s.state, 'ready');
+  assert.equal(s.owned, true);
+  assert.equal(s.url, 'http://127.0.0.1:3081/');
+  await h.manager.stop(); // 收尾停掉子进程：dispose 才会移除父进程 exit 钩子（避免监听器累积告警）
+  h.manager.dispose();
+});
+
+test('dsh-unauthenticated + autoStart=false：不弹三选一，直接报 err.portOccupied（不换端口）', async () => {
+  const askCalls: unknown[] = [];
+  const h = makeHarness({ autoStart: false }, {
+    askPortConflict: async (info) => {
+      askCalls.push(info);
+      return { kind: 'other-port' };
+    },
+  });
+  h.probeQueue = ['dsh-unauthenticated'];
+  const s = await h.manager.ensureRunning();
+  assert.equal(s.state, 'failed');
+  assert.equal(s.error, 'err.portOccupied');
+  assert.equal(h.spawnCount, 0);
+  assert.equal(askCalls.length, 0, 'autoStart=false 保持原语义：不弹三选一');
+  h.manager.dispose();
+});
+
+test('Cookie 复用实例会话失效：健康探测发现后清除持久化 Cookie 并回 idle', async () => {
+  const h = makeHarness({}, { healthIntervalMs: 30 });
+  h.cookieJar.set('127.0.0.1:3080', 'dsh-auth-stale=1');
+  h.probeQueue = ['dsh-unauthenticated', 'dsh'];
+  await h.manager.ensureRunning();
+  assert.equal(h.manager.getSnapshot().state, 'ready');
+  h.probeQueue = ['dsh-unauthenticated']; // Cookie 失效（带 Cookie 探测仍 401）
+  await new Promise((r) => setTimeout(r, 90));
+  assert.equal(h.manager.getSnapshot().state, 'idle', '健康探测未命中应回到 idle');
+  assert.equal(h.cookieJar.has('127.0.0.1:3080'), false, '失效 Cookie 应从存储清除');
+  h.manager.dispose();
+});
+
+test('两个 ServiceManager 共享 Cookie 存储（模拟窗口 A/B）：A 自启就绪即发布 Cookie → B 无令牌探测即复用', async () => {
+  const token = 'WIN-A-TOKEN';
+  const cookieJar = new Map<string, string>(); // 模拟跨窗口共享的用户级 globalState
+  const store = {
+    load: (host: string, port: number) => cookieJar.get(`${host}:${port}`) ?? null,
+    save: (host: string, port: number, cookie: string) => { cookieJar.set(`${host}:${port}`, cookie); },
+    clear: (host: string, port: number) => { cookieJar.delete(`${host}:${port}`); },
+  };
+  // 窗口 A：自启新版 dsh（动态令牌）——就绪路径应立即完成令牌交换并持久化会话 Cookie
+  const a = makeHarness(undefined, {
+    probeService: async (_host, _port, _timeout, t) => (t === token ? 'dsh' : 'down'),
+    cookieStore: store,
+  });
+  const pa = a.manager.ensureRunning();
+  await new Promise((r) => setTimeout(r, 5)); // 等待 spawn 完成、等待循环已开始
+  a.child?.emitStdout(`dsh web: http://127.0.0.1:3080/?token=${token}\n`);
+  const sa = await pa;
+  assert.equal(sa.state, 'ready');
+  assert.equal(sa.owned, true);
+  assert.equal(cookieJar.get('127.0.0.1:3080'), `session-${token}`, 'A 就绪时应已持久化会话 Cookie（不依赖面板/代理后续创建时机）');
+
+  // 窗口 B：无令牌探测 3080 → 401（疑似 dsh 未认证）→ 以 A 发布的 Cookie 无感复用
+  const b = makeHarness(undefined, {
+    probeService: async (_host, _port, _timeout, t, cookie) =>
+      cookie === `session-${token}` ? 'dsh' : 'dsh-unauthenticated',
+    cookieStore: store,
+  });
+  const sb = await b.manager.ensureRunning();
+  assert.equal(sb.state, 'ready');
+  assert.equal(sb.owned, false, 'B 应复用 A 的实例（owned=false，不杀他人进程）');
+  assert.equal(sb.url, 'http://127.0.0.1:3080/', '复用后仍为原端口裸地址（面板经代理访问）');
+  assert.equal(b.manager.getTarget().port, 3080, '不应换端口');
+  assert.equal(b.spawnCount, 0, '不应另起 dsh 实例');
+  assert.equal(b.proxyCreations[0]?.initialCookie, `session-${token}`, 'B 的代理应以持久化 Cookie 预置启动');
+
+  await a.manager.stop(); // 收尾停掉 A 的子进程：dispose 才会移除父进程 exit 钩子
+  a.manager.dispose();
+  b.manager.dispose();
+});
+
+test('多窗口同时冷启动竞态：子进程 EADDRINUSE 崩溃 → 自愈探测疑似 dsh → 以共享 Cookie 复用（不换端口、不再 spawn）', async () => {
+  const fallbackCalls: [number, number][] = [];
+  let crashed = false; // 模拟「另一窗口的 dsh 是否已绑定 3080」
+  const h = makeHarness(undefined, {
+    onPortFallback: (req, fb) => fallbackCalls.push([req, fb]),
+    probeService: async (_host, port, _timeout, _token, cookie) => {
+      if (port === 3080) {
+        if (cookie === 'dsh-auth-wina=1') return 'dsh'; // 窗口 A 发布的会话 Cookie 命中
+        // 崩溃前 A 的 dsh 尚未监听（本窗口探测 down 即另起实例）；崩溃后 3080 已是 A 的 dsh（401）
+        return crashed ? 'dsh-unauthenticated' : 'down';
+      }
+      return 'down'; // 其余候选端口空闲——复用成功时不应被探测到
+    },
+  });
+  h.cookieJar.set('127.0.0.1:3080', 'dsh-auth-wina=1'); // 预置：窗口 A 已就绪并发布 Cookie
+  const p = h.manager.ensureRunning();
+  await new Promise((r) => setTimeout(r, 1)); // 等待 spawn 完成、进入 waiting
+  crashed = true; // 本窗口子进程因 3080 被 A 的 dsh 先绑定而 EADDRINUSE 崩溃
+  h.child?.emitExit(1);
+  const s = await p;
+  assert.equal(s.state, 'ready');
+  assert.equal(s.owned, false, '应以 Cookie 复用另一窗口的实例');
+  assert.equal(s.url, 'http://127.0.0.1:3080/');
+  assert.equal(h.manager.getTarget().port, 3080, '不应换端口');
+  assert.equal(h.spawnCount, 1, '崩溃后不应再 spawn（复用而非换端口重启）');
+  assert.equal(fallbackCalls.length, 0, '不应弹换端口通知');
+  assert.equal(h.proxyCreations[0]?.initialCookie, 'dsh-auth-wina=1', '代理应以持久化 Cookie 预置启动');
+  h.manager.dispose();
+});
+
+test('崩溃自愈竞态：对方 Cookie 发布晚一步 → 宽限重试窗口内命中 → 复用（不换端口）', async () => {
+  let loadCalls = 0;
+  let crashed = false;
+  const h = makeHarness(undefined, {
+    cookieGraceDelayMs: 1, // 单测缩短宽限间隔
+    cookieStore: {
+      // 前 2 次读取落空：模拟「绑定端口 → 发布 Cookie」的短暂窗口与跨窗口存储同步延迟
+      load: async () => {
+        loadCalls += 1;
+        return loadCalls >= 3 ? 'dsh-auth-late=1' : null;
+      },
+      save: async () => {},
+      clear: async () => {},
+    },
+    probeService: async (_host, port, _timeout, _token, cookie) => {
+      if (port === 3080) {
+        if (cookie === 'dsh-auth-late=1') return 'dsh';
+        return crashed ? 'dsh-unauthenticated' : 'down';
+      }
+      return 'down';
+    },
+  });
+  const p = h.manager.ensureRunning();
+  await new Promise((r) => setTimeout(r, 1));
+  crashed = true;
+  h.child?.emitExit(1);
+  const s = await p;
+  assert.equal(s.state, 'ready');
+  assert.equal(s.owned, false);
+  assert.equal(h.manager.getTarget().port, 3080, '宽限命中后不应换端口');
+  assert.equal(h.spawnCount, 1, '不应再 spawn');
+  assert.equal(loadCalls, 3, '宽限窗口内应重试读取共享 Cookie');
+  h.manager.dispose();
+});
+
+test('崩溃自愈后 Cookie 始终缺失：宽限重试耗尽 → 三选一选择「使用其他端口」→ 照旧换端口重启', async () => {
+  const fallbackCalls: [number, number][] = [];
+  const askCalls: { host: string; port: number; tokenAttemptFailed: boolean }[] = [];
+  let crashed = false;
+  let probe3081 = 0;
+  const h = makeHarness(undefined, {
+    cookieGraceDelayMs: 1,
+    onPortFallback: (req, fb) => fallbackCalls.push([req, fb]),
+    askPortConflict: async (info) => {
+      askCalls.push({ host: info.host, port: info.port, tokenAttemptFailed: info.tokenAttemptFailed });
+      return { kind: 'other-port' };
+    },
+    probeService: async (_host, port, _timeout, _token, _cookie) => {
+      if (port === 3080) return crashed ? 'dsh-unauthenticated' : 'down';
+      // 3081：候选探测（findFreePort）down → 换端口重启的初始探测 down → 等待循环 dsh
+      probe3081 += 1;
+      return probe3081 >= 3 ? 'dsh' : 'down';
+    },
+  });
+  const p = h.manager.ensureRunning();
+  await new Promise((r) => setTimeout(r, 1));
+  crashed = true;
+  h.child?.emitExit(1);
+  const s = await p;
+  assert.equal(s.state, 'ready');
+  assert.equal(s.owned, true, '选择换端口后照旧自启');
+  assert.equal(s.url, 'http://127.0.0.1:3081/');
+  assert.equal(h.spawnCount, 2, '崩溃 + 换端口重启各 spawn 一次');
+  assert.deepEqual(fallbackCalls, [[3080, 3081]], '应弹换端口通知');
+  assert.deepEqual(askCalls, [{ host: '127.0.0.1', port: 3080, tokenAttemptFailed: false }], '宽限耗尽应弹一次三选一');
+  await h.manager.stop(); // 收尾停掉子进程：dispose 才会移除父进程 exit 钩子
+  h.manager.dispose();
+});
+
+test('三选一「输入令牌重试」：令牌有效 → 复用（owned=false）、URL 带令牌、写入设置回调、不换端口不 spawn', async () => {
+  const askCalls: { host: string; port: number; tokenAttemptFailed: boolean }[] = [];
+  const h = makeHarness(undefined, {
+    askPortConflict: async (info) => {
+      askCalls.push({ host: info.host, port: info.port, tokenAttemptFailed: info.tokenAttemptFailed });
+      return { kind: 'token', token: 'USER-TOKEN' };
+    },
+    probeService: async (_host, _port, _timeout, t) => (t === 'USER-TOKEN' ? 'dsh' : 'dsh-unauthenticated'),
+  });
+  const s = await h.manager.ensureRunning();
+  assert.equal(s.state, 'ready');
+  assert.equal(s.owned, false, '以用户提供的令牌复用外来实例');
+  assert.equal(s.url, 'http://127.0.0.1:3080/?token=USER-TOKEN');
+  assert.equal(h.manager.getTarget().port, 3080, '不应换端口');
+  assert.equal(h.spawnCount, 0, '不应启动子进程');
+  assert.equal(askCalls.length, 1, '只问一次');
+  assert.deepEqual(h.persistTokenCalls, ['USER-TOKEN'], '验证有效后应回调持久化 dsh.externalToken');
+  assert.equal(h.proxyCreations[0]?.token, 'USER-TOKEN', '代理应以用户令牌做交换');
+  h.manager.dispose();
+});
+
+test('三选一「输入令牌重试」：令牌无效 → 提示后重弹（tokenAttemptFailed=true），第二次令牌有效 → 复用', async () => {
+  const askInfos: { tokenAttemptFailed: boolean }[] = [];
+  const tokenProbes: (string | null)[] = [];
+  const h = makeHarness(undefined, {
+    askPortConflict: async (info) => {
+      askInfos.push({ tokenAttemptFailed: info.tokenAttemptFailed });
+      return askInfos.length === 1 ? { kind: 'token', token: 'BAD' } : { kind: 'token', token: 'GOOD' };
+    },
+    probeService: async (_host, _port, _timeout, t) => {
+      if (t !== undefined) tokenProbes.push(t);
+      return t === 'GOOD' ? 'dsh' : 'dsh-unauthenticated';
+    },
+  });
+  const s = await h.manager.ensureRunning();
+  assert.equal(s.state, 'ready');
+  assert.equal(s.owned, false);
+  assert.deepEqual(tokenProbes, ['BAD', 'GOOD'], '两个令牌都应被探测验证');
+  assert.deepEqual(askInfos.map((i) => i.tokenAttemptFailed), [false, true], '第二次弹窗应提示上次令牌无效');
+  assert.deepEqual(h.persistTokenCalls, ['GOOD'], '只有验证有效的令牌才写入设置');
+  h.manager.dispose();
+});
+
+test('三选一「按原流程重试」：实例已消失 → 原端口自启（owned=true），只问一次', async () => {
+  const askCalls: number[] = [];
+  let probeCount = 0;
+  const h = makeHarness(undefined, {
+    askPortConflict: async () => {
+      askCalls.push(1);
+      return { kind: 'retry' };
+    },
+    probeService: async () => {
+      probeCount += 1;
+      // 首探 dsh-unauthenticated（外来实例在）→ retry 重探 down（实例已消失）→ spawn 等待循环 down → dsh
+      return probeCount === 1 ? 'dsh-unauthenticated' : probeCount <= 3 ? 'down' : 'dsh';
+    },
+  });
+  const s = await h.manager.ensureRunning();
+  assert.equal(s.state, 'ready');
+  assert.equal(s.owned, true, '实例消失后应原端口自启');
+  assert.equal(h.manager.getTarget().port, 3080, '不应换端口');
+  assert.equal(h.spawnCount, 1);
+  assert.equal(askCalls.length, 1, '只应问一次');
+  await h.manager.stop(); // 收尾停掉子进程：dispose 才会移除父进程 exit 钩子
+  h.manager.dispose();
+});
+
+test('三选一「按原流程重试」：实例仍在占用 → 重弹三选一 → 选择「使用其他端口」回退', async () => {
+  const askInfos: { tokenAttemptFailed: boolean }[] = [];
+  const h = makeHarness(undefined, {
+    askPortConflict: async (info) => {
+      askInfos.push({ tokenAttemptFailed: info.tokenAttemptFailed });
+      return askInfos.length === 1 ? { kind: 'retry' } : { kind: 'other-port' };
+    },
+  });
+  // 首探 unauth → retry 重探 unauth → 候选 3081 down → spawn 等待循环 dsh
+  h.probeQueue = ['dsh-unauthenticated', 'dsh-unauthenticated', 'down', 'dsh'];
+  const s = await h.manager.ensureRunning();
+  assert.equal(s.state, 'ready');
+  assert.equal(s.owned, true, '最终换端口自启');
+  assert.equal(s.url, 'http://127.0.0.1:3081/');
+  assert.equal(askInfos.length, 2, 'retry 后仍占用应重弹三选一');
+  await h.manager.stop(); // 收尾停掉子进程：dispose 才会移除父进程 exit 钩子
+  h.manager.dispose();
+});
+
+test('决策等待期间不落任何回退（dismiss 循环由回调负责重弹）：未选择则不换端口、不 spawn、不报失败', async () => {
+  // holder 对象：闭包内赋值 + 事后取用（TS 对 let 闭包捕获的流窄化不随调用重置，对象属性则重置）
+  const askState: { resolve: ((d: PortConflictDecision) => void) | undefined } = { resolve: undefined };
+  const h = makeHarness(undefined, {
+    askPortConflict: () => new Promise<PortConflictDecision>((resolve) => { askState.resolve = resolve; }),
+  });
+  // 首探 unauth（决策挂起）→ 明确选择「使用其他端口」后：候选 3081 down → spawn 等待循环 dsh
+  h.probeQueue = ['dsh-unauthenticated', 'down', 'dsh'];
+  const p = h.manager.ensureRunning();
+  await new Promise((r) => setTimeout(r, 20)); // 决策挂起期间：不应有任何回退动作
+  assert.equal(h.spawnCount, 0, '等待决策期间不应 spawn');
+  assert.equal(h.manager.getTarget().port, 3080, '不应换端口');
+  assert.notEqual(h.manager.getSnapshot().state, 'failed', '等待决策期间不应报失败');
+  const resolveAsk = askState.resolve;
+  assert.ok(resolveAsk, '决策回调应已被调用（挂起中）');
+  resolveAsk({ kind: 'other-port' });
+  const s = await p;
+  assert.equal(s.state, 'ready', '明确选择后回退继续（换端口自启）');
+  await h.manager.stop(); // 收尾停掉子进程：dispose 才会移除父进程 exit 钩子
+  h.manager.dispose();
+});
+
+test('决策等待期间 stop()：可中断等待，流程以 idle 结束（用户后续选择被丢弃、不落回退）', async () => {
+  const askState: { resolve: ((d: PortConflictDecision) => void) | undefined } = { resolve: undefined };
+  const h = makeHarness(undefined, {
+    askPortConflict: () => new Promise<PortConflictDecision>((resolve) => { askState.resolve = resolve; }),
+  });
+  h.probeQueue = ['dsh-unauthenticated'];
+  const p = h.manager.ensureRunning();
+  await new Promise((r) => setTimeout(r, 10)); // 等待进入决策
+  await h.manager.stop(); // 等待期间被叫停
+  askState.resolve?.({ kind: 'other-port' }); // 用户此刻才选择：结果应被丢弃
+  const s = await p;
+  assert.equal(s.state, 'idle', '叫停后不得覆盖 stop() 设置的 idle');
+  assert.equal(h.spawnCount, 0, '不应 spawn');
+  assert.equal(h.manager.getTarget().port, 3080, '不应换端口');
+  h.manager.dispose();
+});
+
+test('崩溃自愈宽限耗尽 → 三选一「输入令牌重试」：令牌有效 → 复用另一窗口实例（不换端口、不再 spawn）', async () => {
+  let crashed = false;
+  const h = makeHarness(undefined, {
+    cookieGraceDelayMs: 1,
+    askPortConflict: async () => ({ kind: 'token', token: 'WINNER-TOKEN' }),
+    probeService: async (_host, port, _timeout, t) => {
+      if (port === 3080) return t === 'WINNER-TOKEN' ? 'dsh' : crashed ? 'dsh-unauthenticated' : 'down';
+      return 'down';
+    },
+  });
+  const p = h.manager.ensureRunning();
+  await new Promise((r) => setTimeout(r, 1));
+  crashed = true; // 本窗口子进程因 3080 被「另一窗口的 dsh」先绑定而 EADDRINUSE 崩溃
+  h.child?.emitExit(1);
+  const s = await p;
+  assert.equal(s.state, 'ready');
+  assert.equal(s.owned, false, '以用户提供的令牌复用另一窗口实例');
+  assert.equal(s.url, 'http://127.0.0.1:3080/?token=WINNER-TOKEN');
+  assert.equal(h.manager.getTarget().port, 3080, '不应换端口');
+  assert.equal(h.spawnCount, 1, '崩溃后不再 spawn');
+  assert.deepEqual(h.persistTokenCalls, ['WINNER-TOKEN'], '验证有效后应回调持久化 dsh.externalToken');
   h.manager.dispose();
 });
 

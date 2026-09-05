@@ -87,13 +87,70 @@ test('带令牌探测：303 令牌交换（Location:/ + dsh-auth Cookie）→ ds
   }
 });
 
-test('无令牌探测收到 401 → foreign（新版 dsh 需访问令牌）', async () => {
+test('无令牌探测收到 401（dsh 认证提示）→ dsh-unauthenticated（疑似 dsh 未认证）', async () => {
   const { server, port } = await serve((_req, res) => {
     res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' });
     res.end('dsh web authentication required; reopen the URL printed by dsh web.\n');
   });
   try {
+    assert.equal(await probeService('127.0.0.1', port, 1000), 'dsh-unauthenticated');
+  } finally {
+    server.close();
+  }
+});
+
+test('令牌为空串（externalToken 设置默认值）→ 按无令牌识别：401 + dsh 认证提示 → dsh-unauthenticated', async () => {
+  const { server, port } = await serve((_req, res) => {
+    res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('dsh web authentication required; reopen the URL printed by dsh web.\n');
+  });
+  try {
+    // 回归：空串曾使 token === undefined 判据失效 → 误判 foreign（静默换端口、不弹三选一）
+    assert.equal(await probeService('127.0.0.1', port, 1000, ''), 'dsh-unauthenticated');
+    assert.equal(await probeService('127.0.0.1', port, 1000, '   '), 'dsh-unauthenticated');
+  } finally {
+    server.close();
+  }
+});
+
+test('令牌为空串 → 按无令牌识别：首页含 __DSH_BOOT__ → dsh（不被当作带令牌请求）', async () => {
+  const { server, port } = await serve((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end(DSH_HTML);
+  });
+  try {
+    assert.equal(await probeService('127.0.0.1', port, 1000, ''), 'dsh');
+  } finally {
+    server.close();
+  }
+});
+
+test('401 但响应体不含 dsh 认证提示（其他服务的鉴权错误）→ foreign', async () => {
+  const { server, port } = await serve((_req, res) => {
+    res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('401 Authorization Required');
+  });
+  try {
     assert.equal(await probeService('127.0.0.1', port, 1000), 'foreign');
+  } finally {
+    server.close();
+  }
+});
+
+test('带会话 Cookie 探测：200 + __DSH_BOOT__ → dsh（Cookie 头已送达）', async () => {
+  const { server, port } = await serve((req, res) => {
+    if (req.headers.cookie === 'dsh-auth-test=SESSION1') {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end(DSH_HTML);
+      return;
+    }
+    res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('dsh web authentication required; reopen the URL printed by dsh web.\n');
+  });
+  try {
+    assert.equal(await probeService('127.0.0.1', port, 1000, undefined, 'dsh-auth-test=SESSION1'), 'dsh');
+    // Cookie 错误/失效：仍是未认证 401 → dsh-unauthenticated（上层据此清除存储并回退）
+    assert.equal(await probeService('127.0.0.1', port, 1000, undefined, 'dsh-auth-test=WRONG'), 'dsh-unauthenticated');
   } finally {
     server.close();
   }
@@ -118,6 +175,54 @@ test('带令牌但 303 非令牌交换（Location 非 /）→ foreign', async ()
   });
   try {
     assert.equal(await probeService('127.0.0.1', port, 1000, 'TOKEN123'), 'foreign');
+  } finally {
+    server.close();
+  }
+});
+
+test('诊断日志（log 注入）：foreign/dsh-unauthenticated 记录状态码与响应体片段，down 记录错误信息', async () => {
+  const logs: string[] = [];
+  const log = (line: string): void => { logs.push(line); };
+  // 非 OK 非 401：记录状态码与响应体片段
+  const notFound = await serve((_req, res) => {
+    res.writeHead(404, { 'content-type': 'text/plain' });
+    res.end('not found page');
+  });
+  try {
+    assert.equal(await probeService('127.0.0.1', notFound.port, 1000, undefined, undefined, log), 'foreign');
+  } finally {
+    notFound.server.close();
+  }
+  // 无令牌 401 + dsh 认证提示：记录 dsh-unauthenticated 与片段
+  const unauth = await serve((_req, res) => {
+    res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('dsh web authentication required; reopen the URL printed by dsh web.\n');
+  });
+  try {
+    assert.equal(await probeService('127.0.0.1', unauth.port, 1000, undefined, undefined, log), 'dsh-unauthenticated');
+  } finally {
+    unauth.server.close();
+  }
+  // 无监听端口：down 记录具体错误信息（定位 fetch 缺失/代理劫持等环境差异）
+  const srv = net.createServer();
+  await new Promise<void>((res) => srv.listen(0, '127.0.0.1', res));
+  const deadPort = (srv.address() as AddressInfo).port;
+  await new Promise<void>((res) => srv.close(() => res()));
+  assert.equal(await probeService('127.0.0.1', deadPort, 1000, undefined, undefined, log), 'down');
+  // 汇总断言：三类诊断各就各位
+  assert.ok(logs.some((l) => l.includes('404') && l.includes('not found page')), 'foreign 应记录状态码与响应体片段');
+  assert.ok(logs.some((l) => l.includes('dsh-unauthenticated') && l.includes('authentication required')), '未认证应记录分类与响应体片段');
+  assert.ok(logs.some((l) => l.includes('down（')), 'down 应记录错误信息');
+  assert.ok(logs.every((l) => l.startsWith('[probe] ')), '诊断日志统一 [probe] 前缀');
+});
+
+test('诊断日志（log 缺省）：行为与原版一致（不读非 401 响应体、不产生日志）', async () => {
+  const { server, port } = await serve((_req, res) => {
+    res.writeHead(500, { 'content-type': 'text/plain' });
+    res.end('boom');
+  });
+  try {
+    assert.equal(await probeService('127.0.0.1', port, 1000), 'foreign');
   } finally {
     server.close();
   }
