@@ -7,6 +7,7 @@
   "dsh.cmd.openFromTitle.title": "DSH: Open Right Panel",
   "dsh.cmd.openExternal.title": "Open in Browser",
   "dsh.cmd.restart.title": "Restart Service",
+  "dsh.cmd.disconnect.title": "Disconnect Panel",
   "dsh.cmd.stop.title": "Stop Service",
   "dsh.cmd.copyUrl.title": "Copy URL",
   "dsh.cmd.showLogs.title": "Show Logs",

@@ -7,6 +7,7 @@
   "dsh.cmd.openFromTitle.title": "DSH：打开右侧面板",
   "dsh.cmd.openExternal.title": "在浏览器中打开",
   "dsh.cmd.restart.title": "重启服务",
+  "dsh.cmd.disconnect.title": "断开面板连接",
   "dsh.cmd.stop.title": "停止服务",
   "dsh.cmd.copyUrl.title": "复制网址",
   "dsh.cmd.showLogs.title": "查看日志",

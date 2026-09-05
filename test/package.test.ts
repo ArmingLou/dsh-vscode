@@ -38,6 +38,23 @@ test('存在手动清理图片缓存命令 dsh.cleanupImageCache', () => {
   assert.ok(Array.isArray(p.activationEvents) && p.activationEvents.includes('onCommand:dsh.cleanupImageCache'), '需声明激活事件');
 });
 
+test('断开命令 dsh.disconnect：声明、双面板标题栏菜单、激活事件齐全', () => {
+  const p = pkg();
+  const cmd = p.contributes.commands.find((c: { command: string }) => c.command === 'dsh.disconnect');
+  assert.ok(cmd, '存在 dsh.disconnect 命令');
+  assert.equal(cmd.icon, '$(debug-disconnect)', '图标用 debug-disconnect');
+  assert.ok(String(cmd.title).includes('dsh.cmd.disconnect.title'), '命令标题走本地化');
+  assert.ok(Array.isArray(p.activationEvents) && p.activationEvents.includes('onCommand:dsh.disconnect'), '需声明激活事件');
+  const vt: { command: string; when?: string; group?: string }[] = p.contributes.menus['view/title'] || [];
+  const items = vt.filter((m) => m.command === 'dsh.disconnect');
+  assert.equal(items.length, 1, '单个菜单项覆盖两个面板视图');
+  assert.ok(items[0].when?.includes('dsh.panel') && items[0].when?.includes('dsh.panel.secondary'), 'when 覆盖主/副面板');
+  assert.ok(String(items[0].group).startsWith('navigation'), '标题栏 navigation 组');
+  // 与 Stop Service 并排：disconnect(navigation@3) 紧跟 stop(navigation@4) 之前
+  const stopGroup = vt.find((m) => m.command === 'dsh.stop')?.group;
+  assert.ok(stopGroup !== undefined && String(items[0].group) < String(stopGroup), '断开按钮应排在停止服务之前并排显示');
+});
+
 test('活动栏/辅助侧边栏容器图标保持原始鲸鱼图标（assets/whale-icon.svg）', () => {
   const p = pkg();
   for (const container of [...p.contributes.viewsContainers.activitybar, ...p.contributes.viewsContainers.secondarySidebar]) {

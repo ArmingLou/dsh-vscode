@@ -311,6 +311,22 @@ export function disconnectedPage(t: T, ctx: PageCtx): string {
   );
 }
 
+/**
+ * 用户手动断开占位页（「断开面板连接」工具栏按钮）：后端服务仍在运行，仅本面板的嵌入连接被断开。
+ * 与 disconnectedPage 视觉/按钮对齐（重新连接 + 查看日志）；粘性由 provider 侧保证——
+ * 任何重渲染路径在 detached 状态下一律渲染本页，只有用户点「重新连接」才恢复 iframe。
+ */
+export function detachedPage(t: T, ctx: PageCtx): string {
+  return shell(
+    ctx,
+    t('panel.detachedTitle'),
+    '',
+    `<div class="center"><p>${t('panel.detachedTitle')}</p>
+<button data-action="reconnect">${t('panel.reconnect')}</button>
+<button data-action="showLogs">${t('panel.showLogs')}</button></div>`,
+  );
+}
+
 /** 远程未启用占位页：远程窗口且 dsh.remote.enabled=false 时展示，引导用户开启并重载（v0.3.0） */
 export function remoteDisabledPage(t: T, ctx: PageCtx): string {
   return shell(

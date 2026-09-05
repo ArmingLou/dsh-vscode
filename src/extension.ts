@@ -508,6 +508,34 @@ export function activate(context: vscode.ExtensionContext): void {
   getDisplayUrl = () => panelPrimary.getDisplayUrl();
   new StatusBarController(manager);
 
+  /**
+   * 「断开面板连接」路由：取「用户正看着的面板」。view/title 工具栏菜单命令触发时
+   * 不带视图/provider 参数，故由各 provider 自行跟踪可见性与最近激活时刻：
+   * 可见面板唯一 → 直接命中；两个都可见（主/辅助侧边栏同时展开）→ 取最近激活者；
+   * 都不可见（命令面板触发等）→ 返回 null（命令无操作，绝不双断）。
+   */
+  function activePanelProvider(): DshPanelProvider | null {
+    const candidates = [panelPrimary, panelSecondary].filter((p) => p.isViewVisible());
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => b.lastVisibleAtMs() - a.lastVisibleAtMs());
+    return candidates[0];
+  }
+
+  /**
+   * 「断开面板连接」命令（dsh.disconnect）：断开目标面板（粘性占位页 + 销毁其 iframe）。
+   * 窗口共享的嵌入代理只有在**没有其他面板仍在嵌入**时才停掉——后端进程（无论 owned 与否）、
+   * 子进程所有权、退出钩子、健康探测一律不受影响；其他窗口的代理与后端复用互不相干。
+   */
+  function disconnectPanelCmd(): void {
+    const target = activePanelProvider();
+    if (!target) return;
+    if (!target.disconnectPanel()) return; // 已断开 / 远程未启用窗口：无操作
+    const other = target === panelPrimary ? panelSecondary : panelPrimary;
+    if (!other.isUsingEmbedProxy()) {
+      void manager?.disconnectEmbed();
+    }
+  }
+
   // 服务就绪后启动握手超时（若面板已打开）
   manager.onChange((s) => {
     if (s.state === 'ready') {
@@ -529,6 +557,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('dsh.openExternal', () => openExternal()),
     vscode.commands.registerCommand('dsh.restart', () => void manager?.restart()),
     vscode.commands.registerCommand('dsh.stop', () => void manager?.stop()),
+    vscode.commands.registerCommand('dsh.disconnect', () => disconnectPanelCmd()),
     vscode.commands.registerCommand('dsh.copyUrl', () => copyUrl()),
     vscode.commands.registerCommand('dsh.showLogs', () => output?.show()),
     vscode.commands.registerCommand('dsh.copyLogs', () => copyLogs()),

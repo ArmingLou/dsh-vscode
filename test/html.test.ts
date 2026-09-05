@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { initI18n, t } from '../src/i18n';
-import { loadingPage, errorPage, disconnectedPage, stoppedPage, readyPage, remoteDisabledPage, type PageCtx } from '../src/panel/html';
+import { loadingPage, errorPage, disconnectedPage, detachedPage, stoppedPage, readyPage, remoteDisabledPage, type PageCtx } from '../src/panel/html';
 
 function ctx(): PageCtx {
   return { nonce: 'abc123', cspSource: 'vscode-webview:', frameHosts: ['http://127.0.0.1:3080'] };
@@ -28,6 +28,19 @@ test('disconnectedPage 与 stoppedPage 都包含重连按钮', () => {
   const s = stoppedPage(t, ctx());
   assert.ok(d.includes('data-action="reconnect"'));
   assert.ok(s.includes('data-action="reconnect"'));
+});
+
+test('detachedPage（手动断开占位页）：双语文案 + 重新连接/查看日志按钮，不含 iframe', () => {
+  initI18n('en');
+  const en = detachedPage(t, ctx());
+  assert.ok(en.includes(t('panel.detachedTitle')), '英文断开文案');
+  assert.ok(en.includes('data-action="reconnect"'), '重新连接按钮走 reconnect 上行通路');
+  assert.ok(en.includes('data-action="showLogs"'), '查看日志按钮');
+  assert.ok(!en.includes('dsh-frame'), '断开页不得嵌入 iframe');
+  initI18n('zh-cn');
+  const zh = detachedPage(t, ctx());
+  assert.ok(zh.includes(t('panel.detachedTitle')), '中文断开文案');
+  assert.ok(zh.includes('data-action="reconnect"'));
 });
 
 test('readyPage 包含目标地址 iframe 且无 sandbox 属性', () => {

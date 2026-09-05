@@ -687,7 +687,9 @@ test('externalToken 空串（设置默认值，未配置）→ 归一化为无�
     },
   });
   const s = await h.manager.ensureRunning();
-  assert.equal(probeTokens[0], undefined, '空串 externalToken 必须归一化为 undefined（无令牌探测）');
+  // harness 的 probeService 会把未带令牌的探测记录为 null（token ?? null），
+  // 故此处断言 null 而非 undefined（若归一化被破坏、空串泄漏为 ''，仍会失败，回归检测力不变）
+  assert.equal(probeTokens[0], null, '空串 externalToken 必须归一化为无令牌探测（不得泄漏为空串）');
   assert.equal(asked, 1, '空串不得破坏 dsh-unauthenticated 识别：应弹一次三选一');
   assert.equal(s.state, 'ready');
   assert.equal(s.owned, true, '选择使用其他端口后才启动自有实例');
@@ -1139,6 +1141,95 @@ test('崩溃自愈宽限耗尽 → 三选一「输入令牌重试」：令牌有
   assert.equal(h.manager.getTarget().port, 3080, '不应换端口');
   assert.equal(h.spawnCount, 1, '崩溃后不再 spawn');
   assert.deepEqual(h.persistTokenCalls, ['WINNER-TOKEN'], '验证有效后应回调持久化 dsh.externalToken');
+  h.manager.dispose();
+});
+
+// —— 「断开面板连接」（disconnectEmbed / ensureEmbed）——
+// 用户断开 = 只停窗口嵌入代理 + 清 embedUrl；后端进程/子进程所有权/退出钩子/健康探测语义不变。
+
+test('disconnectEmbed()：只停代理并清 embedUrl，服务保持 ready、子进程不被杀、owned 不变', async () => {
+  const h = makeHarness(undefined, {
+    probeService: async (_host, _port, _timeout, t) => (t === 'TOK-DETACH' ? 'dsh' : 'down'),
+  });
+  const p = h.manager.ensureRunning();
+  await new Promise((r) => setTimeout(r, 5));
+  h.child?.emitStdout('dsh web: http://127.0.0.1:3080/?token=TOK-DETACH\n');
+  const s = await p;
+  assert.equal(s.state, 'ready');
+  assert.equal(s.owned, true);
+  assert.ok(s.embedUrl, '就绪后应有嵌入代理地址');
+  assert.equal(h.proxyStarts, 1);
+
+  await h.manager.disconnectEmbed();
+  const after = h.manager.getSnapshot();
+  assert.equal(after.state, 'ready', '断开后服务状态保持 ready（后端未被停）');
+  assert.equal(after.owned, true, '子进程所有权不变');
+  assert.equal(after.url, 'http://127.0.0.1:3080/?token=TOK-DETACH', '后端真实地址不变');
+  assert.equal(after.embedUrl, null, '嵌入地址被清空（面板据此显示断开占位页）');
+  assert.equal(h.proxyStops, 1, '嵌入代理被停止');
+  assert.equal(h.child?.killed.length ?? 0, 0, '绝不能 kill 子进程');
+  await h.manager.stop(); // 收尾停掉假子进程（验证 stop 仍正常，语义不被断开影响）
+  h.manager.dispose();
+});
+
+test('disconnectEmbed() 幂等：代理已停时再次调用不重复 stop、不改变快照', async () => {
+  const h = makeHarness(undefined, {
+    probeService: async (_host, _port, _timeout, t) => (t === 'TOK-IDEM' ? 'dsh' : 'down'),
+  });
+  const p = h.manager.ensureRunning();
+  await new Promise((r) => setTimeout(r, 5));
+  h.child?.emitStdout('dsh web: http://127.0.0.1:3080/?token=TOK-IDEM\n');
+  await p;
+  await h.manager.disconnectEmbed();
+  await h.manager.disconnectEmbed();
+  assert.equal(h.proxyStops, 1, '第二次断开应为空操作');
+  assert.equal(h.manager.getSnapshot().state, 'ready');
+  await h.manager.stop();
+  h.manager.dispose();
+});
+
+test('重连闭环：disconnectEmbed() 后 ensureEmbed() 以原令牌重建代理并恢复 embedUrl（状态流转 ready→停代理→重建）', async () => {
+  const h = makeHarness(undefined, {
+    probeService: async (_host, _port, _timeout, t) => (t === 'TOK-RE' ? 'dsh' : 'down'),
+  });
+  const p = h.manager.ensureRunning();
+  await new Promise((r) => setTimeout(r, 5));
+  h.child?.emitStdout('dsh web: http://127.0.0.1:3080/?token=TOK-RE\n');
+  const s = await p;
+  assert.equal(s.state, 'ready');
+  assert.equal(h.proxyStarts, 1);
+  await h.manager.disconnectEmbed();
+  assert.equal(h.manager.getSnapshot().embedUrl, null);
+
+  await h.manager.ensureEmbed();
+  const s2 = h.manager.getSnapshot();
+  assert.equal(s2.state, 'ready');
+  assert.ok(s2.embedUrl?.startsWith('http://127.0.0.1:'), 'embedUrl 应恢复');
+  assert.equal(h.proxyStarts, 2, '应重建代理');
+  assert.equal(h.proxyStops, 1, '旧代理不重复停');
+  assert.equal(h.proxyCreations[1].token, 'TOK-RE', '重建沿用原令牌（不重启后端）');
+  assert.equal(h.child?.killed.length ?? 0, 0, '重连不 kill 子进程');
+
+  await h.manager.ensureEmbed();
+  assert.equal(h.proxyStarts, 2, '代理已在时 ensureEmbed 幂等（直接复用）');
+  await h.manager.stop();
+  h.manager.dispose();
+});
+
+test('ensureEmbed()：旧版 dsh（无令牌/无代理）断开与重连均为空操作，embedUrl 保持 null', async () => {
+  const h = makeHarness();
+  h.probeQueue = ['down', 'dsh']; // 无令牌 stdout → 旧版直连语义
+  const s = await h.manager.ensureRunning();
+  assert.equal(s.state, 'ready');
+  assert.equal(s.embedUrl, null);
+  assert.equal(h.proxyStarts, 0);
+  await h.manager.disconnectEmbed();
+  await h.manager.ensureEmbed();
+  assert.equal(h.proxyStops, 0, '无代理可停');
+  assert.equal(h.proxyStarts, 0, '无令牌不建代理');
+  assert.equal(h.manager.getSnapshot().embedUrl, null);
+  assert.equal(h.manager.getSnapshot().state, 'ready');
+  await h.manager.stop();
   h.manager.dispose();
 });
 

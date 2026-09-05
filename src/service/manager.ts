@@ -294,6 +294,37 @@ export class ServiceManager {
     }
   }
 
+  /**
+   * 「断开面板」：仅停止本窗口的面板嵌入代理并清空快照 embedUrl。
+   * 这是用户断开嵌入连接的资源侧动作，**绝不**触碰：后端进程（无论 owned 与否）、
+   * 子进程所有权（child/owned）、stopOnExit 与父进程退出钩子、健康探测——
+   * 服务状态保持 ready（后端仍在运行，其他窗口/面板不受影响）。
+   * 幂等：代理未在运行时为空操作；已就绪的 url/owned 快照字段保持不变。
+   */
+  async disconnectEmbed(): Promise<void> {
+    await this.stopProxy();
+    if (this.snapshot.embedUrl !== null) {
+      // 仅清嵌入地址，状态仍为 ready（与"服务停止"的 idle 语义区分）
+      this.set({ embedUrl: null });
+    }
+  }
+
+  /**
+   * 「重新连接面板」：确保面板嵌入代理可用（幂等）。
+   * - 代理已在且令牌/目标未变 → 直接复用（空操作）；
+   * - 代理被断开/缺失但仍有令牌或会话 Cookie → 重建并重新交换会话；
+   * - 无令牌且无 Cookie（旧版 dsh 直连模式）→ 无需代理，空操作；
+   * - 服务未就绪 → 空操作（代理由启动流程在就绪时建立，此处交给 ensureRunning 语义）。
+   * 服务就绪时同步刷新快照 url/embedUrl 并广播（面板据此恢复 iframe）。
+   * 不触碰子进程所有权、退出钩子与健康探测。
+   */
+  async ensureEmbed(): Promise<void> {
+    await this.ensureProxy();
+    if (this.snapshot.state === 'ready') {
+      this.set({ url: this.url(), embedUrl: this.proxy?.url ?? null });
+    }
+  }
+
   /** 停掉自启子进程并回到 idle */
   private async stopOwned(): Promise<void> {
     this.clearHealthWatch();
