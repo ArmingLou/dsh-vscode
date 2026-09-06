@@ -12,6 +12,8 @@ import {
   mergePath,
   binJsFromShim,
   windowsDshInvocation,
+  isProcessAlive,
+  stopExternalProcess,
   type ChildProcessLike,
   type SpawnFn,
 } from '../src/service/process';
@@ -603,5 +605,19 @@ test('startDsh 非 Windows：findInPathPosix 未命中但 scanCommonDshLocations
   }, execImpl, readdirImpl);
   runner.startDsh({ host: '127.0.0.1', port: 3080, extraArgs: [] });
   assert.equal(calls[0].cmd, `${nvmPath}/dsh`);
+});
+
+test('isProcessAlive：0 号信号存活探测（本进程存活；不存在的 pid / 非法 pid 判死）', () => {
+  assert.equal(isProcessAlive(process.pid), true, '本进程必然存活');
+  // 远超系统 pid 上限的 pid：进程必然不存在（ESRCH → false）
+  assert.equal(isProcessAlive(2147483647), false);
+  assert.equal(isProcessAlive(0), false, '非法 pid（≤0）直接判死');
+  assert.equal(isProcessAlive(-5), false);
+  assert.equal(isProcessAlive(NaN), false);
+});
+
+test('stopExternalProcess：目标进程已不存在时幂等返回（不抛错，graceMs=0 不实际等待）', async () => {
+  // SIGTERM 抛 ESRCH → 视为已退出成功返回；grace=0 跳过宽限等待，测试不耗时
+  await stopExternalProcess(2147483647, 0);
 });
 

@@ -34,18 +34,15 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
   /** 桥接快捷键去抖：同一组合键上次转发时间（防一次按键双发消息导致 toggle 命令来回横跳） */
   private lastShortcutAt = new Map<string, number>();
   /** 用户手动断开标志（粘性）：置位后任何重渲染（服务状态变化/配置变更/refresh）都只渲染断开占位页，
-   *  绝不自动恢复 iframe；只有用户点占位页「重新连接」才清除。双面板各自独立持有。 */
+   *  绝不自动恢复 iframe；只有用户点占位页「重新连接」才清除。 */
   private detached = false;
-  /** 面板 view 当前是否可见（标题栏「断开」命令路由用：view/title 菜单命令不带视图上下文） */
+  /** 面板 view 当前是否可见（「断开」命令守卫用：view/title 菜单命令触发时不带视图上下文，
+   *  面板未在显示时命令不操作，避免隐藏中被误断） */
   private viewVisible = false;
-  /** 最近一次「变为可见」的时刻（毫秒；两个面板同时可见时路由给最近激活的那个） */
-  private lastVisibleAt = 0;
-  /** 本面板当前是否在嵌入「窗口共享嵌入代理」页面（另一面板断开时据此决定共享代理可否停掉） */
-  private embedding = false;
 
   /**
    * @param manager 服务管理器（面板与服务状态联动）
-   * @param onFirstOpen 面板首次打开时调用一次的回调（用于引导提示，由入口注入）
+   * @param onFirstOpen 面板首次打开时调用一次的回调（由入口注入）
    * @param onBridgeAck 桥接握手回执回调（Task 7 评估桥接状态时注入；可选）
    * @param workspaceRoot 工作区根目录注入函数（openFile 相对路径解析的兜底基准；可选，默认无根）
    * @param bridgeEnabled 桥接是否启用的 getter（Task 7 由 dsh.bridge.enabled 配置驱动；默认启用，
@@ -79,24 +76,21 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
     // 由 Task 10 注册视图时通过第三参数传入（隐藏面板时保留 iframe 会话）。
     view.webview.options = { enableScripts: true };
     view.webview.onDidReceiveMessage((msg: PanelMessage) => this.onMessage(msg));
-    // 标题栏「断开」命令路由：view/title 菜单命令触发时不带视图/provider 参数，
-    // 由各 provider 自行跟踪可见性与最近激活时刻（resolve 时若已可见则视为一次激活）。
+    // 「断开」命令守卫：view/title 菜单命令触发时不带视图/provider 参数，由本面板自行跟踪可见性
+    //（命令面板触发断开而面板隐藏时不操作，避免误断）
     this.viewVisible = view.visible;
-    if (view.visible) this.lastVisibleAt = Date.now();
     view.onDidChangeVisibility(() => {
       this.viewVisible = view.visible;
-      if (this.viewVisible) this.lastVisibleAt = Date.now();
     });
     // 视图被用户移除（右键取消勾选等）：清引用与可见性，避免向已销毁的 view 写入
     view.onDidDispose(() => {
       if (this.view !== view) return; // 已被更新的 resolve 接管，旧视图的销毁不影响现状
       this.view = null;
       this.viewVisible = false;
-      this.embedding = false;
     });
     if (!this.openedOnce) {
       this.openedOnce = true;
-      this.onFirstOpen?.(); // 首次打开：触发一次性引导（如"移到右侧栏"提示）
+      this.onFirstOpen?.(); // 首次打开：触发一次性回调（握手超时计时等）
     }
     this.render();
     // 远程窗口且未启用远程支持：仅显示占位页，绝不在此窗口启动远端 dsh 服务。
@@ -118,19 +112,9 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
     return this.pendingExternalUrl;
   }
 
-  /** 面板 view 当前是否可见（「断开」命令路由用） */
+  /** 面板 view 当前是否可见（「断开」命令守卫用） */
   isViewVisible(): boolean {
     return this.viewVisible;
-  }
-
-  /** 最近一次「变为可见」的时刻（毫秒；两个面板同时可见时路由给最近激活者） */
-  lastVisibleAtMs(): number {
-    return this.lastVisibleAt;
-  }
-
-  /** 本面板当前是否在嵌入「窗口共享嵌入代理」页面（决定另一面板断开时共享代理可否停掉） */
-  isUsingEmbedProxy(): boolean {
-    return this.embedding;
   }
 
   /** 面板是否处于用户手动断开状态（粘性占位页中） */
@@ -140,9 +124,9 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
 
   /**
    * 执行手动断开：置粘性断开标志并立即重渲染断开占位页（iframe 随之销毁）。
-   * 只作用于本面板实例；后端进程/子进程所有权/健康探测均不受影响（停代理由入口侧
-   * 视另一面板占用情况调用 manager.disconnectEmbed() 完成）。已断开或「远程未启用」
-   * 窗口（无任何可断内容）返回 false（无操作）。
+   * 只作用于本面板实例；后端进程/子进程所有权/健康探测均不受影响（停掉窗口共享
+   * 嵌入代理由入口侧在断开后调用 manager.disconnectEmbed() 完成）。已断开或
+   * 「远程未启用」窗口（无任何可断内容）返回 false（无操作）。
    */
   disconnectPanel(): boolean {
     if (this.detached || this.remoteWindowDisabled()) return false;
@@ -366,7 +350,6 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
     const ctx: PageCtx = { nonce, cspSource: v.webview.cspSource, frameHosts: [`http://${host}:${port}`] };
     const s = this.manager.getSnapshot();
     let html: string;
-    this.embedding = false; // 默认不占用窗口嵌入代理；仅下方 ready + embedUrl 的 iframe 分支置 true
     if (this.remoteWindowDisabled()) {
       // 远程窗口且未启用：任何状态都只展示引导占位页，不触碰远端服务。
       html = remoteDisabledPage(t, ctx);
@@ -382,7 +365,6 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
             const hasProxy = s.embedUrl !== null;
             const hasToken = s.url !== null && /\?token=/.test(s.url);
             if (hasProxy) {
-              this.embedding = true; // iframe 经窗口嵌入代理访问（远端隧道同样落在该代理上）
               const displayUrl = this.pendingExternalUrl ?? s.embedUrl!;
               const frameOrigin =
                 this.pendingExternalUrl !== null

@@ -24,7 +24,7 @@ Use the [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness
 
 ## ✨ Features
 
-- 🖱️ **One-click open**: a DSH whale icon in both the left Activity Bar and the right Secondary Side Bar — click either to embed the DSH page in that sidebar;
+- 🖱️ **One-click open**: a DSH whale icon in the Activity Bar — click it to embed the DSH page in the sidebar;
 - 🚀 **Automatic service management**: auto-detects the port — reuses an already-running `dsh web`, otherwise starts one silently in the background and loads it once ready;
 - 🔄 **Live status sync**: four-state status bar indicator (running green / starting yellow / failed red / stopped gray); click it to toggle the panel;
 - 🛟 **Error fallbacks**: port occupied, `dsh` missing, start timeout, crash/disconnect — each has a dedicated page with one-click reconnect; if the configured port is taken by another program, the extension temporarily falls back to the first free port for that session, never a blank screen;
@@ -32,7 +32,6 @@ Use the [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/deepseek-harness
 - 📋 **Copy/Paste/Context menu, works out of the box**: fixes the macOS webview quirk where `Cmd+C` / `Cmd+V` and the right-click menu silently fail inside the embedded DSH page — the panel ships its own standard edit shortcut simulation and a context menu (Copy/Paste/Cut/Select All/Undo/Redo), while plain-browser usage and every existing feature stay untouched;
 - 🧹 **Clean exit**: closing the window stops the auto-started service, no zombie processes; manually started services are never touched;
 - 🔒 **Security boundary**: loopback addresses only (127.0.0.1 / localhost / [::1]); no credentials are read.
-- 🔝 **Editor title-bar icon**: a DSH whale button sits in the top-right of the editor tab bar (like Claude Code) — one click opens the right-side DSH panel;
 - 🌐 **SSH Remote (opt-in)**: when connected to a remote host, run dsh on the remote and open the panel through a VS Code tunnel (`dsh.remote.enabled`, off by default);
 - 🖼️ **Free image upload**: send images even when the active model has no vision — the image is cached in the workspace and dispatched as a file-path reference, letting the model inspect it with an image tool (files are cleaned up when the panel closes; opt-out via `dsh.image.fallback`);
 - 🪟 **No surprise browser window**: `dsh web` is started with `--no-open` by default (restore with `dsh.openInBrowser`).
@@ -68,9 +67,8 @@ npm run package        # produces dsh-vscode.vsix, then install as in Option 2
 
 ## 🚀 Usage
 
-1. After installation, a DSH whale icon appears in both the left Activity Bar and the right Secondary Side Bar;
-2. Click either icon: the extension auto-starts (or reuses) `dsh web` and embeds the DSH page in that sidebar;
-   - Click the **right** icon → the panel opens on the right, leaving the file explorer untouched;
+1. After installation, a DSH whale icon appears in the Activity Bar;
+2. Click it: the extension auto-starts (or reuses) `dsh web` and embeds the DSH page in the sidebar;
    - If `dsh.port` is occupied by another program, the extension automatically switches to the first free port for this session only (your setting is unchanged; a notification tells you the temporary port);
 3. Panel title bar buttons: `Open in Browser` `Restart Service` `Stop Service` `Copy URL` `Show Logs`;
 4. The bottom status bar shows the service status; click it to toggle the panel.
@@ -79,8 +77,7 @@ npm run package        # produces dsh-vscode.vsix, then install as in Option 2
 
 | Command | Description |
 |---|---|
-| `DSH: Open Panel` | Open the left panel |
-| `DSH: Open in Secondary Side Bar` | Open the right panel |
+| `DSH: Open Panel` | Open the DSH panel |
 | `DSH: Open in Browser` | Open the DSH page in the system browser |
 | `DSH: Restart Service` | Restart the extension-managed service |
 | `DSH: Stop Service` | Stop the extension-started service |
@@ -128,7 +125,6 @@ The bridge only works inside the panel. If it is inactive (e.g. you open the DSH
 
 ## 🆕 What's new in v0.3.0
 
-- **Top-right DSH icon**: the whale button in the editor title bar opens the right-side panel (command `DSH: Open Right Panel`). The icon is the **original whale on a white background** (`whale-icon-bg.svg`), clearly visible in both dark and light themes; the activity bar and secondary sidebar keep the original whale icon.
 - **SSH Remote**: with `dsh.remote.enabled` on, the extension runs on the remote host, starts/reuses `dsh` there, and shows the panel through a VS Code tunnel — your local VS Code window stays clean and the remote service stays on `127.0.0.1`.
 - **Image upload works seamlessly even for non-vision models**: attach images freely in the dialog. When the active model has no image input, the image is saved into your workspace and the message is sent back out as the original text plus a `image: <absolute-path>` reference — no error, no popup; the model inspects the file with its own image tool and answers normally. Vision-capable models keep the native image upload untouched.
 - **No browser auto-open**: `dsh web` is started with `--no-open`, so the plugin no longer pops a browser window; turn that back on with `dsh.openInBrowser`.
@@ -186,7 +182,6 @@ src/
 ## 🧭 Known limitations
 
 - The colored icon on the "Get Started with DSH" walkthrough card comes from Marketplace gallery data and only appears after the extension is published (the card itself works regardless);
-- VS Code platform rule: the left icon opens the left panel, the right icon opens the right panel — the left icon cannot open the right panel.
 - SSH Remote: the extension must also be installed on the remote (VS Code prompts for it); the tunnel appears in the Ports view and can be closed by the user (the plugin re-creates it on the next ready).
 - Image fallback caches the image files under the **workspace root** — **an open workspace folder is required** (with no folder open, images cannot be cached and no fallback happens). **Temp images are deleted as soon as the model has seen them**: the previous batch is removed the moment the next message is sent in the same session (the model already read it and answered); if no further message comes, a ~2-minute TTL auto-deletes them; conversation create/switch/delete, panel close, page unload and extension deactivate also clean up (best-effort). On activation the extension additionally sweeps any orphaned `dsh-imgcache-*` files left by an earlier session (VS Code restarts lose the in-memory registry), and you can always run the **`DSH: Clean Up Image Cache`** command to purge them manually.
 - **Verifying the bridge was updated**: in the DSH panel DevTools console you should see `[dsh-vscode-bridge] handshake ok, **v0.3.2**, imageFallback=true` and, after sending an image, `image fallback: 已把图片改为地址随消息重发（N 张）: …`. If it still shows an older version, the bridge was not reinstalled — restart the DSH service (the new vsix ships bridge `0.3.2`; the installer force-reinstalls on version mismatch).

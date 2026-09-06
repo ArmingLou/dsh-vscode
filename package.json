@@ -2,7 +2,7 @@
   "name": "dsh-vscode-panel",
   "displayName": "DSH",
   "description": "在 VS Code 侧边栏中使用 DeepSeek Harness（DSH）网页界面",
-  "version": "0.3.10",
+  "version": "0.3.12",
   "publisher": "Fengze233",
   "icon": "assets/icon.png",
   "license": "MIT",
@@ -20,9 +20,7 @@
   "uninstall": "node ./out/uninstall.js",
   "activationEvents": [
     "onView:dsh.panel",
-    "onView:dsh.panel.secondary",
     "onCommand:dsh.openPanel",
-    "onCommand:dsh.openSecondary",
     "onCommand:dsh.openExternal",
     "onCommand:dsh.restart",
     "onCommand:dsh.disconnect",
@@ -42,13 +40,6 @@
           "title": "%dsh.container.title%",
           "icon": "assets/whale-icon.svg"
         }
-      ],
-      "secondarySidebar": [
-        {
-          "id": "dsh-secondary",
-          "title": "%dsh.container.title%",
-          "icon": "assets/whale-icon.svg"
-        }
       ]
     },
     "views": {
@@ -56,13 +47,6 @@
         {
           "id": "dsh.panel",
           "name": "%dsh.view.panel.name%",
-          "type": "webview"
-        }
-      ],
-      "dsh-secondary": [
-        {
-          "id": "dsh.panel.secondary",
-          "name": "%dsh.view.panelSecondary.name%",
           "type": "webview"
         }
       ]
@@ -92,11 +76,6 @@
         "command": "dsh.openPanel",
         "title": "%dsh.cmd.openPanel.title%",
         "icon": "$(panel)"
-      },
-      {
-        "command": "dsh.openSecondary",
-        "title": "%dsh.cmd.openSecondary.title%",
-        "icon": "$(layout-sidebar-right)"
       },
       {
         "command": "dsh.openExternal",
@@ -145,50 +124,38 @@
         "command": "dsh.cleanupImageCache",
         "title": "%dsh.cmd.cleanupImageCache.title%",
         "category": "DSH"
-      },
-      {
-        "command": "dsh.openFromTitle",
-        "title": "%dsh.cmd.openFromTitle.title%",
-        "icon": "assets/whale-icon-bg.svg"
       }
     ],
     "menus": {
-      "editor/title": [
-        {
-          "command": "dsh.openFromTitle",
-          "group": "navigation@0",
-          "when": "editorIsOpen"
-        }
-      ],
       "view/title": [
         {
           "command": "dsh.openExternal",
-          "when": "view == dsh.panel || view == dsh.panel.secondary",
+          "when": "view == dsh.panel",
           "group": "navigation@1"
         },
         {
           "command": "dsh.restart",
-          "when": "view == dsh.panel || view == dsh.panel.secondary",
+          "when": "view == dsh.panel",
           "group": "navigation@2"
         },
         {
           "command": "dsh.disconnect",
-          "when": "view == dsh.panel || view == dsh.panel.secondary",
+          "when": "view == dsh.panel",
           "group": "navigation@3"
         },
         {
           "command": "dsh.stop",
-          "when": "view == dsh.panel || view == dsh.panel.secondary",
+          "when": "view == dsh.panel",
           "group": "navigation@4"
         },
         {
           "command": "dsh.copyUrl",
-          "when": "view == dsh.panel || view == dsh.panel.secondary",
+          "when": "view == dsh.panel",
           "group": "navigation@5"
         },
         {
           "command": "dsh.showLogs",
-          "when": "view == dsh.panel || view == dsh.panel.secondary",
+          "when": "view == dsh.panel",
           "group": "navigation@6"
         }
       ]

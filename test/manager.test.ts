@@ -7,6 +7,9 @@ import {
   extractAuthToken,
   type ManagerDeps,
   type PortConflictDecision,
+  type SharedStopAskInfo,
+  type UsersRecord,
+  type UsersStore,
 } from '../src/service/manager';
 import type { ProbeResult } from '../src/service/detect';
 import type { ChildProcessLike, ProcessRunner } from '../src/service/process';
@@ -59,6 +62,10 @@ interface Harness {
   proxyCreations: { target: { host: string; port: number }; token: string; initialCookie?: string }[]; // 每次创建的 target/token/cookie
   cookieJar: Map<string, string>; // 内存会话 Cookie 存储（键 host:port；模拟 globalState）
   persistTokenCalls: string[];    // onPersistExternalToken 收到的令牌记录（'token' 决策验证有效后）
+  ownerJar: Map<string, number>;  // 内存跨窗口 owner pid 记录（键 host:port；模拟 globalState 的 dsh.ownerPid@…）
+  externalKillCalls: number[];    // 强停记录：每次 externalProcess.stop(pid) 收到的 pid
+  externalAlive: Map<number, boolean>; // externalProcess.isAlive 的存活覆写（缺省 true=存活）
+  usersJar: Map<string, number[]>; // 内存使用者注册表（键 host:port → 使用中窗口 pid 列表；模拟 globalState 的 dsh.users@…）
 }
 
 function makeHarness(opts?: Partial<Parameters<ServiceManager['reconfigure']>[0]>, depsOpts?: Partial<ManagerDeps>): Harness {
@@ -77,6 +84,10 @@ function makeHarness(opts?: Partial<Parameters<ServiceManager['reconfigure']>[0]
     proxyCreations: [],
     cookieJar: new Map(),
     persistTokenCalls: [],
+    ownerJar: new Map(),
+    externalKillCalls: [],
+    externalAlive: new Map(),
+    usersJar: new Map(),
   };
   const probeService = async (_host: string, _port: number, _timeoutMs?: number, token?: string, cookie?: string): Promise<ProbeResult> => {
     h.probeCount += 1;
@@ -132,8 +143,34 @@ function makeHarness(opts?: Partial<Parameters<ServiceManager['reconfigure']>[0]
         save: (host, port, cookie) => { h.cookieJar.set(`${host}:${port}`, cookie); },
         clear: (host, port) => { h.cookieJar.delete(`${host}:${port}`); },
       },
+      // 内存跨窗口 owner pid 记录（模拟 globalState 的 dsh.ownerPid@host:port）
+      ownerStore: {
+        load: (host, port) => h.ownerJar.get(`${host}:${port}`) ?? null,
+        save: (host, port, pid) => { h.ownerJar.set(`${host}:${port}`, pid); },
+        clear: (host, port) => { h.ownerJar.delete(`${host}:${port}`); },
+      },
+      // 假外部进程控制：记录强停调用；isAlive 默认按 externalAlive 覆写（缺省判定存活）
+      externalProcess: {
+        isAlive: (pid) => h.externalAlive.get(pid) ?? true,
+        stop: async (pid) => { h.externalKillCalls.push(pid); },
+      },
+      // 内存使用者注册表（模拟 globalState 的 dsh.users@host:port；键值直接存 pid 列表）
+      usersStore: {
+        load: (host, port) => {
+          const list = h.usersJar.get(`${host}:${port}`);
+          return list === undefined ? null : { extPids: [...list] };
+        },
+        save: (host, port, record) => { h.usersJar.set(`${host}:${port}`, [...record.extPids]); },
+        clear: (host, port) => { h.usersJar.delete(`${host}:${port}`); },
+      },
       // 记录 'token' 决策验证有效后的持久化回调（默认无副作用；需要决策的用例在 depsOpts 注入 askPortConflict）
       onPersistExternalToken: (token) => { h.persistTokenCalls.push(token); },
+      // 持久日志镜像默认静音：manager 的 persistLog 会把退出路径关键分支同步落
+      // consoleLog（生产为 console.log → exthost 日志）；测试默认丢弃避免污染输出，
+      // 需要断言日志的用例覆写收集。
+      consoleLog: () => {},
+      // 关闭退出复查窗口（≤0=跳过）：既有用例保持 v0.3.11 前时序；复查逻辑由专测覆盖
+      exitRecheckDelayMs: 0,
       ...depsOpts,
     },
   );
@@ -1231,6 +1268,609 @@ test('ensureEmbed()：旧版 dsh（无令牌/无代理）断开与重连均为�
   assert.equal(h.manager.getSnapshot().state, 'ready');
   await h.manager.stop();
   h.manager.dispose();
+});
+
+// —— 共享服务跨窗口「强制停止」（owner pid 记录 + 复用窗口 stopSharedService）——
+
+// —— owner 记录生命周期（owner 窗口侧写入/清理；模拟 globalState 的 ownerJar）——
+
+test('自启子进程就绪：跨窗口 owner 记录写入 pid；stop() 停掉进程后记录清除', async () => {
+  const h = makeHarness();
+  h.probeQueue = ['down', 'dsh'];
+  await h.manager.ensureRunning();
+  assert.equal(h.manager.getSnapshot().owned, true);
+  assert.equal(h.ownerJar.get('127.0.0.1:3080'), 1234, '就绪时应写入自启子进程 pid（供复用窗口识别归属）');
+  await h.manager.stop();
+  assert.equal(h.manager.getSnapshot().state, 'idle');
+  assert.equal(h.ownerJar.has('127.0.0.1:3080'), false, '停掉自启进程后应清除 owner 记录');
+  h.manager.dispose();
+});
+
+test('restart()：先停旧进程清记录，新进程就绪后重新写入 owner pid', async () => {
+  const h = makeHarness();
+  h.probeQueue = ['down', 'dsh'];
+  await h.manager.ensureRunning();
+  assert.equal(h.ownerJar.get('127.0.0.1:3080'), 1234);
+  h.probeQueue = ['down', 'dsh'];
+  const s = await h.manager.restart();
+  assert.equal(s.state, 'ready');
+  assert.equal(s.owned, true);
+  assert.equal(h.ownerJar.get('127.0.0.1:3080'), 1234, '重启就绪后记录应重新发布');
+  h.manager.dispose();
+});
+
+test('自启子进程被外部终止（意外退出）：回 idle、停代理、清 owner 记录（owner 窗口侧自动感知）', async () => {
+  const h = makeHarness(undefined, {
+    probeService: async (_host, _port, _timeout, t) => (t === 'TOK-A' ? 'dsh' : 'down'),
+  });
+  const p = h.manager.ensureRunning();
+  await new Promise((r) => setTimeout(r, 5));
+  h.child?.emitStdout('dsh web: http://127.0.0.1:3080/?token=TOK-A\n');
+  const s = await p;
+  assert.equal(s.state, 'ready');
+  assert.equal(s.owned, true);
+  assert.equal(h.ownerJar.get('127.0.0.1:3080'), 1234, '就绪应已写 owner 记录');
+  assert.equal(h.proxyStarts, 1);
+  h.child?.emitExit(1); // 模拟另一窗口强停 kill 了该进程
+  assert.equal(h.manager.getSnapshot().state, 'idle');
+  assert.equal(h.proxyStops, 1, '代理随服务停止');
+  await new Promise((r) => setTimeout(r, 5)); // 等 void 的异步记录清理完成
+  assert.equal(h.ownerJar.has('127.0.0.1:3080'), false, '子进程意外退出应清除 owner 记录');
+  h.manager.dispose();
+});
+
+test('启动等待期子进程崩溃：不清除 pid 不同的他窗口 owner 记录（clear-if-mine 守卫）', async () => {
+  const h = makeHarness();
+  h.ownerJar.set('127.0.0.1:3080', 5555); // 另一窗口的 dsh 进程记录（本窗口假子进程 pid=1234）
+  h.probeQueue = ['down', 'down', 'foreign']; // 崩溃后自愈失败 → err.startCrashed
+  const p = h.manager.ensureRunning();
+  await new Promise((r) => setTimeout(r, 1));
+  h.child?.emitExit(1);
+  const s = await p;
+  assert.equal(s.state, 'failed');
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(h.ownerJar.get('127.0.0.1:3080'), 5555, 'pid 不匹配时不得误删他窗口的记录（多窗口冷启动竞态）');
+  h.manager.dispose();
+});
+
+// —— 复用窗口 stopSharedService（对话框经 deps.askStopReused 注入，决策分支全覆盖）——
+
+test('复用窗口 Stop：无 owner 记录 → 不弹窗、仅脱钩（no-record，维持原行为）', async () => {
+  const askCalls: SharedStopAskInfo[] = [];
+  const h = makeHarness(undefined, {
+    askStopReused: async (info) => { askCalls.push(info); return 'force-stop'; },
+  });
+  h.probeQueue = ['dsh']; // 复用就绪（owned=false）
+  await h.manager.ensureRunning();
+  assert.equal(h.manager.getSnapshot().state, 'ready');
+  assert.equal(h.manager.getSnapshot().owned, false);
+  const outcome = await h.manager.stopSharedService();
+  assert.equal(outcome, 'no-record');
+  assert.equal(askCalls.length, 0, '无记录不弹对话框');
+  assert.equal(h.manager.getSnapshot().state, 'idle', '照旧脱钩');
+  assert.equal(h.externalKillCalls.length, 0, '不 kill 任何进程');
+  h.manager.dispose();
+});
+
+test('复用窗口 Stop：owner 记录 pid 已不存在 → 不弹窗、清失效记录、仅脱钩（gone）', async () => {
+  const askCalls: SharedStopAskInfo[] = [];
+  const h = makeHarness(undefined, {
+    askStopReused: async (info) => { askCalls.push(info); return 'force-stop'; },
+  });
+  h.ownerJar.set('127.0.0.1:3080', 4242);
+  h.externalAlive.set(4242, false); // 记录的进程已死（owner 窗口崩溃残留）
+  h.probeQueue = ['dsh'];
+  await h.manager.ensureRunning();
+  const outcome = await h.manager.stopSharedService();
+  assert.equal(outcome, 'gone');
+  assert.equal(askCalls.length, 0, 'pid 已死不弹强停对话框');
+  assert.equal(h.manager.getSnapshot().state, 'idle');
+  assert.equal(h.ownerJar.has('127.0.0.1:3080'), false, '失效记录应顺带清除');
+  assert.equal(h.externalKillCalls.length, 0);
+  h.manager.dispose();
+});
+
+test('复用窗口 Stop：对话框「取消」→ 保持连接，不动记录/代理/进程', async () => {
+  const infos: SharedStopAskInfo[] = [];
+  const h = makeHarness(undefined, {
+    askStopReused: async (info) => { infos.push(info); return 'cancel'; },
+  });
+  h.ownerJar.set('127.0.0.1:3080', 9999); // 他窗口的存活服务记录
+  h.probeQueue = ['dsh'];
+  await h.manager.ensureRunning();
+  const outcome = await h.manager.stopSharedService();
+  assert.equal(outcome, 'cancel');
+  assert.equal(infos.length, 1);
+  assert.equal(infos[0].authority, '127.0.0.1:3080');
+  assert.equal(infos[0].pid, 9999);
+  assert.equal(h.manager.getSnapshot().state, 'ready', '取消后保持连接');
+  assert.equal(h.ownerJar.get('127.0.0.1:3080'), 9999, '取消不清 owner 记录');
+  assert.equal(h.externalKillCalls.length, 0, '取消不 kill');
+  h.manager.dispose();
+});
+
+test('复用窗口 Stop：对话框「仅断开本窗口连接」→ 脱钩，但服务与记录保留（不 kill）', async () => {
+  const h = makeHarness(undefined, {
+    askStopReused: async () => 'detach',
+  });
+  h.ownerJar.set('127.0.0.1:3080', 9999);
+  h.probeQueue = ['dsh'];
+  await h.manager.ensureRunning();
+  const outcome = await h.manager.stopSharedService();
+  assert.equal(outcome, 'detach');
+  assert.equal(h.manager.getSnapshot().state, 'idle', '本窗口脱钩');
+  assert.equal(h.externalKillCalls.length, 0, '仅断开不 kill 共享服务');
+  assert.equal(h.ownerJar.get('127.0.0.1:3080'), 9999, '服务仍在运行：owner 记录保留，其他窗口仍可识别');
+  h.manager.dispose();
+});
+
+test('复用窗口 Stop：二次确认强停 → kill 外部 pid、清 owner 记录、停代理、回 idle（force-killed）', async () => {
+  const h = makeHarness(undefined, {
+    askStopReused: async () => 'force-stop', // 对话框返回「已通过二次确认的强制停止」
+  });
+  h.cookieJar.set('127.0.0.1:3080', 'dsh-auth-b=1'); // Cookie 复用路径：就绪时建面板代理
+  h.ownerJar.set('127.0.0.1:3080', 9999);
+  h.probeQueue = ['dsh-unauthenticated', 'dsh'];
+  const s = await h.manager.ensureRunning();
+  assert.equal(s.state, 'ready');
+  assert.equal(s.owned, false);
+  assert.equal(h.proxyStarts, 1, '复用就绪应已建面板代理');
+  const outcome = await h.manager.stopSharedService();
+  assert.equal(outcome, 'force-killed');
+  assert.deepEqual(h.externalKillCalls, [9999], '应对 owner 记录的 pid 发强停');
+  assert.equal(h.ownerJar.has('127.0.0.1:3080'), false, '强停成功后清 owner 记录');
+  assert.equal(h.proxyStops, 1, '代理随脱钩停止');
+  assert.equal(h.manager.getSnapshot().state, 'idle');
+  h.manager.dispose();
+});
+
+test('弹窗期间共享服务进程退出：强停复检不通过 → 回退仅脱钩并清记录（gone），不 kill', async () => {
+  let askCalls = 0;
+  let aliveChecks = 0;
+  const h = makeHarness(undefined, {
+    askStopReused: async () => { askCalls += 1; return 'force-stop'; },
+    externalProcess: {
+      // 预检（弹窗前）存活 → 复检（弹窗后）已死：模拟弹窗期间进程被他人停止
+      isAlive: () => { aliveChecks += 1; return aliveChecks === 1; },
+      stop: async (pid: number) => { h.externalKillCalls.push(pid); },
+    },
+  });
+  h.ownerJar.set('127.0.0.1:3080', 9999);
+  h.probeQueue = ['dsh'];
+  await h.manager.ensureRunning();
+  const outcome = await h.manager.stopSharedService();
+  assert.equal(outcome, 'gone');
+  assert.equal(askCalls, 1, '预检存活应先弹对话框');
+  assert.equal(aliveChecks, 2, '强停前应复检一次');
+  assert.equal(h.externalKillCalls.length, 0, '复检失败不得 kill');
+  assert.equal(h.manager.getSnapshot().state, 'idle');
+  assert.equal(h.ownerJar.has('127.0.0.1:3080'), false, '失效记录应清除');
+  h.manager.dispose();
+});
+
+test('强停 kill 抛错（EPERM 等）：kill-failed、本窗口脱钩、owner 记录保留（服务可能仍在运行）', async () => {
+  const h = makeHarness(undefined, {
+    askStopReused: async () => 'force-stop',
+    externalProcess: {
+      isAlive: () => true,
+      stop: async () => { throw Object.assign(new Error('not permitted'), { code: 'EPERM' }); },
+    },
+  });
+  h.ownerJar.set('127.0.0.1:3080', 9999);
+  h.probeQueue = ['dsh'];
+  await h.manager.ensureRunning();
+  const outcome = await h.manager.stopSharedService();
+  assert.equal(outcome, 'kill-failed');
+  assert.equal(h.manager.getSnapshot().state, 'idle', '失败也照常脱钩');
+  assert.equal(h.ownerJar.get('127.0.0.1:3080'), 9999, 'kill 失败不清记录');
+  h.manager.dispose();
+});
+
+test('未注入决策回调（旧装配兜底）：共享服务 Stop 直接脱钩，不弹窗不 kill', async () => {
+  const h = makeHarness(); // 不注入 askStopReused
+  h.ownerJar.set('127.0.0.1:3080', 9999);
+  h.probeQueue = ['dsh'];
+  await h.manager.ensureRunning();
+  const outcome = await h.manager.stopSharedService();
+  assert.equal(outcome, 'detach');
+  assert.equal(h.manager.getSnapshot().state, 'idle');
+  assert.equal(h.externalKillCalls.length, 0);
+  assert.equal(h.ownerJar.get('127.0.0.1:3080'), 9999, '脱钩不动他窗口的服务与记录');
+  h.manager.dispose();
+});
+
+// —— 「最后一个使用者退出才清理」：跨窗口使用者注册表协议（releaseOnExit）——
+// 窗口在 manager 进入 ready 时登记扩展宿主 pid、停止使用/退出时注销；退出清理（releaseOnExit）
+// 注销自己 → 过滤死 pid → 仍有其他存活使用者则移交不杀，自己是最后使用者才 kill。
+
+/** 内存使用者注册表 store（两个 manager 共享同一 jar 模拟跨窗口 globalState；值=去重 pid 列表） */
+function jarUsersStore(jar: Map<string, number[]>) {
+  return {
+    load: (host: string, port: number): UsersRecord | null => {
+      const list = jar.get(`${host}:${port}`);
+      return list === undefined ? null : { extPids: [...list] };
+    },
+    save: (host: string, port: number, record: UsersRecord): void => {
+      jar.set(`${host}:${port}`, [...record.extPids]);
+    },
+    clear: (host: string, port: number): void => {
+      jar.delete(`${host}:${port}`);
+    },
+  };
+}
+
+/** 模拟两个窗口（A/B）的装配：共享 owner 记录、使用者注册表与外部进程控制 */
+function makeTwoWindows() {
+  const ownerJar = new Map<string, number>();
+  const usersJar = new Map<string, number[]>();
+  const extKills: number[] = [];
+  const dead = new Set<number>(); // externalProcess.isAlive=false 的 pid（模拟崩溃/已死窗口）
+  const shared = {
+    ownerStore: {
+      load: (host: string, port: number) => ownerJar.get(`${host}:${port}`) ?? null,
+      save: (host: string, port: number, pid: number) => { ownerJar.set(`${host}:${port}`, pid); },
+      clear: (host: string, port: number) => { ownerJar.delete(`${host}:${port}`); },
+    },
+    usersStore: jarUsersStore(usersJar),
+    externalProcess: {
+      isAlive: (pid: number) => !dead.has(pid),
+      stop: async (pid: number) => { extKills.push(pid); },
+    },
+  };
+  const a = makeHarness(undefined, { selfPid: 9001, ...shared });
+  const b = makeHarness(undefined, { selfPid: 9002, ...shared });
+  return { a, b, ownerJar, usersJar, extKills, dead };
+}
+
+/** 驱动窗口自启就绪（初始探测 down → spawn → 等待循环命中 dsh；owned=true，注册/发布 owner pid） */
+async function bootOwned(h: Harness): Promise<void> {
+  h.probeQueue = ['down', 'dsh'];
+  const s = await h.manager.ensureRunning();
+  assert.equal(s.state, 'ready');
+  assert.equal(s.owned, true);
+}
+
+/** 驱动窗口复用就绪（初始探测即 dsh；owned=false，登记使用者） */
+async function bootReuse(h: Harness): Promise<void> {
+  h.probeQueue = ['dsh'];
+  const s = await h.manager.ensureRunning();
+  assert.equal(s.state, 'ready');
+  assert.equal(s.owned, false);
+}
+
+test('协议：多窗口共享时 owner 先退出 → 不杀服务进程、置移交标志、owner 记录保留（移交）', async () => {
+  const { a, b, ownerJar, usersJar, extKills } = makeTwoWindows();
+  await bootOwned(a); // A 自启就绪（owner）
+  assert.deepEqual(usersJar.get('127.0.0.1:3080'), [9001], 'A 就绪应登记为使用者');
+  assert.equal(ownerJar.get('127.0.0.1:3080'), 1234, 'A 就绪应发布 owner pid（假子进程 pid=1234）');
+  await bootReuse(b); // B 复用同一服务
+  assert.deepEqual(usersJar.get('127.0.0.1:3080'), [9001, 9002], 'B 就绪应追加登记');
+  // A（owner）先退出（模拟 deactivate 主路径 releaseOnExit(true)）：
+  await a.manager.releaseOnExit(true);
+  assert.deepEqual(extKills, [], 'owner 退出不得 kill 共享服务进程');
+  assert.equal(a.child?.killed.length ?? 0, 0, '不得对自启子进程发 kill（SIGTERM/SIGKILL 均不应出现）');
+  assert.equal(a.manager.isExitKillSkipped(), true, '应置移交标志（exit 钩子据此跳过兜底杀进程）');
+  assert.equal(ownerJar.get('127.0.0.1:3080'), 1234, 'owner 记录保留：供最后退出者按记录定位 kill');
+  assert.deepEqual(usersJar.get('127.0.0.1:3080'), [9002], 'A 已注销，B 仍在册');
+  // 收尾（测试内进程不真正退出）：手动停 A 的子进程释放 exit 钩子
+  await a.manager.stop();
+  a.manager.dispose();
+  b.manager.dispose();
+});
+
+test('协议：owner 先退出移交后，最后使用者（复用窗口）退出 → 按 owner 记录 kill 并清记录', async () => {
+  const { a, b, ownerJar, usersJar, extKills } = makeTwoWindows();
+  await bootOwned(a);
+  await bootReuse(b);
+  await a.manager.releaseOnExit(true); // owner 先退出：移交不杀
+  assert.equal(extKills.length, 0);
+  await b.manager.releaseOnExit(true); // 最后使用者退出：应清理共享服务进程
+  assert.deepEqual(extKills, [1234], '最后使用者退出应按 owner 记录定位 kill 服务进程（stopExternalProcess）');
+  assert.equal(ownerJar.has('127.0.0.1:3080'), false, '清理成功后清 owner 记录');
+  assert.equal(usersJar.has('127.0.0.1:3080'), false, '最后使用者注销后注册表键清空');
+  assert.equal(b.manager.isExitKillSkipped(), false, '已实际清理的场景无需移交标志');
+  await a.manager.stop();
+  a.manager.dispose();
+  b.manager.dispose();
+});
+
+test('协议：单窗口（唯一使用者，owner）退出 → 照旧清理自启子进程（行为与现状一致）', async () => {
+  const h = makeHarness(); // 默认装配已注入 usersStore（h.usersJar）
+  await bootOwned(h);
+  assert.deepEqual(h.usersJar.get('127.0.0.1:3080'), [process.pid], '就绪应登记本窗口扩展宿主 pid');
+  assert.equal(h.ownerJar.get('127.0.0.1:3080'), 1234);
+  await h.manager.releaseOnExit(true);
+  assert.equal(h.manager.getSnapshot().state, 'idle');
+  assert.ok((h.child?.killed ?? []).includes('SIGTERM'), '唯一使用者退出应照旧停掉自启子进程');
+  assert.equal(h.ownerJar.has('127.0.0.1:3080'), false, '子进程停止后清 owner 记录');
+  assert.equal(h.usersJar.has('127.0.0.1:3080'), false, '退出后注册表无残留');
+  assert.equal(h.manager.isExitKillSkipped(), false);
+  h.manager.dispose();
+});
+
+test('协议：复用窗口先退出（移交），owner 最后退出 → 走 stopChild 杀自己的子进程（不触发 externalProcess.stop）', async () => {
+  const { a, b, ownerJar, usersJar, extKills } = makeTwoWindows();
+  await bootOwned(a);
+  await bootReuse(b);
+  await b.manager.releaseOnExit(true); // B（复用窗口）先退出：A 仍在册 → 移交（B 无子进程本就无可杀）
+  assert.equal(extKills.length, 0, 'B 退出不 kill');
+  assert.deepEqual(usersJar.get('127.0.0.1:3080'), [9001], 'B 注销后只剩 A');
+  await a.manager.releaseOnExit(true); // A（owner，最后使用者）退出：stopChild 清理自有子进程
+  assert.deepEqual(extKills, [], 'owner 自启进程清理走 stopChild，不触发 externalProcess.stop');
+  assert.ok((a.child?.killed ?? []).includes('SIGTERM'), 'A 退出应杀自己的子进程');
+  assert.equal(ownerJar.has('127.0.0.1:3080'), false, 'stopOwned 顺带清 owner 记录');
+  a.manager.dispose();
+  b.manager.dispose();
+});
+
+test('协议：stopOnExit=false → 退出仅注销自己，不 kill、不置移交标志、owner 记录保留（服务留守）', async () => {
+  const h = makeHarness();
+  await bootOwned(h);
+  assert.equal(h.ownerJar.get('127.0.0.1:3080'), 1234);
+  await h.manager.releaseOnExit(false); // stopOnExit=false：deactivate 不清理（服务留守）
+  assert.equal(h.manager.getSnapshot().state, 'ready', '服务保持就绪（留守）');
+  assert.equal((h.child?.killed ?? []).length, 0, '不得 kill 自启子进程');
+  assert.equal(h.ownerJar.get('127.0.0.1:3080'), 1234, 'owner 记录保留（供后续复用窗口识别归属）');
+  assert.equal(h.usersJar.has('127.0.0.1:3080'), false, '本窗口已注销（不再使用该服务）');
+  assert.equal(h.manager.isExitKillSkipped(), false, 'stopOnExit=false 不置移交标志');
+  await h.manager.stop(); // 收尾：测试内进程不真正退出，手动停子进程释放 exit 钩子
+  h.manager.dispose();
+});
+
+test('协议：退出清理前过滤崩溃窗口残留的死 pid（已死使用者不计，仍判定为最后使用者并清理孤儿服务）', async () => {
+  const { a, b, ownerJar, usersJar, extKills, dead } = makeTwoWindows();
+  await bootOwned(a);
+  await bootReuse(b);
+  assert.deepEqual(usersJar.get('127.0.0.1:3080'), [9001, 9002]);
+  // A 窗口被强杀（kill -9）：deactivate 与 exit 钩子都没跑 → 注册表残留 A 的条目、owner 记录残留、子进程成孤儿
+  dead.add(9001); // A 的扩展宿主进程已死
+  await b.manager.releaseOnExit(true); // B（最后在册使用者）退出：过滤死 pid 后仍判空 → 清理孤儿服务
+  assert.deepEqual(extKills, [1234], '死使用者被过滤后 B 是最后使用者：按 owner 记录 kill 孤儿服务进程');
+  assert.equal(ownerJar.has('127.0.0.1:3080'), false, '清理后清 owner 记录');
+  assert.equal(usersJar.has('127.0.0.1:3080'), false, '死条目与 B 的注销一并清空');
+  await a.manager.stop(); // 收尾：停掉 A 的孤儿子进程（测试内），释放 exit 钩子
+  a.manager.dispose();
+  b.manager.dispose();
+});
+
+test('协议：登记/注销随就绪与 idle 流转（子进程意外退出 → 注销；再次就绪 → 重新登记；stop → 注销）', async () => {
+  const h = makeHarness();
+  await bootOwned(h);
+  assert.deepEqual(h.usersJar.get('127.0.0.1:3080'), [process.pid], '就绪应登记');
+  h.child?.emitExit(1); // 子进程意外退出（服务被杀/崩溃）→ 回 idle
+  assert.equal(h.manager.getSnapshot().state, 'idle');
+  await new Promise((r) => setTimeout(r, 5)); // 等 void 的异步注销完成
+  assert.equal(h.usersJar.has('127.0.0.1:3080'), false, '服务死亡回 idle 应注销');
+  assert.equal(h.ownerJar.has('127.0.0.1:3080'), false, '意外退出清 owner 记录');
+  await bootOwned(h); // 重新启动就绪
+  assert.deepEqual(h.usersJar.get('127.0.0.1:3080'), [process.pid], '再次就绪应重新登记');
+  await h.manager.stop(); // 手动停止（脱钩）→ 注销
+  assert.equal(h.usersJar.has('127.0.0.1:3080'), false, 'stop 脱钩应注销');
+  await bootOwned(h); // 再次就绪（第三轮）
+  assert.deepEqual(h.usersJar.get('127.0.0.1:3080'), [process.pid], '再启动就绪重新登记');
+  assert.equal(h.ownerJar.get('127.0.0.1:3080'), 1234, 'owner 记录随新子进程重新发布');
+  await h.manager.stop();
+  h.manager.dispose();
+});
+
+test('协议：restart 先注销、就绪再登记（owner 记录同步重新发布）', async () => {
+  const h = makeHarness();
+  await bootOwned(h);
+  assert.deepEqual(h.usersJar.get('127.0.0.1:3080'), [process.pid]);
+  h.probeQueue = ['down', 'dsh'];
+  const s = await h.manager.restart();
+  assert.equal(s.state, 'ready');
+  assert.equal(s.owned, true);
+  assert.deepEqual(h.usersJar.get('127.0.0.1:3080'), [process.pid], '重启就绪后应重新登记');
+  assert.equal(h.ownerJar.get('127.0.0.1:3080'), 1234, '重启就绪后 owner 记录重新发布');
+  await h.manager.stop();
+  h.manager.dispose();
+});
+
+test('协议：未注入使用者注册表（旧装配）→ releaseOnExit 降级旧行为 stop()（owner 退出即杀）', async () => {
+  const h = makeHarness(undefined, { usersStore: undefined }); // 显式关掉注册表（旧装配）
+  await bootOwned(h);
+  assert.equal(h.usersJar.has('127.0.0.1:3080'), false, '无注册表不登记');
+  await h.manager.releaseOnExit(true);
+  assert.equal(h.manager.getSnapshot().state, 'idle', '旧装配：退出即停自启进程（与现状一致）');
+  assert.ok((h.child?.killed ?? []).includes('SIGTERM'), '旧装配照旧杀自启子进程');
+  assert.equal(h.ownerJar.has('127.0.0.1:3080'), false, '旧装配 stop 照旧清 owner 记录');
+  assert.equal(h.manager.isExitKillSkipped(), false);
+  h.manager.dispose();
+});
+
+// —— v0.3.12 退出路径加固：降级语义保守化（F2）/ 退出复查窗口 / exit 钩子共享守卫（F5）/ dispose 无杀伤 ——
+// 用户真机复现：A（owner）spawn 3080 服务、B 复用且面板正常使用中，仅关 A 窗口 → 服务被杀。
+// 线上根因：VS Code deactivate 期间 globalState.update 必 reject(Canceled)（存储已关闭），
+// A 的注销写回失败 → 注册表残留 A 自身条目 → pruneDeadUsers 的写回清理同样被拒 →
+// 旧实现把写回失败并入 catch 返回 null → releaseOnExit 误判「注册表读取失败」→ 降级
+// stop() → 杀掉 B 正在使用的服务进程。以下用例逐一回归各防线。
+
+test('根因回归：退出期间注册表写回被拒（deactivate 存储已关闭必 reject）→ 仍按镜像读取结果移交，绝不误杀共享服务', async () => {
+  // 复刻 VS Code deactivate 生命周期：globalState.update 必 reject(Canceled)，
+  // globalState.get 仍读本窗口内存镜像（同步，不受影响）
+  const usersJar = new Map<string, number[]>();
+  let writesClosed = false;
+  const usersStore: UsersStore = {
+    load: (host, port) => {
+      const list = usersJar.get(`${host}:${port}`);
+      return list === undefined ? null : { extPids: [...list] };
+    },
+    save: async (host, port, record) => {
+      if (writesClosed) throw new Error('Canceled');
+      usersJar.set(`${host}:${port}`, [...record.extPids]);
+    },
+    clear: async (host, port) => {
+      if (writesClosed) throw new Error('Canceled');
+      usersJar.delete(`${host}:${port}`);
+    },
+  };
+  const a = makeHarness(undefined, { selfPid: 9001, usersStore });
+  const b = makeHarness(undefined, { selfPid: 9002, usersStore });
+  await bootOwned(a); // A 自启就绪（owner，登记 pid=9001）
+  await bootReuse(b); // B 复用同一服务（登记 pid=9002）
+  assert.deepEqual(usersJar.get('127.0.0.1:3080'), [9001, 9002]);
+  writesClosed = true; // A 进入 deactivate：所有注册表写入被拒（注销/过滤写回均失败）
+  await a.manager.releaseOnExit(true);
+  assert.equal(a.child?.killed.length ?? 0, 0, '移交：绝不能杀 B 正在使用的服务进程（v0.3.11 此处必现误杀）');
+  assert.equal(a.manager.isExitKillSkipped(), true, '应置移交标志（exit 钩子跳过兜底杀）');
+  assert.deepEqual(usersJar.get('127.0.0.1:3080'), [9001, 9002], '注册表残留可接受（A 的注销写不落盘）：由后续窗口死 pid 过滤自愈');
+  assert.equal(b.manager.getSnapshot().state, 'ready', 'B 侧连接不受 A 退出影响');
+  await a.manager.stop(); // 收尾：测试内手动停 A 的子进程，释放 exit 钩子
+  a.manager.dispose();
+  b.manager.dispose();
+});
+
+test('F2：注册表读取失败 → 保守不杀（宁留孤儿不误杀共享服务），置 skipExitKill 跳过 exit 钩子兜底杀', async () => {
+  const logs: string[] = [];
+  const h = makeHarness(undefined, {
+    log: (line) => logs.push(line),
+    consoleLog: (line) => logs.push(line),
+    usersStore: {
+      load: async () => { throw new Error('storage broken'); },
+      save: async () => {},
+      clear: async () => {},
+    },
+  });
+  await bootOwned(h); // registerSelf 同因读取失败而不登记（注册表不可用即无协调，符合预期）
+  await h.manager.releaseOnExit(true);
+  assert.equal(h.child?.killed.length ?? 0, 0, '「不确定」不再等于「杀」：读取失败不得杀自启子进程（可能有其他窗口在用）');
+  assert.equal(h.manager.isExitKillSkipped(), true, 'exit 钩子兜底杀须同步跳过');
+  assert.ok(logs.some((l) => l.includes('保守不清理')), '降级决策必须落持久日志（exthost）');
+  h.manager.runExitHookDecision();
+  assert.equal(h.child?.killed.length ?? 0, 0, 'skipExitKill=true 时 exit 钩子不得兜底杀');
+  await h.manager.stop(); // 收尾：手动清理（模拟孤儿最终被用户/后续会话清理）
+  h.manager.dispose();
+});
+
+test('F2：健康失联回 idle 但子进程仍存活（child 保留）→ 退出按注册表移交，不再绕过注册表直接 stop 误杀', async () => {
+  const ownerJar = new Map<string, number>();
+  const usersJar = new Map<string, number[]>();
+  const extKills: number[] = [];
+  const shared = {
+    ownerStore: {
+      load: (host: string, port: number) => ownerJar.get(`${host}:${port}`) ?? null,
+      save: (host: string, port: number, pid: number) => { ownerJar.set(`${host}:${port}`, pid); },
+      clear: (host: string, port: number) => { ownerJar.delete(`${host}:${port}`); },
+    },
+    usersStore: jarUsersStore(usersJar),
+    externalProcess: {
+      isAlive: (pid: number) => true,
+      stop: async (pid: number) => { extKills.push(pid); },
+    },
+  };
+  const a = makeHarness(undefined, { selfPid: 9001, healthIntervalMs: 20, ...shared });
+  const b = makeHarness(undefined, { selfPid: 9002, ...shared });
+  await bootOwned(a);
+  await bootReuse(b);
+  assert.ok(a.child, '自启子进程在册');
+  a.probeQueue = ['down']; // A 的健康探测瞬时失败（服务繁忙/网络抖动）
+  await new Promise((r) => setTimeout(r, 60));
+  assert.equal(a.manager.getSnapshot().state, 'idle', '健康失联：回 idle');
+  assert.ok(a.child, '但子进程仍存活（健康失败路径不杀自有子进程——B 仍在使用的共享服务）');
+  // B 仍在册 → A 退出必须移交（v0.3.11 旧行为：state!=ready 绕过注册表直接 stop → 误杀）
+  await a.manager.releaseOnExit(true);
+  assert.equal(a.child?.killed.length ?? 0, 0, '仍有其他使用者：移交不杀');
+  assert.equal(a.manager.isExitKillSkipped(), true);
+  assert.deepEqual(extKills, []);
+  await a.manager.stop(); // 收尾
+  a.manager.dispose();
+  b.manager.dispose();
+});
+
+test('F2：未就绪且无自启子进程（启动失败）→ 退出纯脱钩，绝不按 owner 记录清理由他人启动的服务', async () => {
+  const h = makeHarness();
+  h.ownerJar.set('127.0.0.1:3080', 7777); // 他窗口/终端启动的服务记录（本窗口从未使用该服务）
+  h.probeQueue = ['foreign']; // 端口被占 → failed（无子进程、从未就绪、从未登记）
+  const s = await h.manager.ensureRunning();
+  assert.equal(s.state, 'failed');
+  await h.manager.releaseOnExit(true);
+  assert.deepEqual(h.externalKillCalls, [], '从未使用该服务的窗口退出不得 kill 他人服务');
+  assert.equal(h.ownerJar.get('127.0.0.1:3080'), 7777, 'owner 记录不动');
+  h.manager.dispose();
+});
+
+test('退出复查窗口：其他窗口的登记在首查后才同步到本窗口镜像 → 延迟复查后改判移交，不杀', async () => {
+  const usersJar = new Map<string, number[]>();
+  const a = makeHarness(undefined, {
+    selfPid: 9001,
+    exitRecheckDelayMs: 40, // 开启复查窗口
+    usersStore: jarUsersStore(usersJar),
+  });
+  await bootOwned(a); // 注册表=[9001]，B 尚未出现
+  const p = a.manager.releaseOnExit(true); // 首查 others=0 → 进入复查延迟
+  await new Promise((r) => setTimeout(r, 10)); // 仍在复查窗口内
+  // B（复用窗口）此刻才完成登记（模拟跨窗口 globalState 镜像广播延迟到达 A）
+  usersJar.set('127.0.0.1:3080', [9002]);
+  await p;
+  assert.equal(a.child?.killed.length ?? 0, 0, '复查发现其他使用者：改判移交不杀');
+  assert.equal(a.manager.isExitKillSkipped(), true);
+  await a.manager.stop(); // 收尾
+  a.manager.dispose();
+});
+
+test('退出复查窗口：复查后仍无其他使用者 → 照常清理自启子进程（单窗口语义不变）', async () => {
+  const h = makeHarness(undefined, { exitRecheckDelayMs: 5 });
+  await bootOwned(h);
+  await h.manager.releaseOnExit(true);
+  assert.ok((h.child?.killed ?? []).includes('SIGTERM'), '复查无他人后照旧停自启子进程');
+  assert.equal(h.ownerJar.has('127.0.0.1:3080'), false, '清理顺带清 owner 记录');
+  assert.equal(h.manager.isExitKillSkipped(), false);
+  h.manager.dispose();
+});
+
+test('F5 exit 钩子：本会话登记成功过（共享使用迹象）→ 即使 skipExitKill=false 也跳过兜底杀（宁留孤儿不误杀）', async () => {
+  const logs: string[] = [];
+  const h = makeHarness(undefined, { consoleLog: (line) => logs.push(line) });
+  await bootOwned(h); // registerSelf 成功 → sharedUseSignaled=true；child 存活
+  assert.equal(h.manager.isSharedUseSignaled(), true);
+  assert.equal(h.manager.isExitKillSkipped(), false); // 未走退出清理（模拟 deactivate 被打断/未运行）
+  h.manager.runExitHookDecision(); // 进程 exit：钩子决策
+  assert.equal(h.child?.killed.length ?? 0, 0, '有共享使用迹象：跳过兜底杀（宁可留孤儿）');
+  assert.ok(logs.some((l) => l.includes('跳过兜底杀') && l.includes('共享使用迹象')), '跳过原因必须落持久日志');
+  await h.manager.stop(); // 收尾
+  h.manager.dispose();
+});
+
+test('F5 exit 钩子：从未登记成功（旧装配）且无共享迹象 → 兜底杀照常执行（防僵尸进程）', async () => {
+  const logs: string[] = [];
+  const h = makeHarness(undefined, { usersStore: undefined, consoleLog: (line) => logs.push(line) });
+  await bootOwned(h);
+  assert.equal(h.manager.isSharedUseSignaled(), false, '旧装配从未登记：无共享迹象');
+  h.manager.runExitHookDecision();
+  assert.ok((h.child?.killed ?? []).includes('SIGKILL'), '无共享迹象照常兜底杀，防孤儿进程');
+  assert.ok(logs.some((l) => l.includes('执行兜底杀')), '兜底杀必须落持久日志（pid + 原因标记）');
+  await h.manager.stop();
+  h.manager.dispose();
+});
+
+test('F5 exit 钩子：启动中途（未就绪未登记）进程退出 → 兜底杀启动中的子进程（防僵尸）', async () => {
+  const h = makeHarness();
+  h.probeQueue = ['down', 'down', 'down'];
+  const p = h.manager.ensureRunning(); // 启动流程进行中（waiting）
+  await new Promise((r) => setTimeout(r, 5));
+  assert.ok(h.child, '启动中已有子进程');
+  assert.equal(h.manager.isSharedUseSignaled(), false, '未就绪未登记：无共享迹象');
+  h.manager.runExitHookDecision();
+  assert.ok((h.child?.killed ?? []).includes('SIGKILL'), '启动中途退出：兜底杀防僵尸');
+  await h.manager.stop(); // 叫停启动流程（stopRequested → doStart 以 idle 收尾）
+  const s = await p;
+  assert.equal(s.state, 'idle');
+  h.manager.dispose();
+});
+
+test('dispose 无杀伤：移交场景（child 存活 + skipExitKill=true）deactivate 尾部 dispose 不杀子进程，exit 钩子仍跳过', async () => {
+  const { a, b } = makeTwoWindows();
+  await bootOwned(a);
+  await bootReuse(b);
+  await a.manager.releaseOnExit(true); // 移交
+  a.manager.dispose(); // deactivate 尾部调用
+  assert.equal(a.child?.killed.length ?? 0, 0, 'dispose 绝不杀移交中的子进程');
+  a.manager.runExitHookDecision(); // 进程真正退出时钩子仍保留（child 存活）且决策为跳过
+  assert.equal(a.child?.killed.length ?? 0, 0, '移交后 exit 钩子不得兜底杀');
+  await a.manager.stop(); // 收尾
+  a.manager.dispose(); // 幂等
+  b.manager.dispose();
 });
 
 

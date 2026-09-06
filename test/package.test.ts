@@ -14,20 +14,41 @@ test('extensionKind 优先 workspace（远程场景跑在远端）', () => {
   assert.equal(p.extensionKind[0], 'workspace');
 });
 
-test('右上角图标命令与 editor/title 菜单（v0.3.0）', () => {
+test('单面板收敛（v0.3.11）：主面板 dsh.panel 保留为唯一面板，副面板全套已移除', () => {
   const p = pkg();
-  const cmd = p.contributes.commands.find((c: { command: string }) => c.command === 'dsh.openFromTitle');
-  assert.ok(cmd, '存在 dsh.openFromTitle 命令');
-  // 右上角图标：原鲸鱼 + 白底（明暗主题都清晰可见），不再用明暗双主题变体
-  assert.equal(cmd.icon, 'assets/whale-icon-bg.svg', '右上角命令图标应为白底鲸鱼');
-  assert.ok(existsSync(join(__dirname, '..', '..', 'assets', 'whale-icon-bg.svg')), '白底鲸鱼图标文件应存在');
-  const bg = readFileSync(join(__dirname, '..', '..', 'assets', 'whale-icon-bg.svg'), 'utf8');
-  assert.ok(bg.includes('#FFFFFF'), '白底图标应含白色背景');
-  assert.ok(bg.includes('#000000'), '白底图标应保留原黑色鲸鱼路径');
-  const menu: { command: string; group?: string }[] = p.contributes.menus['editor/title'] || [];
-  const item = menu.find((m) => m.command === 'dsh.openFromTitle');
-  assert.ok(item, 'editor/title 菜单包含该命令');
-  assert.ok(String(item.group).startsWith('navigation'), '组为 navigation（标签栏右侧图标区）');
+  // 视图容器：只剩 activitybar dsh；secondarySidebar 容器 dsh-secondary 已移除
+  assert.ok(Array.isArray(p.contributes.viewsContainers.activitybar), 'activitybar 容器保留');
+  assert.equal(p.contributes.viewsContainers.activitybar.length, 1, '唯一容器');
+  assert.equal(p.contributes.viewsContainers.activitybar[0].id, 'dsh');
+  assert.equal(p.contributes.viewsContainers.secondarySidebar, undefined, 'secondarySidebar 容器已删除');
+  // 视图：只剩 dsh.panel
+  assert.deepEqual(Object.keys(p.contributes.views), ['dsh'], '视图组只剩主面板所在容器');
+  const viewIds: string[] = p.contributes.views['dsh'].map((v: { id: string }) => v.id);
+  assert.deepEqual(viewIds, ['dsh.panel'], '唯一视图 dsh.panel');
+  assert.equal(p.contributes.views['dsh'][0].name, '%dsh.view.panel.name%');
+  // 命令：openPanel 保留为唯一打开命令；openSecondary / openFromTitle（编辑器右上角按钮）已删除
+  const cmdIds: string[] = p.contributes.commands.map((c: { command: string }) => c.command);
+  assert.ok(cmdIds.includes('dsh.openPanel'), 'dsh.openPanel 保留为唯一打开命令');
+  assert.ok(!cmdIds.includes('dsh.openSecondary'), 'dsh.openSecondary 已删除');
+  assert.ok(!cmdIds.includes('dsh.openFromTitle'), 'dsh.openFromTitle 已删除');
+  // 激活事件：副面板相关事件已移除，主面板事件保留
+  assert.ok(p.activationEvents.includes('onView:dsh.panel'));
+  assert.ok(p.activationEvents.includes('onCommand:dsh.openPanel'));
+  assert.ok(!p.activationEvents.includes('onView:dsh.panel.secondary'));
+  assert.ok(!p.activationEvents.includes('onCommand:dsh.openSecondary'));
+  // editor/title 菜单已移除（右上角按钮入口随 openFromTitle 一并删除）
+  assert.equal(p.contributes.menus['editor/title'], undefined, 'editor/title 菜单已删除');
+  // 本地化键：副面板相关键移除、主面板键保留
+  const nls = JSON.parse(readFileSync(join(__dirname, '..', '..', 'package.nls.json'), 'utf8'));
+  const nlsZh = JSON.parse(readFileSync(join(__dirname, '..', '..', 'package.nls.zh-cn.json'), 'utf8'));
+  assert.equal(nls['dsh.view.panel.name'], 'DSH Panel');
+  assert.equal(nlsZh['dsh.view.panel.name'], 'DSH 面板');
+  for (const key of ['dsh.view.panelSecondary.name', 'dsh.cmd.openSecondary.title', 'dsh.cmd.openFromTitle.title']) {
+    assert.equal(nls[key], undefined, `en 不应含键 ${key}`);
+    assert.equal(nlsZh[key], undefined, `zh-cn 不应含键 ${key}`);
+  }
+  // 右上角按钮专用图标资产已随入口删除
+  assert.ok(!existsSync(join(__dirname, '..', '..', 'assets', 'whale-icon-bg.svg')), '白底鲸鱼图标文件已删除');
 });
 
 test('存在手动清理图片缓存命令 dsh.cleanupImageCache', () => {
@@ -38,7 +59,7 @@ test('存在手动清理图片缓存命令 dsh.cleanupImageCache', () => {
   assert.ok(Array.isArray(p.activationEvents) && p.activationEvents.includes('onCommand:dsh.cleanupImageCache'), '需声明激活事件');
 });
 
-test('断开命令 dsh.disconnect：声明、双面板标题栏菜单、激活事件齐全', () => {
+test('断开命令 dsh.disconnect：声明、面板标题栏菜单、激活事件齐全（单面板）', () => {
   const p = pkg();
   const cmd = p.contributes.commands.find((c: { command: string }) => c.command === 'dsh.disconnect');
   assert.ok(cmd, '存在 dsh.disconnect 命令');
@@ -47,19 +68,19 @@ test('断开命令 dsh.disconnect：声明、双面板标题栏菜单、激活�
   assert.ok(Array.isArray(p.activationEvents) && p.activationEvents.includes('onCommand:dsh.disconnect'), '需声明激活事件');
   const vt: { command: string; when?: string; group?: string }[] = p.contributes.menus['view/title'] || [];
   const items = vt.filter((m) => m.command === 'dsh.disconnect');
-  assert.equal(items.length, 1, '单个菜单项覆盖两个面板视图');
-  assert.ok(items[0].when?.includes('dsh.panel') && items[0].when?.includes('dsh.panel.secondary'), 'when 覆盖主/副面板');
+  assert.equal(items.length, 1, '单个菜单项覆盖唯一面板');
+  assert.equal(items[0].when, 'view == dsh.panel', 'when 只覆盖唯一面板 dsh.panel');
   assert.ok(String(items[0].group).startsWith('navigation'), '标题栏 navigation 组');
   // 与 Stop Service 并排：disconnect(navigation@3) 紧跟 stop(navigation@4) 之前
   const stopGroup = vt.find((m) => m.command === 'dsh.stop')?.group;
   assert.ok(stopGroup !== undefined && String(items[0].group) < String(stopGroup), '断开按钮应排在停止服务之前并排显示');
 });
 
-test('活动栏/辅助侧边栏容器图标保持原始鲸鱼图标（assets/whale-icon.svg）', () => {
+test('活动栏容器图标保持原始鲸鱼图标（assets/whale-icon.svg）', () => {
   const p = pkg();
-  for (const container of [...p.contributes.viewsContainers.activitybar, ...p.contributes.viewsContainers.secondarySidebar]) {
-    assert.equal(container.icon, 'assets/whale-icon.svg', container.id + ' 应保持原始鲸鱼图标');
-  }
+  const containers = p.contributes.viewsContainers.activitybar;
+  assert.ok(Array.isArray(containers) && containers.length === 1, '仅 activitybar 容器 dsh');
+  assert.equal(containers[0].icon, 'assets/whale-icon.svg', '活动栏容器应保持原始鲸鱼图标');
   assert.ok(existsSync(join(__dirname, '..', '..', 'assets', 'whale-icon.svg')), '原始鲸鱼图标文件应存在');
 });
 

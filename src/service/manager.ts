@@ -1,7 +1,12 @@
 // src/service/manager.ts — 服务管理器：状态机编排探测/启动/等待/停止
 // 纯模块：不依赖 vscode；探测与进程管理均通过依赖注入，便于单测。
 import { findFreePort, PORT_FALLBACK_ATTEMPTS, type ProbeResult } from './detect';
-import type { ChildProcessLike, ProcessRunner } from './process';
+import {
+  isProcessAlive,
+  stopExternalProcess,
+  type ChildProcessLike,
+  type ProcessRunner,
+} from './process';
 import { createDefaultProxyFactory, type DshProxyLike, type DshProxyTarget } from './proxy';
 import type { MsgKey } from '../i18n';
 
@@ -117,6 +122,47 @@ export interface ManagerDeps {
   onPersistExternalToken?: (token: string) => void | Promise<void>;
   /** 会话 Cookie 持久化存取（复用外来实例；缺省为不持久化） */
   cookieStore?: SessionCookieStore;
+  /**
+   * 自启子进程 pid 的跨窗口记录存取（缺省不记录：复用窗口的「强制停止共享服务」随之不可用，
+   * 点 Stop Service 维持旧行为——仅脱钩并提示）。
+   */
+  ownerStore?: OwnerPidStore;
+  /**
+   * 使用中窗口注册表（跨窗口共享服务的使用者计数；缺省不注入 → 不登记不协调，
+   * 退出清理降级为旧行为——owner 窗口退出即杀自启子进程）。
+   */
+  usersStore?: UsersStore;
+  /**
+   * 本窗口扩展宿主 pid（使用者注册表登记/注销用；缺省 process.pid；
+   * 单测注入不同值模拟多窗口）。
+   */
+  selfPid?: number;
+  /**
+   * 同步持久日志出口（默认 console.log → 扩展宿主 exthost 日志文件，窗口关闭后仍可查）。
+   * 退出路径（releaseOnExit / 使用者注册表读写 / exit 钩子）的关键分支除 deps.log 外
+   * 必须经此再落一份：OutputChannel 随窗口销毁，事后排障只能依赖 exthost 持久日志。
+   * 单测注入收集器避免污染测试输出。
+   */
+  consoleLog?: (line: string) => void;
+  /**
+   * 退出清理判定「自己是最后使用者」后的延迟复查窗口（毫秒，默认 400）：
+   * 等待跨窗口 globalState 镜像同步（其他窗口刚就绪登记、本窗口镜像尚未收到主进程
+   * 存储广播的短暂窗口）再读一次注册表，复查到其他使用者则改判移交。≤0 关闭复查
+   * （单测注入 0 保持既有用例时序）。复查仅发生在「即将 kill」分支：移交路径不受
+   * 影响（亚秒返回）；清理路径 400ms + stopChild 收尾 ~3.2s 仍在 deactivate 5s 预算内。
+   */
+  exitRecheckDelayMs?: number;
+  /**
+   * 外部进程（另一窗口自启的 dsh）的存活探测与强停原语（强停共享服务用）。
+   * 未注入时默认 process.ts 的真实实现（process.kill）；单测注入假实现避免触碰真实进程。
+   */
+  externalProcess?: { isAlive(pid: number): boolean; stop(pid: number): Promise<void> };
+  /**
+   * 「复用窗口停止共享服务」的决策回调（复用窗口点 Stop Service、目标服务存在存活 owner
+   * 记录时调用；modal 弹窗与强停前二次确认在扩展层实现，返回最终决策）。
+   * 未注入时维持旧行为：直接脱钩（不弹窗、不 kill）。
+   */
+  askStopReused?: (info: SharedStopAskInfo) => Promise<SharedStopDecision>;
   /** 崩溃自愈 Cookie 复用的宽限重试间隔（毫秒，默认 1000；单测注入小值缩短用例耗时） */
   cookieGraceDelayMs?: number;
   /** 就绪后的健康探测间隔（毫秒，默认 30000；≤0 关闭探测） */
@@ -144,6 +190,79 @@ export interface SessionCookieStore {
   clear(host: string, port: number): void | Promise<void>;
 }
 
+/**
+ * 自启 dsh 子进程 pid 的跨窗口记录存取（按 host:port 分键）。
+ * 扩展里接 context.globalState（用户级、跨窗口共享，键形如 `dsh.ownerPid@host:port`，与
+ * 会话 Cookie 的 `dsh.proxyCookie@host:port` 同构）。owner 窗口在自启子进程就绪时写入 pid，
+ * 复用窗口据此识别「该共享服务由哪个窗口启动」并决定能否提供「强制停止」。
+ * 记录随进程停止/意外退出清理；owner 窗口崩溃导致的残留可接受——消费方使用前必须校验
+ * pid 存活（0 号信号探测），并负责清理已失效的记录。单测注入内存实现。
+ */
+export interface OwnerPidStore {
+  load(host: string, port: number): number | null | Promise<number | null>;
+  save(host: string, port: number, pid: number): void | Promise<void>;
+  clear(host: string, port: number): void | Promise<void>;
+}
+
+/** 使用者注册表记录：正在使用该 dsh 服务的窗口（扩展宿主）pid 列表（去重） */
+export interface UsersRecord {
+  extPids: number[];
+}
+
+/**
+ * 使用中窗口（扩展宿主 pid）注册表存取（按 host:port 分键）。
+ * 扩展里接 context.globalState（用户级、跨窗口共享，键形如 `dsh.users@host:port`，
+ * 与 ownerPid/Cookie 键同构）；单测注入内存实现。
+ *
+ * 协议背景：「最后一个使用该 dsh 服务的 VS Code 窗口退出后才自动清理服务进程」——
+ * 窗口在 manager 进入 ready（连接该服务，含自启就绪与复用就绪）时登记本窗口扩展宿主 pid；
+ * 停止使用（stop/脱钩/失联回 idle/重启）与窗口退出时注销。退出清理（releaseOnExit）前用
+ * isProcessAlive 过滤死 pid（窗口崩溃/强杀残留）：仍有其他存活使用者 → 移交不杀；
+ * 自己是最后使用者才按 owner 记录/自启子进程清理。
+ * 未注入（旧装配缺省）→ 不登记不协调，退出清理降级为旧行为（owner 窗口退出即杀）。
+ */
+export interface UsersStore {
+  load(host: string, port: number): UsersRecord | null | Promise<UsersRecord | null>;
+  save(host: string, port: number, record: UsersRecord): void | Promise<void>;
+  clear(host: string, port: number): void | Promise<void>;
+}
+
+/** 「复用窗口停止共享服务」决策回调的入参（记录存在且 pid 存活时才回调） */
+export interface SharedStopAskInfo {
+  host: string;
+  port: number;
+  /** 展示用 host:port（日志与文案变量） */
+  authority: string;
+  /** owner 记录中的 pid（目标 dsh 服务进程） */
+  pid: number;
+}
+
+/**
+ * 「复用窗口停止共享服务」的对话框决策（modal 在扩展层实现：
+ * 三选一「仅断开本窗口连接 / 强制停止服务 / 取消」+ 强停前的二次红色确认，均在回调内完成）。
+ * - 'detach'：仅断开本窗口（服务继续运行）；
+ * - 'force-stop'：用户已通过二次确认，同意强制终止共享服务进程；
+ * - 'cancel'：用户取消（含强停二次确认被否），保持当前连接不动。
+ */
+export type SharedStopDecision = 'detach' | 'force-stop' | 'cancel';
+
+/**
+ * stopSharedService() 的执行结果（命令层据此决定是否追加提示文案）：
+ * - 'cancel'：用户取消，保持连接；
+ * - 'detach'：仅断开本窗口（用户选择，或未注入决策回调时的旧行为兜底）；
+ * - 'force-killed'：已强停共享服务进程并清 owner 记录，本窗口脱钩；
+ * - 'gone'：owner 记录的 pid 已不存在（进程已退出/弹窗期间退出），清失效记录后仅脱钩；
+ * - 'no-record'：无 owner 记录（终端或旧版本扩展启动），维持原行为仅脱钩；
+ * - 'kill-failed'：强停信号发送失败（如 EPERM），本窗口脱钩但服务可能仍在运行。
+ */
+export type SharedStopOutcome =
+  | 'cancel'
+  | 'detach'
+  | 'force-killed'
+  | 'gone'
+  | 'no-record'
+  | 'kill-failed';
+
 /** 启动总超时默认值（毫秒）——dsh 冷启动约 14s，留 4x 余量覆盖慢机/多实例；按用户决定固定 60s */
 const DEFAULT_START_TIMEOUT_MS = 60000;
 /** 就绪后健康探测间隔默认值（毫秒） */
@@ -162,6 +281,21 @@ const PROXY_RETRY_DELAY_MS = 1000;
 const COOKIE_REUSE_GRACE_ATTEMPTS = 3;
 /** 崩溃自愈 Cookie 复用的宽限重试间隔（毫秒） */
 const COOKIE_REUSE_GRACE_DELAY_MS = 1000;
+/**
+ * 退出清理「最后使用者」判定后的延迟复查窗口（毫秒）：吸收跨窗口 globalState 镜像
+ * 同步延迟（B 刚登记、A 镜像尚未收到广播的短暂窗口）。400ms + 现有 stopChild 收尾
+ * ~3.2s ≈ 3.6s，仍在 deactivate 5s 硬预算内。
+ */
+const EXIT_RECHECK_DELAY_MS = 400;
+
+/** 默认持久日志出口：console.log（扩展宿主环境落入 exthost 日志文件，窗口关闭后可查） */
+const defaultConsoleLog = (line: string): void => { console.log(line); };
+
+/** 默认外部进程控制原语（process.ts 的真实实现）；deps 未注入时使用。单测注入假实现避免触碰真实进程 */
+const defaultExternalProcess = {
+  isAlive: (pid: number): boolean => isProcessAlive(pid),
+  stop: (pid: number): Promise<void> => stopExternalProcess(pid),
+};
 
 /** resolvePortConflict 的内部结果（manager 私有流转，不对外） */
 export type PortConflictResolution =
@@ -203,17 +337,65 @@ export class ServiceManager {
   /** 配置中设定的原始端口（不含运行时 fallback），reconfigure 用来判定端口是否真正变更 */
   private originalPort: number;
   private disposed = false;
-  /** 父进程退出时杀掉子进程，防止僵尸（stopOnExit=false 时移除） */
+  /**
+   * 退出移交标志：releaseOnExit 判定「仍有其他窗口在使用（移交）」或「stopOnExit=false
+   * 服务留守」时置位，父进程 exit 钩子据此跳过兜底杀子进程（最后一次 spawn 时复位，
+   * 新一轮子进程生命周期重新决策）。
+   */
+  private skipExitKill = false;
+  /**
+   * 共享使用迹象（F5 守卫）：本会话 registerSelf 成功过、或 pruneDeadUsers 快照曾见过
+   * 其他存活使用者。置位后 exit 钩子在 skipExitKill=false 时也跳过兜底杀——退出清理
+   * 被打断（deactivate 5s 超时等）时宁可留下孤儿进程（后续窗口按死 pid 过滤 / owner
+   * 记录失效清理自愈），绝不误杀其他窗口正在使用的共享服务。
+   */
+  private sharedUseSignaled = false;
+  /** 父进程退出时杀掉子进程，防止僵尸（stopOnExit=false 时移除）；按使用者注册表移交后跳过 */
   private parentExitHook = (): void => {
+    this.exitKillDecision('process-exit');
+  };
+
+  /**
+   * exit 钩子的兜底杀决策（同步，不得抛出）：
+   * - skipExitKill=true（退出清理已按注册表移交/保守不杀）→ 跳过；
+   * - sharedUseSignaled=true（本会话有共享使用迹象）→ 跳过（宁留孤儿不误杀共享服务）；
+   * - 无存活子进程引用 → 无需执行；
+   * - 其余（退出清理未完成或未运行、无共享迹象）→ SIGKILL 兜底杀防僵尸。
+   * 所有分支同步落持久日志（exthost），事后可判别兜底杀是否发生及原因。
+   */
+  private exitKillDecision(reason: string): void {
+    const authority = `${this.opts.host}:${this.opts.port}`;
+    const child = this.child;
+    const pid = child?.pid;
+    if (this.skipExitKill) {
+      this.persistLog(`[exit-hook] ${authority} 跳过兜底杀（原因=${reason}）：skipExitKill=true（退出清理已按使用者注册表移交或保守不杀）`);
+      return;
+    }
+    if (this.sharedUseSignaled) {
+      this.persistLog(`[exit-hook] ${authority} 跳过兜底杀（原因=${reason}）：本会话存在共享使用迹象（登记成功/曾见其他使用者，child pid=${pid ?? '无'}），宁留孤儿不误杀共享服务`);
+      return;
+    }
+    if (!pid || !child) {
+      this.persistLog(`[exit-hook] ${authority} 兜底杀无需执行（原因=${reason}）：无存活子进程引用（skipExitKill=false）`);
+      return;
+    }
+    this.persistLog(`[exit-hook] ${authority} 执行兜底杀 pid=${pid}（原因=${reason}，skipExitKill=false 且无共享使用迹象：退出清理未完成或未运行，防僵尸进程）`);
     try {
-      if (this.child?.pid) {
-        try { process.kill(-this.child.pid, 'SIGKILL'); } catch { /* 非 Unix 或进程组已退出 */ }
-        this.child.kill('SIGKILL');
-      }
+      try { process.kill(-pid, 'SIGKILL'); } catch { /* 非 Unix 或进程组已退出 */ }
+      child.kill('SIGKILL');
     } catch {
       /* 进程可能已退出，忽略 */
     }
-  };
+  }
+
+  /**
+   * （单测专用）直接执行 exit 钩子决策：生产路径由 process 'exit' 事件触发，单测无法
+   * 安全模拟进程退出（会波及同进程内其他 manager 的钩子），经此入口直测兜底杀/跳过
+   * 逻辑。不真正退出进程。
+   */
+  runExitHookDecision(): void {
+    this.exitKillDecision('test');
+  }
 
   constructor(private opts: ManagerOptions, private deps: ManagerDeps) {
     // externalToken 空串/纯空白 = 未配置（VS Code 设置默认 ''，归一化后仍为 ''）：
@@ -230,6 +412,26 @@ export class ServiceManager {
   /** 当前状态快照（副本，防外部篡改） */
   getSnapshot(): ServiceSnapshot {
     return { ...this.snapshot };
+  }
+
+  /** releaseOnExit 是否已置退出移交标志（exit 钩子将跳过兜底杀进程；退出流程/测试确认用） */
+  isExitKillSkipped(): boolean {
+    return this.skipExitKill;
+  }
+
+  /** 本会话是否出现过共享使用迹象（登记成功/曾见其他存活使用者）——F5 exit 钩子守卫的判据（测试确认用） */
+  isSharedUseSignaled(): boolean {
+    return this.sharedUseSignaled;
+  }
+
+  /**
+   * 关键分支持久日志：deps.log（OutputChannel，随窗口销毁）之外同步再落一份到
+   * consoleLog（默认 console.log → exthost 持久日志，窗口关闭后仍可查，带
+   * [dsh-vscode] 前缀便于 grep）。供退出路径事后排障；任何出口失败都不影响主流程。
+   */
+  private persistLog(line: string): void {
+    try { this.deps.log(line); } catch { /* OutputChannel 可能已销毁 */ }
+    try { (this.deps.consoleLog ?? defaultConsoleLog)(`[dsh-vscode] ${line}`); } catch { /* 日志出口失败不传播 */ }
   }
 
   /** 当前目标地址（面板生成 CSP frame-src 用） */
@@ -279,19 +481,222 @@ export class ServiceManager {
     return this.op;
   }
 
-  /** 停止：仅停止插件自己启动的服务；启动流程进行中也会立即停掉已 spawn 的子进程 */
+  /**
+   * 停止：仅停止插件自己启动的服务；启动流程进行中也会立即停掉已 spawn 的子进程。
+   * 复用窗口的「强制停止共享服务」请走 stopSharedService()（由命令层调用）——
+   * stop() 保持纯脱钩语义，绝不弹窗（deactivate/窗口关闭等程序化路径依赖这一点）。
+   */
   async stop(): Promise<void> {
     this.stopRequested = true;
     this.clearHealthWatch(); // 复用外部服务时也要清掉健康探测定时器
     if (this.child) {
       await this.stopOwned();
     } else {
-      // 复用的外来实例（含 Cookie 会话）脱钩：只清内存引用，
-      // 持久化凭据保留（实例仍在运行，其 Cookie 下次启动验证后仍可复用）
-      this.sessionCookie = null;
-      await this.stopProxy(); // 复用外部服务也可能有代理（理论罕见，防泄漏）
-      this.set({ state: 'idle', url: null, embedUrl: null, owned: false, error: null });
+      await this.detachReused();
     }
+  }
+
+  /**
+   * 复用的外来实例（含 Cookie 会话）脱钩：清健康探测/内存引用/代理并回 idle，注销使用者登记。
+   * 持久化凭据（Cookie / owner 记录）保留——实例仍在运行，凭据下次启动验证后仍可复用。
+   * stop() 的非 owned 分支与 stopSharedService() 的强停收尾共用。
+   */
+  private async detachReused(): Promise<void> {
+    await this.unregisterSelf(); // 停止使用：从使用者注册表注销本窗口
+    this.clearHealthWatch();
+    this.sessionCookie = null;
+    await this.stopProxy(); // 复用外部服务也可能有代理（理论罕见，防泄漏）
+    this.set({ state: 'idle', url: null, embedUrl: null, owned: false, error: null });
+  }
+
+  /**
+   * 「停止服务」的共享服务语义（**仅由命令层调用**；deactivate/程序化 stop 仍走 stop()）。
+   * 复用窗口（ready 且 owned=false）点 Stop Service 时先查跨窗口 owner 记录：
+   * - 无记录（终端启动 / 旧版本扩展启动）→ 维持旧行为仅脱钩（'no-record'，调用方提示）；
+   * - 记录存在但 pid 已死 → 清失效记录 + 仅脱钩（'gone'，调用方提示「服务进程已退出」）；
+   * - 记录存活 → 经 deps.askStopReused 弹窗决策：
+   *   cancel=保持连接不动；detach=仅断开本窗口；force-stop（回调内已完成二次确认）=
+   *   先复检 pid 存活（弹窗期间可能已退出）→ SIGTERM→宽限→SIGKILL 单 pid 强停
+   *   （不碰进程组：外部进程组不归本扩展管理）→ 清 owner 记录 → 照常脱钩。
+   *   owner 窗口侧由子进程 exit 监听自动感知（handleUnexpectedExit）并清理自身状态与记录。
+   * 强停失败（EPERM 等）→ 'kill-failed'：本窗口仍脱钩，owner 记录保留（服务可能仍在运行）。
+   */
+  async stopSharedService(): Promise<SharedStopOutcome> {
+    // 防御：与命令层快照竞态（决策期间自启流程意外完成等），有自有子进程按自有停止处理
+    if (this.child) {
+      await this.stopOwned();
+      return 'detach';
+    }
+    const ext = this.deps.externalProcess ?? defaultExternalProcess;
+    const authority = `${this.opts.host}:${this.opts.port}`;
+    const recorded = await this.readSharedOwner();
+    if (recorded === null) {
+      this.deps.log(`[stop] ${authority} 无跨窗口 owner 记录（终端/旧版本扩展启动），无法强停，仅断开本窗口`);
+      await this.detachReused();
+      return 'no-record';
+    }
+    const pid = recorded.pid;
+    if (!ext.isAlive(pid)) {
+      this.deps.log(`[stop] owner 记录进程 pid=${pid} 已不存在（${authority}），清除失效记录并仅断开本窗口`);
+      await this.clearOwnerPidIfMine(pid);
+      await this.detachReused();
+      return 'gone';
+    }
+    const ask = this.deps.askStopReused;
+    if (!ask) {
+      // 未注入决策回调（旧装配/单测兜底）：维持旧行为直接脱钩
+      this.deps.log('[stop] 未注入共享服务停止决策回调（旧装配），仅断开本窗口');
+      await this.detachReused();
+      return 'detach';
+    }
+    this.deps.log(`[stop] ${authority} 上的共享 DSH 服务由另一窗口启动（pid=${pid}），弹出停止方式决策`);
+    const decision = await ask({ host: this.opts.host, port: this.opts.port, authority, pid });
+    if (decision === 'cancel') {
+      this.deps.log(`[stop] 用户取消：保持与 ${authority} 的连接`);
+      return 'cancel';
+    }
+    if (decision === 'detach') {
+      this.deps.log(`[stop] 用户选择仅断开本窗口（${authority} 上的服务继续运行）`);
+      await this.detachReused();
+      return 'detach';
+    }
+    // force-stop：回调内已通过二次确认；执行前复检 pid（弹窗期间进程可能已退出）
+    if (!ext.isAlive(pid)) {
+      this.deps.log(`[stop] 强停前发现 pid=${pid} 已不存在（${authority}，弹窗期间退出），清除记录并仅断开本窗口`);
+      await this.clearOwnerPidIfMine(pid);
+      await this.detachReused();
+      return 'gone';
+    }
+    this.clearHealthWatch(); // 强停期间不让健康探测干扰状态流转
+    this.set({ state: 'stopping' });
+    try {
+      await ext.stop(pid);
+      this.deps.log(`[stop] 已强制终止共享 DSH 服务进程 pid=${pid}（${authority}）`);
+    } catch (err) {
+      this.deps.log(`[stop] 强制终止 pid=${pid} 失败: ${String(err)}`);
+      await this.detachReused();
+      return 'kill-failed';
+    }
+    await this.clearOwnerPidIfMine(pid); // 强停成功清记录（owner 窗口侧的 exit 清理同样会清，幂等）
+    await this.detachReused();
+    return 'force-killed';
+  }
+
+  /**
+   * 窗口退出主路径（extension deactivate 调用；须在进程退出前完成，可异步读写 globalState）。
+   * 与手动 stopServiceCmd 无关——手动停止仍是立即停止语义，只有「窗口退出」走本协议。
+   *
+   * cleanup=true（stopOnExit=true，默认）——「最后一个使用该服务的窗口退出才清理」：
+   * 1. 未注入注册表（旧装配）→ 维持旧行为 stop()（退出即停自启/启动中的进程）；
+   * 2. 注销自己（退出期间 globalState 写入可能被拒——VS Code deactivate 时存储服务
+   *    已关闭，属预期；注册表残留由 prune 的 selfPid 过滤与后续窗口死 pid 过滤自愈）；
+   * 3. pruneDeadUsers 过滤死 pid 后仍有其他存活使用者 → 移交：不杀、置 skipExitKill、
+   *    owner 记录保留（供最后退出者按记录定位 kill）；
+   * 4. 注册表读取失败 → 保守不杀（v0.3.12 语义反转：「不确定」不再等于「杀」——宁留
+   *    孤儿不误杀共享服务；残留由下次 pruneDeadUsers / owner 记录失效清理自愈）；
+   * 5. 自己是最后使用者 → 延迟复查注册表（吸收跨窗口镜像同步延迟）后仍无他人：
+   *    自启子进程走 stopOwned（杀子进程 + 顺带清 owner 记录）；复用的他人服务按跨窗口
+   *    owner 记录定位 kill 后清记录；复查发现他人 → 改判移交。未就绪且无子进程 →
+   *    纯脱钩收尾（绝不触碰他人服务）。
+   *
+   * cleanup=false（stopOnExit=false）——服务留守（供外部/其他窗口继续使用）：
+   * 仅注销自己，不清理、不 kill、不动 owner/其他使用者记录，也不置移交标志
+   * （该语义下 exit 钩子本就不在注册状态）。用户此后改回 true 时按上述协议清理。
+   */
+  async releaseOnExit(cleanup: boolean): Promise<void> {
+    const authority = `${this.opts.host}:${this.opts.port}`;
+    if (!cleanup) {
+      this.persistLog(`[exit] ${authority} stopOnExit=false（服务留守）：仅注销本窗口，不清理`);
+      await this.unregisterSelf();
+      return;
+    }
+    if (!this.deps.usersStore) {
+      // 旧装配：无注册表无法协调 → 维持旧行为（退出即停自启/启动中的进程）
+      this.persistLog(`[exit] ${authority} 未注入使用者注册表（旧装配）：退出清理走旧行为（停本窗口自启/启动中的进程）`);
+      await this.stop();
+      return;
+    }
+    // 退出流程不再允许新的启动动作：中断进行中的启动循环轮询（不杀已 spawn 的子进程，
+    // 去留由注册表判定），避免退出期间崩溃自愈逻辑再 spawn 新进程成孤儿。
+    this.stopRequested = true;
+    // 注销自己（退出 = 停止使用）。写回失败属预期（deactivate 期间存储已关闭）：
+    // 注册表残留由下方 prune 的 selfPid 过滤与后续窗口的死 pid 过滤自愈。
+    await this.unregisterSelf();
+    const others = await this.pruneDeadUsers();
+    if (others === null) {
+      // 注册表读取失败：无法确认是否还有其他使用者 → 保守不杀（v0.3.12 反转旧「不确定即杀」）
+      this.skipExitKill = true;
+      this.persistLog(`[exit] ${authority} 使用者注册表读取失败：保守不清理（宁留孤儿不误杀共享服务），exit 钩子兜底杀已跳过；残留由后续 prune/owner 记录失效清理自愈`);
+      return;
+    }
+    if (others.length > 0) {
+      // 仍有其他窗口在使用该服务：移交——不杀；置标志防 exit 钩子兜底误杀；owner 记录保留
+      this.skipExitKill = true;
+      this.persistLog(`[exit] ${authority} 仍有 ${others.length} 个窗口在使用该服务（pid=${others.join(',')}）：移交，本窗口退出不清理，等待最后使用者退出时清理`);
+      return;
+    }
+    if (this.child) {
+      // 最后使用者 & owner（含未就绪但子进程仍存活的路径——健康失联回 idle、启动/
+      // 等待中、启动超时 failed 等，统一按注册表协调，不再绕过注册表直接 stop 误杀）：
+      // 延迟复查（吸收跨窗口 globalState 镜像同步延迟）再清理自启子进程。
+      const recheck = await this.recheckUsersAfterDelay(authority);
+      if (recheck !== 'alone') return; // 复查见他人 → 移交；读取失败 → 保守不杀（均已置标志并记日志）
+      this.persistLog(`[exit] ${authority} 复查后仍无其他使用者，本窗口（owner）退出清理自启服务进程（pid=${this.child.pid}）`);
+      await this.stopOwned();
+      return;
+    }
+    if (this.snapshot.state === 'ready') {
+      // 复用他人启动的共享服务 + 最后使用者：同样复查后按跨窗口 owner 记录定位清理
+      const recheck = await this.recheckUsersAfterDelay(authority);
+      if (recheck !== 'alone') return;
+      const recorded = await this.readSharedOwner();
+      if (recorded === null) {
+        this.persistLog(`[exit] ${authority} 无其他使用者且无 owner 记录（终端/外部启动的实例），不在此协议内，不做清理`);
+        return;
+      }
+      const ext = this.deps.externalProcess ?? defaultExternalProcess;
+      if (!ext.isAlive(recorded.pid)) {
+        this.persistLog(`[exit] ${authority} owner 记录进程 pid=${recorded.pid} 已不存在，清除失效记录（服务已不在，无需清理）`);
+        await this.clearOwnerPidIfMine(recorded.pid);
+        return;
+      }
+      this.persistLog(`[exit] ${authority} 复查后仍无其他使用者，本窗口（最后使用者）退出，按 owner 记录清理共享服务进程 pid=${recorded.pid}`);
+      try {
+        await ext.stop(recorded.pid);
+      } catch (err) {
+        this.persistLog(`[exit] ${authority} 清理共享服务进程 pid=${recorded.pid} 失败: ${String(err)}（owner 记录保留，服务可能仍在运行）`);
+        return;
+      }
+      await this.clearOwnerPidIfMine(recorded.pid); // 清理成功清记录
+      return;
+    }
+    // 未就绪且无自启子进程（idle/failed/启动失败等）：纯脱钩收尾，不 kill 任何进程
+    this.persistLog(`[exit] ${authority} 本窗口未就绪且无自启子进程（state=${this.snapshot.state}）：仅脱钩收尾，不清理任何进程`);
+    await this.stop();
+  }
+
+  /**
+   * 退出清理前的延迟复查：判定「自己是最后使用者」后，等一个短暂窗口（默认 400ms）
+   * 再读一次使用者注册表——覆盖「其他窗口刚就绪登记、本窗口的 globalState 内存镜像
+   * 尚未收到主进程存储广播」的同步窗口。复查见他人/读取失败都已置 skipExitKill 并记
+   * 持久日志；返回 'alone' 才允许执行 kill。exitRecheckDelayMs≤0 时跳过复查（单测时序）。
+   */
+  private async recheckUsersAfterDelay(authority: string): Promise<'alone' | 'others' | 'unknown'> {
+    const delayMs = this.deps.exitRecheckDelayMs ?? EXIT_RECHECK_DELAY_MS;
+    if (delayMs <= 0) return 'alone';
+    await new Promise((r) => setTimeout(r, delayMs));
+    const others = await this.pruneDeadUsers();
+    if (others === null) {
+      this.skipExitKill = true;
+      this.persistLog(`[exit] ${authority} 复查时使用者注册表读取失败：保守不清理（宁留孤儿不误杀共享服务）`);
+      return 'unknown';
+    }
+    if (others.length > 0) {
+      this.skipExitKill = true;
+      this.persistLog(`[exit] ${authority} 复查发现 ${others.length} 个窗口在使用该服务（pid=${others.join(',')}，首查为镜像同步延迟）：移交，本窗口退出不清理`);
+      return 'others';
+    }
+    return 'alone';
   }
 
   /**
@@ -325,8 +730,9 @@ export class ServiceManager {
     }
   }
 
-  /** 停掉自启子进程并回到 idle */
+  /** 停掉自启子进程并回到 idle（顺带注销使用者登记；restart 先经此注销、就绪再登记） */
   private async stopOwned(): Promise<void> {
+    await this.unregisterSelf(); // 停止使用：从使用者注册表注销本窗口
     this.clearHealthWatch();
     await this.stopProxy(); // 代理随令牌一起销毁
     if (!this.child) {
@@ -343,7 +749,19 @@ export class ServiceManager {
     } catch (err) {
       this.deps.log(`[process] 停止子进程失败: ${String(err)}`);
     }
+    await this.clearOwnerPidIfMine(child.pid); // 自启进程已停：清跨窗口 owner 记录
     this.set({ state: 'idle', url: null, embedUrl: null, owned: false, error: null });
+  }
+
+  /**
+   * 进入就绪（所有就绪路径共用的收尾）：广播 ready 快照 →（自启路径）发布跨窗口 owner pid →
+   * 登记本窗口为服务使用者（注册表）→ 启动健康探测。
+   */
+  private async enterReady(owned: boolean, publishChildPid?: number): Promise<void> {
+    this.set({ state: 'ready', url: this.url(), embedUrl: this.proxy?.url ?? null, owned });
+    if (publishChildPid !== undefined) await this.publishOwnerPid(publishChildPid);
+    await this.registerSelf();
+    this.startHealthWatch();
   }
 
   /**
@@ -370,8 +788,7 @@ export class ServiceManager {
         this.authToken = this.opts.externalToken ?? null; // 复用外部实例：其令牌来自配置
         this.sessionCookie = null; // 令牌复用：会话走令牌交换，不再使用旧 Cookie
         await this.ensureProxy(); // 外部实例同样需要面板嵌入代理（webview 无 Cookie）
-        this.set({ state: 'ready', url: this.url(), embedUrl: this.proxy?.url ?? null, owned: false });
-        this.startHealthWatch(); // 复用外部服务也要周期探测，失联时回 idle
+        await this.enterReady(false); // 复用就绪：登记本窗口为使用者（含健康探测启动）
         return this.getSnapshot();
       }
       if (probe === 'dsh-unauthenticated') {
@@ -474,6 +891,7 @@ export class ServiceManager {
       }
     }
     this.child = child;
+    this.skipExitKill = false; // 新一轮子进程生命周期：清退出移交标志（退出决策重新评估）
     this.childStderr = ''; // 新一轮启动重置 stderr 缓冲（供 --no-open 崩溃识别）
     this.childStdout = ''; // 新一轮启动重置 stdout 缓冲（供访问令牌解析）
     this.authToken = null; // 新进程的令牌未知：先按旧版（无令牌）探测，等到 URL 行后更新
@@ -583,8 +1001,7 @@ export class ServiceManager {
         if (this.stopRequested) return this.getSnapshot();
         if (reuse === 'dsh') {
           this.deps.log('[process] 子进程退出，但端口已有 dsh 服务在运行（残留实例占端口自愈），改为复用');
-          this.set({ state: 'ready', url: this.url(), embedUrl: this.proxy?.url ?? null, owned: false });
-          this.startHealthWatch();
+          await this.enterReady(false); // 复用就绪：登记本窗口为使用者
           return this.getSnapshot();
         }
         if (reuse === 'dsh-unauthenticated') {
@@ -622,8 +1039,8 @@ export class ServiceManager {
       if (result === 'dsh') {
         // 就绪前先确保面板嵌入代理就绪（新版 dsh 需代理注入会话 Cookie；失败则回退直连并记日志）
         await this.ensureProxy();
-        this.set({ state: 'ready', url: this.url(), embedUrl: this.proxy?.url ?? null, owned: true });
-        this.startHealthWatch();
+        // 进入就绪并发布跨窗口 owner pid（供复用窗口识别归属/强停）+ 登记本窗口为使用者
+        await this.enterReady(true, child.pid);
         return this.getSnapshot();
       }
       // 'foreign' 表示子进程没能绑定端口（被占）——继续等待会让用户困惑，
@@ -676,8 +1093,7 @@ export class ServiceManager {
     this.sessionCookie = cookie;
     this.authToken = null; // 无令牌复用：健康探测/代理均走 Cookie 会话
     await this.ensureProxy();
-    this.set({ state: 'ready', url: this.url(), embedUrl: this.proxy?.url ?? null, owned: false });
-    this.startHealthWatch();
+    await this.enterReady(false); // 复用就绪：登记本窗口为使用者
     return true;
   }
 
@@ -734,8 +1150,7 @@ export class ServiceManager {
           this.authToken = decision.token; // 复用外来实例：令牌来自用户输入（已验证有效）
           this.sessionCookie = null; // 令牌复用：会话走令牌交换
           await this.ensureProxy();
-          this.set({ state: 'ready', url: this.url(), embedUrl: this.proxy?.url ?? null, owned: false });
-          this.startHealthWatch();
+          await this.enterReady(false); // 复用就绪：登记本窗口为使用者
           this.deps.log(`[process] 以用户提供的令牌复用 ${this.opts.host}:${this.opts.port} 上已有的 dsh 实例`);
           // 持久化 dsh.externalToken（尽力而为：失败仅记日志，不影响本次会话）
           try {
@@ -777,6 +1192,144 @@ export class ServiceManager {
     }
   }
 
+  // —— 跨窗口 owner 记录（共享服务归属）：owner 窗口在自启子进程就绪时写 pid，
+  //    复用窗口点 Stop Service 时据此识别归属；所有清理都按「记录的 pid 与本窗口子进程一致」
+  //    才执行（clear-if-mine），避免多窗口冷启动竞态下误删他窗口的记录 ——
+
+  /** 记录自启子进程 pid（就绪时；未注入存储则跳过；pid 未知时记日志） */
+  private async publishOwnerPid(pid: number | undefined): Promise<void> {
+    const store = this.deps.ownerStore;
+    if (!store) return;
+    if (pid === undefined) {
+      this.deps.log(`[owner] 自启子进程 pid 未知，跳过跨窗口 owner 记录（${this.opts.host}:${this.opts.port}）`);
+      return;
+    }
+    try {
+      await store.save(this.opts.host, this.opts.port, pid);
+      this.deps.log(`[owner] 已记录自启进程 pid=${pid}（${this.opts.host}:${this.opts.port}）`);
+    } catch (err) {
+      this.deps.log(`[owner] 记录自启进程 pid 失败: ${String(err)}`);
+    }
+  }
+
+  /** 清理 owner 记录（仅当存储中记录的 pid 与给定 pid 一致，防误删他窗口的记录） */
+  private async clearOwnerPidIfMine(pid: number | undefined): Promise<void> {
+    const store = this.deps.ownerStore;
+    if (!store || pid === undefined) return;
+    try {
+      const stored = await store.load(this.opts.host, this.opts.port);
+      if (stored === pid) {
+        await store.clear(this.opts.host, this.opts.port);
+        this.deps.log(`[owner] 已清除跨窗口 owner 记录（pid=${pid}，${this.opts.host}:${this.opts.port}）`);
+      }
+    } catch (err) {
+      this.deps.log(`[owner] 清除跨窗口 owner 记录失败: ${String(err)}`);
+    }
+  }
+
+  /** 读取本 host:port 的 owner 记录（未注入存储/读取失败视为无记录） */
+  private async readSharedOwner(): Promise<{ pid: number } | null> {
+    const store = this.deps.ownerStore;
+    if (!store) return null;
+    try {
+      const pid = await store.load(this.opts.host, this.opts.port);
+      return pid === null || pid === undefined ? null : { pid };
+    } catch (err) {
+      this.deps.log(`[owner] 读取跨窗口 owner 记录失败: ${String(err)}`);
+      return null;
+    }
+  }
+
+  // —— 使用者注册表（「最后一个使用者退出才清理」协议）：窗口进入 ready（连接服务）时登记
+  //    本窗口扩展宿主 pid，停止使用（stop/脱钩/失联/退出）时注销；退出清理据此判定是否还有
+  //    其他窗口在使用该服务。所有读写都 try/catch 记日志，绝不抛出（注册表只是协调手段，
+  //    存取失败仅降级为旧行为，不得中断启动/停止流程）——
+
+  /** 登记本窗口为服务使用者（进入 ready 时；未注入存储则跳过；重复登记去重） */
+  private async registerSelf(): Promise<void> {
+    const store = this.deps.usersStore;
+    if (!store) return;
+    const selfPid = this.deps.selfPid ?? process.pid;
+    const authority = `${this.opts.host}:${this.opts.port}`;
+    try {
+      const record = await store.load(this.opts.host, this.opts.port);
+      const list = Array.isArray(record?.extPids) ? record.extPids : [];
+      if (list.includes(selfPid)) return; // 已登记（幂等）：不重复写
+      const next = [...list, selfPid];
+      await store.save(this.opts.host, this.opts.port, { extPids: next });
+      this.sharedUseSignaled = true; // F5：本会话已成为注册表参与者（共享使用迹象）
+      this.persistLog(`[users] ${authority} 本窗口登记为服务使用者（pid=${selfPid}，现存 ${next.length} 个窗口）`);
+    } catch (err) {
+      this.persistLog(`[users] ${authority} 登记服务使用者失败（pid=${selfPid}）: ${String(err)}`);
+    }
+  }
+
+  /** 注销本窗口（停止使用/退出时；未登记过则不动注册表；清空后删除键） */
+  private async unregisterSelf(): Promise<void> {
+    const store = this.deps.usersStore;
+    if (!store) return;
+    const selfPid = this.deps.selfPid ?? process.pid;
+    const authority = `${this.opts.host}:${this.opts.port}`;
+    try {
+      const record = await store.load(this.opts.host, this.opts.port);
+      const list = Array.isArray(record?.extPids) ? record.extPids : [];
+      if (!list.includes(selfPid)) return; // 未登记过（或已注销）：不动注册表
+      const next = list.filter((pid) => pid !== selfPid);
+      if (next.length === 0) {
+        await store.clear(this.opts.host, this.opts.port);
+      } else {
+        await store.save(this.opts.host, this.opts.port, { extPids: next });
+      }
+      this.persistLog(`[users] ${authority} 本窗口注销服务使用者（pid=${selfPid}${next.length > 0 ? `，剩余 ${next.length} 个窗口` : '，无剩余使用者'}）`);
+    } catch (err) {
+      // 窗口退出（deactivate）期间 globalState 写入会被拒（存储服务已关闭）：属预期，
+      // 残留由 pruneDeadUsers 的 selfPid 过滤与后续窗口的死 pid 过滤自愈。
+      this.persistLog(`[users] ${authority} 注销服务使用者失败（pid=${selfPid}）: ${String(err)}（退出期间存储已关闭属预期，残留由死 pid 过滤自愈）`);
+    }
+  }
+
+  /**
+   * 过滤注册表中的失效条目：本窗口自己的残留（注销写回失败等）+ 已死的窗口 pid
+   * （崩溃/强杀残留——deactivate 与 exit 钩子都没跑），顺带回写清理。
+   * 返回仍存活的「其他窗口」pid 列表（自己不算：退出中的本窗口无论注册表写入成败都不计数）。
+   * 读取失败返回 null（调用方按无法确认处理）；**写回清理失败不影响判定结果**——
+   * 退出期间 globalState 写入会被拒（VS Code deactivate 时存储服务已关闭），若把写回
+   * 失败并入读取失败返回 null，owner 窗口退出会降级 stop() 误杀其他窗口正在使用的
+   * 共享服务（v0.3.11 线上根因：注销/过滤写回双双被拒 → prune 返回 null → 误杀）。
+   * 残留条目由后续窗口的 prune 死 pid 过滤自愈。
+   */
+  private async pruneDeadUsers(): Promise<number[] | null> {
+    const store = this.deps.usersStore;
+    if (!store) return [];
+    const selfPid = this.deps.selfPid ?? process.pid;
+    const authority = `${this.opts.host}:${this.opts.port}`;
+    const ext = this.deps.externalProcess ?? defaultExternalProcess;
+    let list: number[];
+    try {
+      const record = await store.load(this.opts.host, this.opts.port);
+      list = Array.isArray(record?.extPids) ? record.extPids : [];
+    } catch (err) {
+      this.persistLog(`[users] ${authority} 使用者注册表读取失败: ${String(err)}`);
+      return null;
+    }
+    const kept = list.filter((pid) => pid !== selfPid && ext.isAlive(pid));
+    if (kept.length > 0) this.sharedUseSignaled = true; // F5：本会话曾见过其他存活使用者
+    if (kept.length !== list.length) {
+      // 写回清理尽力而为：失败不影响力判定（仍返回 kept）
+      try {
+        if (kept.length === 0) {
+          await store.clear(this.opts.host, this.opts.port);
+        } else {
+          await store.save(this.opts.host, this.opts.port, { extPids: kept });
+        }
+        this.persistLog(`[users] ${authority} 过滤 ${list.length - kept.length} 个失效使用者条目（崩溃/强杀/退出残留，剩余 ${kept.length} 个窗口）`);
+      } catch (err) {
+        this.persistLog(`[users] ${authority} 失效条目写回清理失败: ${String(err)}（不影响力判定；退出期间存储已关闭属预期，残留由后续死 pid 过滤自愈）`);
+      }
+    }
+    return kept;
+  }
+
   /** 就绪状态下子进程意外退出：回到 idle（面板据此显示"已断开"） */
   private handleUnexpectedExit(child: ChildProcessLike): void {
     if (this.child !== child) return; // 已被 stopOwned 接管或已替换
@@ -784,7 +1337,9 @@ export class ServiceManager {
     this.authToken = null; // 子进程退出，其访问令牌随之失效
     this.sessionCookie = null; // 防御性清空（自启实例不走 Cookie 会话）
     void this.stopProxy(); // 代理随令牌一起销毁
+    void this.clearOwnerPidIfMine(child.pid); // 子进程意外退出（含被其他窗口强停）：清跨窗口 owner 记录
     if (this.snapshot.state === 'ready') {
+      void this.unregisterSelf(); // 服务已死：本窗口不再使用，注销使用者登记
       this.clearHealthWatch();
       this.set({ state: 'idle', url: null, embedUrl: null, owned: false, error: null });
     }
@@ -806,6 +1361,7 @@ export class ServiceManager {
         if (result !== 'dsh' && this.snapshot.state === 'ready') {
           this.clearHealthWatch(); // 已回 idle，定时器自清理，不空转
           void this.stopProxy(); // 服务失联：代理一并销毁
+          void this.unregisterSelf(); // 服务失联：本窗口停止使用，注销使用者登记
           // 复用外来实例（Cookie 会话）失效：同步清除持久化 Cookie，
           // 避免下次启动再拿失效凭据探测（持久化凭据只在验证有效时保留）
           if (!this.child && this.sessionCookie !== null) {
@@ -936,7 +1492,10 @@ export class ServiceManager {
   }
 
   /** 清理：移除钩子与监听器（不杀子进程，停止由 stop() 决定）；
-   * 仍有活跃子进程时保留父进程退出钩子，防止启动流程中被 dispose 后成孤儿 */
+   * 仍有活跃子进程时保留父进程退出钩子，防止启动流程中被 dispose 后成孤儿。
+   * 证实无杀伤路径：dispose 只清健康定时器/嵌入代理/监听器与（无子进程时的）exit
+   * 钩子，绝不调用 stop/kill——移交场景（child 存活 + skipExitKill=true）deactivate
+   * 尾部调用本方法后，子进程由保留的 exit 钩子按 skipExitKill/sharedUseSignaled 决策。 */
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;

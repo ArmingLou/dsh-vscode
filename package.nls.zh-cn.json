@@ -1,10 +1,7 @@
 {
   "dsh.container.title": "DSH",
   "dsh.view.panel.name": "DSH 面板",
-  "dsh.view.panelSecondary.name": "DSH 面板（右）",
   "dsh.cmd.openPanel.title": "DSH: 打开面板",
-  "dsh.cmd.openSecondary.title": "DSH: 在辅助侧边栏打开",
-  "dsh.cmd.openFromTitle.title": "DSH：打开右侧面板",
   "dsh.cmd.openExternal.title": "在浏览器中打开",
   "dsh.cmd.restart.title": "重启服务",
   "dsh.cmd.disconnect.title": "断开面板连接",
@@ -31,6 +28,6 @@
   "dsh.walkthrough.title": "DSH 入门",
   "dsh.walkthrough.description": "在 VS Code 内直接使用 DeepSeek Harness 网页界面。",
   "dsh.walkthrough.step.title": "打开 DSH 面板",
-  "dsh.walkthrough.step.description": "点击左侧活动栏或右侧辅助侧边栏的 DSH 图标，或运行 [DSH: 打开面板](command:dsh.openPanel)。面板会自动启动（或复用）dsh web 服务，并在侧边栏内嵌显示 DSH 网页。",
+  "dsh.walkthrough.step.description": "点击左侧活动栏的 DSH 图标，或运行 [DSH: 打开面板](command:dsh.openPanel)。面板会自动启动（或复用）dsh web 服务，并在侧边栏内嵌显示 DSH 网页。",
   "dsh.cmd.copyLogs.title": "DSH: 复制日志"
 }

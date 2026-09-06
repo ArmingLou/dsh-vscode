@@ -477,6 +477,55 @@ export function resolveWindowsNodeExecutable(
   );
 }
 
+/**
+ * 0 号信号存活探测：判断 pid 是否仍有对应进程。
+ * - kill 成功 → 存活；
+ * - ESRCH → 进程不存在；
+ * - EPERM → 进程存在但无权向其发信号（按存活处理——进程在，只是本扩展杀不动它）；
+ * - 其余异常（如平台限制）保守按存活处理（宁可无法强停，也不误报「已退出」）。
+ * pid 非法（非正整数）直接 false。
+ */
+export function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+/**
+ * 停止一个外部进程（非本扩展 spawn，如另一窗口自启的 dsh web）：SIGTERM → 宽限 → SIGKILL，
+ * 随后短暂等待内核回收端口（与 stopChild 相同的收尾节奏）。
+ *
+ * 与 stopChild 的差异：**只杀单个 pid，绝不 kill(-pid) 进程组**——外部进程组不归本扩展
+ * 管理，组信号可能波及无关进程组（且当 pid 不是组首时 -pid 会指向别的组）。
+ * 进程已不存在时 SIGTERM 抛 ESRCH → 视为成功幂等返回；SIGKILL 阶段抛错（进程已在
+ * SIGTERM 后退出）同样忽略。EPERM 等真实失败向上抛出，由调用方提示用户。
+ *
+ * 平台差异：Windows 上 process.kill 仅支持有限的信号集，SIGTERM/SIGKILL 均为强制终止
+ * 语义（与 stopChild 的处理一致），故无需平台分支；探测阶段的 kill(pid, 0) 两平台通用。
+ *
+ * @param pid     目标进程 pid
+ * @param graceMs SIGTERM 到 SIGKILL 的宽限期（默认 3000，与 stopChild 一致）
+ */
+export async function stopExternalProcess(pid: number, graceMs = 3000): Promise<void> {
+  try {
+    process.kill(pid, 'SIGTERM');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ESRCH') return; // 已退出：视为成功
+    throw err; // EPERM 等：真实失败，向上抛
+  }
+  if (graceMs > 0) await new Promise((resolve) => setTimeout(resolve, graceMs));
+  try {
+    process.kill(pid, 'SIGKILL');
+  } catch {
+    /* SIGTERM 已生效（进程已退出），忽略 */
+  }
+  await new Promise((resolve) => setTimeout(resolve, 200));
+}
+
 /** 进程管理接口 */
 export interface ProcessRunner {
   /** 启动 dsh web 子进程（命令名按平台选择） */

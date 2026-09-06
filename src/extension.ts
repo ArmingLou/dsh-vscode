@@ -7,7 +7,7 @@ import { initI18n, t } from './i18n';
 import { readConfig, normalizeExternalToken, type DshConfig } from './config';
 import { probeService } from './service/detect';
 import { createProcessRunner, findInPath, resolveLoginShellPath, mergePath, findInPathPosix, scanCommonDshLocations, defaultExecSync, type ResolveResult } from './service/process';
-import { ServiceManager, type ManagerOptions, type SessionCookieStore } from './service/manager';
+import { ServiceManager, type ManagerOptions, type SessionCookieStore, type OwnerPidStore, type UsersStore, type UsersRecord } from './service/manager';
 import { DshPanelProvider } from './panel/provider';
 import { StatusBarController } from './statusbar';
 import { resolveWorkspaceRoot } from './workspaceRoot';
@@ -24,7 +24,7 @@ import { evaluateBridgeStatus, bridgeWarningText } from './bridge/status';
 
 let manager: ServiceManager | null = null;
 let output: vscode.OutputChannel | null = null;
-/** 当前展示用本地可达 URL 的来源（读主面板解析结果；远程=隧道 URL，本地=null 回退原地址） */
+/** 当前展示用本地可达 URL 的来源（读面板解析结果；远程=隧道 URL，本地=null 回退原地址） */
 let getDisplayUrl: (() => string | null) | null = null;
 
 /** 日志缓冲（供「复制日志」命令 dsh.copyLogs 使用；上限行数防内存膨胀） */
@@ -182,7 +182,7 @@ export function activate(context: vscode.ExtensionContext): void {
   appendLog(`工作区: ${vscode.workspace.workspaceFolders?.map((f) => f.uri.fsPath).join(', ') || '(无)'}`);
   appendLog('=============================');
 
-  // —— 桥接状态（单一状态，两个面板共享，避免多个面板重复触发定时器）——
+  // —— 桥接状态（扩展级单一状态：握手/评估只跑一套，面板只负责展示与回执转发）——
   // install：桥接安装结果；桥接禁用时为 null（不安装、不评估、不弹警告）。
   // handshakeOk：握手回执（onBridgeAck 写入）；undefined=尚未握手，true/false=握手成败。
   let install: BridgeInstallResult | null = null;
@@ -245,19 +245,19 @@ export function activate(context: vscode.ExtensionContext): void {
         if (handshakeRetries < 1) {
           handshakeRetries += 1;
           appendLog('[bridge] handshake timeout，重载面板重试一次（冷启动首屏可能未完成）');
-          refreshPanels(); // 重渲染 = iframe 重载：DSH 页面重新引导并再次握手
+          refreshPanel(); // 重渲染 = iframe 重载：DSH 页面重新引导并再次握手
           startHandshakeTimeout();
           return;
         }
         appendLog('[bridge] handshake timeout');
         handshakeOk = false;
-        setBridgeTroubleAll(true); // 点亮页面内「加载异常」提示条（提供手动重试入口，不再无声白屏）
+        setBridgeTrouble(true); // 点亮页面内「加载异常」提示条（提供手动重试入口，不再无声白屏）
         evaluateAndWarn(); // 握手刚失败，立即评估（不必再等固定延迟）
       }
     }, HANDSHAKE_TIMEOUT_MS);
   }
 
-  /** 握手回执回调（两个面板共享）：记录结果、取消超时、同步提示条（握手已发生，无论成败） */
+  /** 握手回执回调（面板注入）：记录结果、取消超时、同步提示条（握手已发生，无论成败） */
   function onBridgeAck(ok: boolean, version?: string): void {
     // 日志带桥接版本：页面里跑的是哪个版本的桥接代码一目了然（排查“装了新版还在跑旧行为”用）
     appendLog(`[bridge] handshake ${ok ? 'ok' : 'failed'}${version ? ` (bridge v${version})` : ''}`);
@@ -265,26 +265,24 @@ export function activate(context: vscode.ExtensionContext): void {
     handshakeRetries = 0; // 新握手周期重置自动重载计数
     clearHandshakeTimer();
     if (ok) {
-      setBridgeTroubleAll(false); // 握手成功：隐藏「加载异常」提示条（页面已正常工作）
+      setBridgeTrouble(false); // 握手成功：隐藏「加载异常」提示条（页面已正常工作）
     } else {
-      setBridgeTroubleAll(true); // 页面已加载但桥接失败：点亮提示条供「重试安装桥接」
+      setBridgeTrouble(true); // 页面已加载但桥接失败：点亮提示条供「重试安装桥接」
       evaluateAndWarn();
     }
   }
 
-  /** 重渲染两个面板（iframe 重载；供握手超时自动重试与外部调用） */
-  function refreshPanels(): void {
-    panelPrimary?.refresh();
-    panelSecondary?.refresh();
+  /** 重渲染面板（iframe 重载；供握手超时自动重试与外部调用） */
+  function refreshPanel(): void {
+    panel?.refresh();
   }
 
-  /** 同步两个面板的「页面加载异常」提示条显隐（纯 postMessage，不重载 iframe） */
-  function setBridgeTroubleAll(trouble: boolean): void {
-    panelPrimary?.setTrouble(trouble);
-    panelSecondary?.setTrouble(trouble);
+  /** 同步面板的「页面加载异常」提示条显隐（纯 postMessage，不重载 iframe） */
+  function setBridgeTrouble(trouble: boolean): void {
+    panel?.setTrouble(trouble);
   }
 
-  /** 任一面板首次打开：标记已打开并尝试启动握手超时（幂等，不重复建定时器） */
+  /** 面板首次打开：标记已打开并尝试启动握手超时（幂等，不重复建定时器） */
   function onPanelFirstOpen(): void {
     panelOpened = true;
     startHandshakeTimeout();
@@ -335,7 +333,7 @@ export function activate(context: vscode.ExtensionContext): void {
       handshakeOk = undefined;
       handshakeRetries = 0;
       clearHandshakeTimer();
-      setBridgeTroubleAll(false); // 重试期间隐藏「加载异常」提示条（iframe 即将重载重握手）
+      setBridgeTrouble(false); // 重试期间隐藏「加载异常」提示条（iframe 即将重载重握手）
       // 清警告静默（globalState 标志），允许后续再次弹出降级警告
       await context.globalState.update(BRIDGE_SILENCE_KEY, false);
       warningShown = false;
@@ -378,6 +376,42 @@ export function activate(context: vscode.ExtensionContext): void {
     },
   };
 
+  /** globalState 键：自启 dsh 子进程 pid 的跨窗口记录（键形仿 cookie 的 dsh.proxyCookie@host:port） */
+  const ownerPidKey = (host: string, port: number): string => `dsh.ownerPid@${host}:${port}`;
+  /**
+   * 跨窗口 owner 记录存取（用户级 globalState 共享）：owner 窗口在自启子进程就绪时写入 pid；
+   * 复用窗口点 Stop Service 时读取并校验 pid 存活，据此决定是否提供「强制停止共享服务」。
+   * 记录随进程停止/意外退出清理；owner 窗口崩溃残留由消费方按 pid 存活校验兜底（读前先验活）。
+   */
+  const ownerStore: OwnerPidStore = {
+    load: (host, port) => context.globalState.get<number>(ownerPidKey(host, port)) ?? null,
+    save: async (host, port, pid) => {
+      await context.globalState.update(ownerPidKey(host, port), pid);
+    },
+    clear: async (host, port) => {
+      await context.globalState.update(ownerPidKey(host, port), undefined);
+    },
+  };
+
+  /** globalState 键：使用中窗口注册表（键形仿 dsh.ownerPid@host:port） */
+  const usersKey = (host: string, port: number): string => `dsh.users@${host}:${port}`;
+  /**
+   * 使用中窗口（扩展宿主 pid）注册表存取（用户级 globalState 共享）：
+   * 窗口在 manager 进入 ready（连接服务，含自启就绪与复用就绪）时登记、停止使用/退出时注销；
+   * 窗口退出清理（releaseOnExit）据此判定是否「最后一个使用者」——最后使用者退出才自动清理
+   * 服务进程（复用 dsh.stopOnExit 语义：true=最后使用者退出才清理；false=永不自动清理）。
+   * 本窗口 pid 由 manager 侧取 process.pid（=本窗口扩展宿主进程），此处只管存储。
+   */
+  const usersStore: UsersStore = {
+    load: (host, port) => context.globalState.get<UsersRecord>(usersKey(host, port)) ?? null,
+    save: async (host, port, record) => {
+      await context.globalState.update(usersKey(host, port), record);
+    },
+    clear: async (host, port) => {
+      await context.globalState.update(usersKey(host, port), undefined);
+    },
+  };
+
   /**
    * 探测出口：接入 detect 级诊断日志（非 dsh 判定时记录 HTTP 状态码/响应体片段/错误信息，
    * 定位真实环境中的探测分类偏差——如 401 认证提示文案变化、代理劫持导致的 down）。
@@ -394,6 +428,46 @@ export function activate(context: vscode.ExtensionContext): void {
       void vscode.window.showInformationMessage(t('msg.portFallback', { port: requested, fallback }));
     },
     cookieStore,
+    ownerStore,
+    usersStore,
+    // 复用窗口「停止服务」遇到「另一窗口启动的共享服务」时的决策对话框（modal 三选一，
+    // 强停前再弹一次红色二次确认；仅 dsh.stop 命令路径会触发，deactivate 的 stop() 绝不弹窗）
+    askStopReused: async (info) => {
+      const authority = info.authority;
+      const detachOnly = t('stop.detachOnly');
+      const forceStop = t('stop.forceStop');
+      const cancel = t('stop.cancel');
+      appendLog(`[stop] ${authority} 上的共享 DSH 服务由另一窗口启动（pid=${info.pid}），弹出停止方式选择`);
+      const choice = await vscode.window.showWarningMessage(
+        t('stop.sharedPrompt', { authority }),
+        { modal: true },
+        detachOnly,
+        forceStop,
+        cancel,
+      );
+      if (choice === forceStop) {
+        // 强停影响所有使用者：二次红色确认后才真正执行（ESC/关闭弹窗按取消处理）
+        const confirmStop = t('stop.confirmStop');
+        const confirmed = await vscode.window.showWarningMessage(
+          t('stop.forceConfirm'),
+          { modal: true },
+          confirmStop,
+          cancel,
+        );
+        if (confirmed === confirmStop) {
+          appendLog(`[stop] 用户二次确认：强制停止共享 DSH 服务（pid=${info.pid}）`);
+          return 'force-stop';
+        }
+        appendLog('[stop] 强停二次确认被取消：保持当前连接');
+        return 'cancel';
+      }
+      if (choice === detachOnly) {
+        appendLog('[stop] 用户选择仅断开本窗口连接');
+        return 'detach';
+      }
+      appendLog('[stop] 用户取消停止操作：保持当前连接');
+      return 'cancel';
+    },
     // 端口冲突强制三选一（dsh-unauthenticated 且 Cookie 复用落空时）：
     // modal 弹窗，ESC/关闭立即重弹直到用户明确选择；等待期间不落任何回退。
     askPortConflict: async (info) => {
@@ -472,27 +546,10 @@ export function activate(context: vscode.ExtensionContext): void {
     asExternalUri: async (uri) => await vscode.env.asExternalUri(vscode.Uri.parse(uri.toString())),
   });
 
-  // 左右两侧各一个 provider 实例，共享同一 manager（服务状态一致）
-  const panelPrimary = new DshPanelProvider(
+  // 唯一面板（左侧活动栏视图 dsh.panel）的 provider；与 manager 一一对应（服务状态一致）
+  const panel = new DshPanelProvider(
     manager,
-    () => {
-      void showSecondaryGuideOnce(context); // 首次打开面板弹一次入口引导
-      onPanelFirstOpen(); // 面板打开：标记并尝试启动握手超时
-    },
-    onBridgeAck, // onBridgeAck：桥接握手回执 → handshakeOk（Task 7 状态评估）
-    workspaceRootGetter, // workspaceRoot：文件相对路径解析的兜底基准
-    bridgeEnabledGetter, // bridgeEnabled：dsh.bridge.enabled 驱动握手脚本注入
-    remoteEnabledGetter, // remoteEnabled：dsh.remote.enabled 驱动远程隧道（开启后才接线）
-    resolveExternalUrl, // resolveExternalUrl：远程窗口的 URL 隧道解析
-    imageFallbackGetter, // imageFallback：dsh.image.fallback 驱动图片降级
-    shortcutsGetter, // shortcuts：dsh.bridge.shortcuts 驱动 iframe 内快捷键转发
-    () => {
-      void retryBridge(); // 「重新加载异常提示条」的「重试安装桥接」按钮 → 重装桥接并重启服务
-    },
-  );
-  const panelSecondary = new DshPanelProvider(
-    manager,
-    onPanelFirstOpen, // 辅助侧边栏首次打开同样触发握手超时
+    onPanelFirstOpen, // 面板首次打开：标记并尝试启动握手超时
     onBridgeAck,
     workspaceRootGetter,
     bridgeEnabledGetter,
@@ -501,39 +558,54 @@ export function activate(context: vscode.ExtensionContext): void {
     imageFallbackGetter,
     shortcutsGetter,
     () => {
-      void retryBridge();
+      void retryBridge(); // 「重新加载异常提示条」的「重试安装桥接」按钮 → 重装桥接并重启服务
     },
   );
-  // 复制网址命令读取主面板的展示 URL（远程=隧道本地 URL）
-  getDisplayUrl = () => panelPrimary.getDisplayUrl();
+  // 复制网址命令读取面板的展示 URL（远程=隧道本地 URL）
+  getDisplayUrl = () => panel.getDisplayUrl();
   new StatusBarController(manager);
 
   /**
-   * 「断开面板连接」路由：取「用户正看着的面板」。view/title 工具栏菜单命令触发时
-   * 不带视图/provider 参数，故由各 provider 自行跟踪可见性与最近激活时刻：
-   * 可见面板唯一 → 直接命中；两个都可见（主/辅助侧边栏同时展开）→ 取最近激活者；
-   * 都不可见（命令面板触发等）→ 返回 null（命令无操作，绝不双断）。
+   * 「断开面板连接」命令（dsh.disconnect）：唯一面板直接命中，无需多面板路由。
+   * 面板未在显示（命令面板触发等）时不操作——沿用旧语义：面板隐藏时绝不误断。
+   * 单面板语义：断开面板（粘性占位页 + 销毁 iframe）后，本窗口已无任何面板在嵌入
+   * 「窗口共享嵌入代理」→ 无条件停掉代理（disconnectEmbed 幂等，代理未启用时为 no-op；
+   * 后端进程、子进程所有权、退出钩子、健康探测一律不受影响）。
    */
-  function activePanelProvider(): DshPanelProvider | null {
-    const candidates = [panelPrimary, panelSecondary].filter((p) => p.isViewVisible());
-    if (candidates.length === 0) return null;
-    candidates.sort((a, b) => b.lastVisibleAtMs() - a.lastVisibleAtMs());
-    return candidates[0];
+  function disconnectPanelCmd(): void {
+    if (!panel.isViewVisible()) return; // 面板未在显示：命令无操作
+    if (!panel.disconnectPanel()) return; // 已断开 / 远程未启用窗口：无操作
+    void manager?.disconnectEmbed();
   }
 
   /**
-   * 「断开面板连接」命令（dsh.disconnect）：断开目标面板（粘性占位页 + 销毁其 iframe）。
-   * 窗口共享的嵌入代理只有在**没有其他面板仍在嵌入**时才停掉——后端进程（无论 owned 与否）、
-   * 子进程所有权、退出钩子、健康探测一律不受影响；其他窗口的代理与后端复用互不相干。
+   * 「停止服务」命令（dsh.stop，面板标题栏 Stop Service）：
+   * - 自有服务（owned）或服务未就绪 → 直接 manager.stop()（原有语义，无弹窗）；
+   * - 复用他窗口的共享服务（ready 且 owned=false）→ manager.stopSharedService()：
+   *   有存活 owner 记录 → 弹「仅断开本窗口连接 / 强制停止服务 / 取消」+ 强停二次确认
+   *   （对话框在注入的 askStopReused 回调内，见上）；无记录 / 记录失效 → 提示后仅脱钩。
+   * 程序化停止（deactivate/窗口关闭）仍走 manager.stop() 纯脱钩路径，绝不弹窗。
    */
-  function disconnectPanelCmd(): void {
-    const target = activePanelProvider();
-    if (!target) return;
-    if (!target.disconnectPanel()) return; // 已断开 / 远程未启用窗口：无操作
-    const other = target === panelPrimary ? panelSecondary : panelPrimary;
-    if (!other.isUsingEmbedProxy()) {
-      void manager?.disconnectEmbed();
-    }
+  function stopServiceCmd(): void {
+    const m = manager;
+    if (!m) return;
+    void (async () => {
+      const s = m.getSnapshot();
+      if (s.owned || s.state !== 'ready') {
+        await m.stop();
+        return;
+      }
+      const outcome = await m.stopSharedService();
+      const authority = `${m.getTarget().host}:${m.getTarget().port}`;
+      if (outcome === 'no-record') {
+        void vscode.window.showInformationMessage(t('stop.noOwnerRecord', { authority }));
+      } else if (outcome === 'gone') {
+        void vscode.window.showInformationMessage(t('stop.ownerDead'));
+      } else if (outcome === 'kill-failed') {
+        void vscode.window.showWarningMessage(t('stop.killFailed', { authority }));
+      }
+      // cancel / detach / force-killed：对话框/面板状态已表达结果，不再追加通知
+    })();
   }
 
   // 服务就绪后启动握手超时（若面板已打开）
@@ -545,18 +617,13 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     // 第三参数：隐藏面板时保留 webview（iframe 不销毁、DSH 页面会话不丢）
-    vscode.window.registerWebviewViewProvider('dsh.panel', panelPrimary, {
-      webviewOptions: { retainContextWhenHidden: true },
-    }),
-    vscode.window.registerWebviewViewProvider('dsh.panel.secondary', panelSecondary, {
+    vscode.window.registerWebviewViewProvider('dsh.panel', panel, {
       webviewOptions: { retainContextWhenHidden: true },
     }),
     vscode.commands.registerCommand('dsh.openPanel', () => openPanel()),
-    vscode.commands.registerCommand('dsh.openSecondary', () => openSecondary(context)),
-    vscode.commands.registerCommand('dsh.openFromTitle', () => openSecondary(context)),
     vscode.commands.registerCommand('dsh.openExternal', () => openExternal()),
     vscode.commands.registerCommand('dsh.restart', () => void manager?.restart()),
-    vscode.commands.registerCommand('dsh.stop', () => void manager?.stop()),
+    vscode.commands.registerCommand('dsh.stop', () => stopServiceCmd()),
     vscode.commands.registerCommand('dsh.disconnect', () => disconnectPanelCmd()),
     vscode.commands.registerCommand('dsh.copyUrl', () => copyUrl()),
     vscode.commands.registerCommand('dsh.showLogs', () => output?.show()),
@@ -567,12 +634,11 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('dsh')) {
         onConfigChanged();
-        // 快捷键映射变化：重渲染两个面板 → 握手脚本把新映射带给 iframe（iframe 随重渲染重载并重新握手）
+        // 快捷键映射变化：重渲染面板 → 握手脚本把新映射带给 iframe（iframe 随重渲染重载并重新握手）
         const { config } = readConfig();
         if (JSON.stringify(config.shortcuts) !== JSON.stringify(lastShortcuts)) {
           lastShortcuts = config.shortcuts;
-          panelPrimary.refresh();
-          panelSecondary.refresh();
+          panel.refresh();
         }
       }
     }),
@@ -590,7 +656,7 @@ export function activate(context: vscode.ExtensionContext): void {
   }
 }
 
-/** 打开面板：聚焦视图（VS Code 自动打开视图所在的侧边栏，左/右皆可） */
+/** 打开 DSH 面板：聚焦视图（VS Code 自动打开视图所在的左侧活动栏侧边栏） */
 async function openPanel(): Promise<void> {
   await vscode.commands.executeCommand('dsh.panel.focus');
 }
@@ -624,32 +690,6 @@ async function copyLogs(): Promise<void> {
   void vscode.window.showInformationMessage(t('msg.logsCopied'));
 }
 
-/** 一次性引导：告知 DSH 面板可通过左侧活动栏与右侧辅助侧边栏的图标打开 */
-async function showSecondaryGuideOnce(context: vscode.ExtensionContext): Promise<void> {
-  const KEY = 'dsh.secondaryGuideShown';
-  if (context.globalState.get(KEY)) return;
-  await vscode.window.showInformationMessage(t('guide.secondaryText'), t('guide.gotIt'));
-  void context.globalState.update(KEY, true);
-}
-
-/** 在辅助侧边栏打开：新版 VS Code（≥1.91）直接聚焦右侧视图；旧版回退聚焦+引导 */
-async function openSecondary(context: vscode.ExtensionContext): Promise<void> {
-  const cmds = await vscode.commands.getCommands(true);
-  // 视图声明在 package.json 里，VS Code 会自动生成 <viewId>.focus 命令；
-  // 存在即说明当前版本支持辅助侧边栏容器（≥1.91）
-  if (cmds.includes('dsh.panel.secondary.focus')) {
-    await vscode.commands.executeCommand('dsh.panel.secondary.focus');
-    return;
-  }
-  // 旧版回退：聚焦辅助侧边栏（命令 ID 因版本而异，取存在者）+ 一次性移动引导
-  const focusId = cmds.includes('workbench.action.focusSecondarySideBar')
-    ? 'workbench.action.focusSecondarySideBar'
-    : 'workbench.action.focusAuxiliaryBar';
-  await vscode.commands.executeCommand(focusId);
-  await vscode.commands.executeCommand('dsh.panel.focus');
-  await showSecondaryGuideOnce(context);
-}
-
 /** 手动清理命令：删除图片降级临时缓存（先按注册表删全部，再扫工作区根清理孤儿） */
 async function cleanupImageCacheCmd(): Promise<void> {
   const fsDeps = { writeFile: async () => {}, rmFile: async (p: string) => { await nodeFs.unlink(p); } };
@@ -677,8 +717,19 @@ function onConfigChanged(): void {
   m.setExitBehavior(!config.stopOnExit);
 }
 
-/** 插件停用：按 stopOnExit 决定是否停止自启服务（只杀插件自启的） */
+/**
+ * 插件停用（窗口退出主路径）：按 stopOnExit 与「使用者注册表」协调共享服务去留。
+ * 新语义（v0.3.11）：「最后一个使用该 dsh 服务的窗口退出才自动清理」——
+ * 多窗口共享同一服务时，owner 窗口先退出不再杀服务进程（其他窗口继续用），
+ * 最后使用者退出才清理；单窗口行为与旧版一致（唯一窗口退出即清理）。
+ * stopOnExit=true（默认）= 上述「最后使用者退出才清理」；false = 永不自动清理（服务留守）。
+ * 手动 Stop Service（stopServiceCmd）不受影响——那仍是立即停止/强停对话框语义。
+ */
 export async function deactivate(): Promise<void> {
+  // 退出路径持久日志（console → exthost 日志文件，窗口关闭后可查）：deactivate 是否
+  // 运行、运行到哪一步、最终清理决策，事后从 ~/Library/Application Support/Code/logs/
+  // <日期>/window*/exthost/ 按 [dsh-vscode] 前缀 grep 判别。
+  console.log('[dsh-vscode] [exit] deactivate 开始');
   // v0.3.0：图片缓存兜底清理（关闭 VS Code/停用扩展时，页面 pagehide 不必然触发）
   try {
     await cleanupAllImageCaches({ writeFile: async () => {}, rmFile: async (p) => { await nodeFs.unlink(p); } });
@@ -686,6 +737,11 @@ export async function deactivate(): Promise<void> {
     // 清理失败不影响停用流程
   }
   const config = readConfig().config;
-  if (config.stopOnExit) await manager?.stop();
+  console.log(`[dsh-vscode] [exit] 开始退出清理（stopOnExit=${config.stopOnExit}，host=${config.host}:${config.port}）`);
+  appendLog(`[exit] deactivate：stopOnExit=${config.stopOnExit}`);
+  // 注销本窗口并按使用者注册表决定服务去留（内部判定：无注册表/读取失败/有其他使用者
+  // 等分支的关键决策都会经 manager.persistLog 同步落 exthost 日志）
+  await manager?.releaseOnExit(config.stopOnExit);
+  console.log('[dsh-vscode] [exit] 退出清理完成（deactivate 正常结束）');
   manager?.dispose();
 }

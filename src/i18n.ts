@@ -36,11 +36,6 @@ const messages = {
     'status.starting': 'DSH: Starting',
     'status.failed': 'DSH: Failed',
     'status.stopped': 'DSH: Stopped',
-    // 辅助侧边栏引导
-    'guide.secondaryTitle': 'DSH: Two Sidebar Entrances',
-    'guide.secondaryText':
-      'The DSH panel is available from both the Activity Bar and the Secondary Side Bar icons. Click either to open it.',
-    'guide.gotIt': 'Got it',
     // 通知
     'info.urlCopied': 'URL copied: {url}',
     'info.notReady': 'DSH service is not ready yet.',
@@ -62,6 +57,21 @@ const messages = {
     'conflict.tokenPlaceholder': 'http://127.0.0.1:3080/?token=… or raw token',
     'msg.logsCopied': 'DSH logs copied to the clipboard. Paste them into your bug report.',
     'msg.imageCacheCleaned': 'Cleaned up {count} image-fallback temp file(s) from the workspace.',
+    // 复用窗口「停止服务」的共享服务强停（对话框与提示）
+    'stop.sharedPrompt':
+      'The DSH service at {authority} is running from another window. Stopping it will disconnect every window currently using it. Choose how to proceed:',
+    'stop.detachOnly': 'Disconnect This Window Only',
+    'stop.forceStop': 'Force Stop Service',
+    'stop.cancel': 'Cancel',
+    'stop.forceConfirm':
+      'This will terminate the service process — other windows using it will disconnect. Are you sure you want to stop it?',
+    'stop.confirmStop': 'Stop Service',
+    'stop.noOwnerRecord':
+      'This DSH service was not started by this extension (it may have been started in a terminal or by an older extension version), so it cannot be stopped from this window. Stop it in the window or terminal that started it.',
+    'stop.ownerDead':
+      'The process that started this DSH service has already exited. This window has only disconnected.',
+    'stop.killFailed':
+      'Failed to force-stop the shared DSH service at {authority}. It may still be running; this window has disconnected.',
     // 桥接状态与警告
     'bridge.warnDegraded':
       'DSH bridge is not active. These features are unavailable: 1) click links to open in browser 2) click file paths to open in VS Code. You can retry installing the bridge or silence this warning.',
@@ -100,10 +110,6 @@ const messages = {
     'status.starting': 'DSH: 启动中',
     'status.failed': 'DSH: 失败',
     'status.stopped': 'DSH: 已停止',
-    'guide.secondaryTitle': 'DSH：双侧栏入口',
-    'guide.secondaryText':
-      'DSH 面板可通过左侧活动栏或右侧辅助侧边栏的 DSH 图标打开，点击任意一个即可使用。',
-    'guide.gotIt': '知道了',
     'info.urlCopied': '已复制网址：{url}',
     'info.notReady': 'DSH 服务尚未就绪。',
     'info.stopped': 'DSH 服务已停止。',
@@ -124,6 +130,19 @@ const messages = {
     'conflict.tokenPlaceholder': 'http://127.0.0.1:3080/?token=… 或纯令牌',
     'msg.logsCopied': 'DSH 日志已复制到剪贴板，请粘贴到问题报告中。',
     'msg.imageCacheCleaned': '已清理 {count} 张图片降级临时缓存。',
+    // 复用窗口「停止服务」的共享服务强停（对话框与提示）
+    'stop.sharedPrompt':
+      '{authority} 上的 DSH 服务由另一个窗口启动，停止它将影响所有正在使用它的窗口。请选择处理方式：',
+    'stop.detachOnly': '仅断开本窗口连接',
+    'stop.forceStop': '强制停止服务',
+    'stop.cancel': '取消',
+    'stop.forceConfirm': '将终止该服务进程，其他正在使用它的窗口会断开连接。确定要停止吗？',
+    'stop.confirmStop': '停止服务',
+    'stop.noOwnerRecord':
+      '该 DSH 服务不是由本扩展启动的（可能由终端或旧版本扩展启动），无法在此停止，请到启动它的窗口/终端操作。',
+    'stop.ownerDead': '启动该 DSH 服务的进程已退出，本窗口仅断开连接。',
+    'stop.killFailed':
+      '强制停止 {authority} 上的共享 DSH 服务失败，服务可能仍在运行；本窗口已断开连接。',
     'bridge.warnDegraded':
       'DSH 桥接未生效，以下功能不可用：①点击链接跳转浏览器 ②点击文件路径在 VS Code 打开。可重试安装桥接，或不再显示本警告。',
     'bridge.retryNow': '重试安装',
