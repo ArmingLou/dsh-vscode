@@ -632,7 +632,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const api = await createDshApiClient(snapshot.url, manager?.getSessionCookie() ?? undefined);
       const ws = await syncWorkspace(api, root);
       workspaceSynced = true;
-      panel.setWorkspaceId(ws.workspaceId);
+      panel.setWorkspaceId(ws.workspaceId, ws.path);
       appendLog(`[bridge] workspace synced: ${ws.workspaceId} (${root})`);
     } catch (err) {
       appendLog(`[bridge] workspace sync failed: ${String(err)}`);

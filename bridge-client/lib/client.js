@@ -32,6 +32,37 @@ window.__ModuleLoader__.load({
     // —— 握手状态 ——
     let bridgeToken = ""; // 父页面下发的握手 token；未握手前为空，不激活任何拦截
     let bridgeWorkspaceId = ""; // 工作区同步后下发的 workspaceId；未同步前为空
+    let bridgeWorkspacePath = ""; // 工作区同步后下发的绝对路径；用于在界面下拉里匹配工作区项
+
+    // —— 工作区界面切换（防御式）：打开工作区下拉→按目录名匹配工作区项→点击，让界面激活当前工作区。
+    // 全程 try/catch + 找不到就静默放弃，绝不抛异常、不影响前端。 ——
+    function activateWorkspaceInUi() {
+      try {
+        const p = String(bridgeWorkspacePath || "").trim();
+        const targetName = p.replace(/^.*[\\/]/g, "").trim();
+        const targets = [targetName, p].filter(Boolean);
+        if (targets.length === 0) return;
+        const btn = document.querySelector('[aria-label="选择工作区"]') || document.querySelector('.pXSMma_workspace');
+        if (!btn) return;
+        const openMenu = () => { if (btn.getAttribute("aria-expanded") !== "true") btn.click(); };
+        openMenu();
+        let tries = 0;
+        const timer = setInterval(() => {
+          tries++;
+          try {
+            openMenu(); // 每轮确保下拉仍展开（避免被其它交互关闭后漏匹配）
+            const itemBtns = document.querySelectorAll('button[role="menuitem"]');
+            for (const b of itemBtns) {
+              const lbl = b.querySelector('[class*="_itemLabel"]') || b;
+              const t = String(lbl.textContent || "").trim();
+              if (targets.some((s) => t === s || t.includes(s))) { b.click(); clearInterval(timer); return; }
+            }
+            if (tries >= 50) clearInterval(timer); // 约 5s 上限
+          } catch { clearInterval(timer); }
+        }, 100);
+      } catch { /* 静默失败，绝不抛异常 */ }
+    }
+
 
     // —— 桥接快捷键映射（v0.3.2）：握手时随 bridgeHello 下发 { 组合键: VS Code 命令 id } ——
     // 背景：VS Code 只把快捷键转发给顶层 webview，嵌套 iframe 内的 Cmd+1 / Cmd+Esc / Cmd+` 等
@@ -53,7 +84,7 @@ window.__ModuleLoader__.load({
     }
 
     // 桥接包版本（与插件版本统一，随包发布；安装器按「版本不一致或 client.js 内容不一致」强制重装）
-    const BRIDGE_VERSION = "0.3.18";
+    const BRIDGE_VERSION = "0.3.20";
 
     // —— 剪贴板写桥接：VS Code webview 对跨源 iframe 的 navigator.clipboard.writeText 有权限拦截 ——
     // 背景：即使 iframe 声明 allow="clipboard-write"，VS Code（Electron）仍会拒绝写入
@@ -575,10 +606,12 @@ window.__ModuleLoader__.load({
         }
         return;
       }
-      // 工作区同步：握手成功后父页面下发 workspaceId，存入供 session.create 使用
+      // 工作区同步：握手成功后父页面下发 workspaceId(+path)，存入供 session.create 使用；并尝试在界面里切到该工作区
       if (d.kind === "bridgeSyncWorkspace" && typeof d.workspaceId === "string" && d.workspaceId !== "") {
         bridgeWorkspaceId = d.workspaceId;
-        console.log("[dsh-vscode-bridge] bridgeSyncWorkspace received @ " + Date.now() + " id=" + bridgeWorkspaceId);
+        bridgeWorkspacePath = typeof d.workspacePath === "string" ? d.workspacePath : "";
+        console.log("[dsh-vscode-bridge] bridgeSyncWorkspace received @ " + Date.now() + " id=" + bridgeWorkspaceId + " path=" + bridgeWorkspacePath);
+        activateWorkspaceInUi();
         return;
       }
     }

@@ -247,10 +247,10 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
     void this.view?.webview.postMessage({ type: 'setBridgeTrouble', trouble });
   }
 
-  /** 设置 dsh workspaceId 并下发到 iframe（工作区同步完成后由扩展侧调用；独立 postMessage，不修改握手脚本） */
-  setWorkspaceId(workspaceId: string | undefined): void {
+  /** 设置 dsh workspaceId + path 并下发到 iframe（工作区同步完成后由扩展侧调用；独立 postMessage，不修改握手脚本） */
+  setWorkspaceId(workspaceId: string | undefined, workspacePath?: string): void {
     if (workspaceId !== undefined) {
-      void this.view?.webview.postMessage({ type: 'bridgeSyncWorkspace', workspaceId });
+      void this.view?.webview.postMessage({ type: 'bridgeSyncWorkspace', workspaceId, workspacePath });
     }
   }
 
