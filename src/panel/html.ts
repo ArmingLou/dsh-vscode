@@ -24,6 +24,7 @@ export type PanelMessage =
   | { type: 'bridgeSaveImageAck'; requestId: string; ok: boolean; path?: string }
   | { type: 'bridgeDeleteImages'; requestId: string; paths: string[] }
   | { type: 'bridgeDeleteImagesAck'; requestId: string; ok: boolean }
+  | { type: 'bridgeSyncWorkspace'; workspaceId: string }
   | { type: 'bridgeShortcut'; combo: string; key?: string; code?: string }
   | { type: 'reloadPage' }
   | { type: 'retryBridgeInstall' };
@@ -163,6 +164,11 @@ if (iframeEl) {
     // 删除图片回执：转发给 iframe，resolve 其 deleteImages Promise
     if (d && d.type === 'bridgeDeleteImagesAck' && typeof d.requestId === 'string' && typeof d.ok === 'boolean') {
       iframeEl.contentWindow.postMessage({ kind: 'deleteImagesAck', requestId: d.requestId, ok: d.ok }, iframeSrc);
+      return;
+    }
+    // 工作区同步：扩展侧 syncWorkspace 完成后下发 workspaceId，转发给 iframe 供 session.create 使用
+    if (d && d.type === 'bridgeSyncWorkspace' && typeof d.workspaceId === 'string') {
+      iframeEl.contentWindow.postMessage({ kind: 'bridgeSyncWorkspace', workspaceId: d.workspaceId }, iframeSrc);
       return;
     }
     // —— 上行：iframe 发来的消息，origin + source 双重校验 ——

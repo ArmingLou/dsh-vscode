@@ -31,6 +31,7 @@ window.__ModuleLoader__.load({
     console.log("[dsh-vscode-bridge] client.js executed");
     // —— 握手状态 ——
     let bridgeToken = ""; // 父页面下发的握手 token；未握手前为空，不激活任何拦截
+    let bridgeWorkspaceId = ""; // 工作区同步后下发的 workspaceId；未同步前为空
 
     // —— 桥接快捷键映射（v0.3.2）：握手时随 bridgeHello 下发 { 组合键: VS Code 命令 id } ——
     // 背景：VS Code 只把快捷键转发给顶层 webview，嵌套 iframe 内的 Cmd+1 / Cmd+Esc / Cmd+` 等
@@ -52,7 +53,7 @@ window.__ModuleLoader__.load({
     }
 
     // 桥接包版本（与插件版本统一，随包发布；安装器按「版本不一致或 client.js 内容不一致」强制重装）
-    const BRIDGE_VERSION = "0.3.12";
+    const BRIDGE_VERSION = "0.3.18";
 
     // —— 剪贴板写桥接：VS Code webview 对跨源 iframe 的 navigator.clipboard.writeText 有权限拦截 ——
     // 背景：即使 iframe 声明 allow="clipboard-write"，VS Code（Electron）仍会拒绝写入
@@ -574,6 +575,12 @@ window.__ModuleLoader__.load({
         }
         return;
       }
+      // 工作区同步：握手成功后父页面下发 workspaceId，存入供 session.create 使用
+      if (d.kind === "bridgeSyncWorkspace" && typeof d.workspaceId === "string" && d.workspaceId !== "") {
+        bridgeWorkspaceId = d.workspaceId;
+        console.log("[dsh-vscode-bridge] bridgeSyncWorkspace received @ " + Date.now() + " id=" + bridgeWorkspaceId);
+        return;
+      }
     }
 
 
@@ -757,6 +764,26 @@ window.__ModuleLoader__.load({
             }
           } catch { /* 非 JSON/形状不符：放行 */ }
         }
+        // 工作区同步（必须在 origFetch 之前覆盖）：DSH 前端 session.create 总会带全局最近工作区的
+        // workspaceId；多窗口共享同一 3080 时，须强制覆盖为本窗口工作区，否则新会话仍落旧工作区。
+        if (init && init.method === "POST" && typeof init.body === "string" && init.body !== "" && init.body.indexOf('"session.create"') !== -1) {
+          try {
+            const origWs = (init.body.match(/"workspaceId":"[^"]*"/) || [null])[0];
+            if (bridgeWorkspaceId !== "") {
+              if (init.body.indexOf('"workspaceId"') !== -1) {
+                init.body = init.body.replace(/"workspaceId":"[^"]*"/g, '"workspaceId":"' + bridgeWorkspaceId + '"');
+              } else {
+                const patchIdx = init.body.indexOf('"session.create"');
+                const insertAfter = init.body.indexOf('"payload"', patchIdx);
+                const bracePos = insertAfter !== -1 ? init.body.indexOf('{', insertAfter) : -1;
+                if (bracePos !== -1) {
+                  init.body = init.body.slice(0, bracePos + 1) + '"workspaceId":"' + bridgeWorkspaceId + '",' + init.body.slice(bracePos + 1);
+                }
+              }
+            }
+            console.log("[dsh-vscode-bridge] session.create @ " + Date.now() + " bridgeWs=" + (bridgeWorkspaceId || "none") + " ws=" + (origWs || "none"));
+          } catch { /* 覆盖失败不阻断 session.create */ }
+        }
         const res = await origFetch(input, init);
         try {
           if (!imageFallbackEnabled || bridgeToken === "") return res;
@@ -767,7 +794,9 @@ window.__ModuleLoader__.load({
           // —— 对话生命周期：新建/删除会话或 prompt 观测到会话 id 变更 → 上一对话终止，清理临时图片 ——
           const method = parsed && typeof parsed.method === "string" ? parsed.method : "";
           const sessionId = payload && typeof payload.sessionId === "string" ? payload.sessionId : "";
-          if (method === "session.create") handleConversationEnd("新建", true);
+          if (method === "session.create") {
+            handleConversationEnd("新建", true);
+          }
           else if (method === "session.delete") handleConversationEnd("删除", true);
           else if (sessionId !== "" && lastSeenSessionId !== "" && sessionId !== lastSeenSessionId) {
             handleConversationEnd("切换", false); // 保留当前消息刚捕获的图片（不清 imageCache）

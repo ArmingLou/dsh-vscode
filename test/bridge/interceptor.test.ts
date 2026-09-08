@@ -909,3 +909,46 @@ test('v0.3.4 未握手时 host.openPath 不拦截（普通浏览器保持原生�
     rmSync(b.outDir, { recursive: true, force: true });
   }
 });
+
+test('syncWorkspace：session.create 的 workspaceId 被覆盖为本窗口工作区（pre-fetch，须在 origFetch 前）', async () => {
+  const calls: { input: unknown; init: any }[] = [];
+  const fakeRealFetch = async (input: unknown, init: any) => {
+    calls.push({ input, init });
+    return jsonResponse(ACCEPT_BODY);
+  };
+  const b = loadBridge({ fetch: fakeRealFetch });
+  try {
+    b.apply();
+    b.emitWin('message', { kind: 'bridgeHello', token: 'tok', imageFallback: true });
+    // 下发本窗口工作区 id
+    b.emitWin('message', { kind: 'bridgeSyncWorkspace', workspaceId: 'ws-suansuan' });
+    // 前端新建会话（自带全局最近工作区 id）
+    const body = JSON.stringify({ type: 'client-request', rpcId: 'c', method: 'session.create', payload: { workspaceId: 'ws-global-recent' } });
+    await b.window.fetch('/api/session.create', { method: 'POST', body });
+    assert.equal(calls.length, 1, 'session.create 应到达后端');
+    const sent = JSON.parse(calls[0].init.body);
+    assert.equal(sent.payload.workspaceId, 'ws-suansuan', 'session.create 的 workspaceId 应覆盖为本窗口工作区');
+  } finally {
+    rmSync(b.outDir, { recursive: true, force: true });
+  }
+});
+
+test('syncWorkspace：未下发工作区时 session.create 保持原体不被篡改', async () => {
+  const calls: { input: unknown; init: any }[] = [];
+  const fakeRealFetch = async (input: unknown, init: any) => {
+    calls.push({ input, init });
+    return jsonResponse(ACCEPT_BODY);
+  };
+  const b = loadBridge({ fetch: fakeRealFetch });
+  try {
+    b.apply();
+    b.emitWin('message', { kind: 'bridgeHello', token: 'tok', imageFallback: true });
+    const body = JSON.stringify({ type: 'client-request', rpcId: 'c', method: 'session.create', payload: { workspaceId: 'ws-other' } });
+    await b.window.fetch('/api/session.create', { method: 'POST', body });
+    assert.equal(calls.length, 1, 'session.create 应到达后端');
+    const sent = JSON.parse(calls[0].init.body);
+    assert.equal(sent.payload.workspaceId, 'ws-other', '未下发工作区时应保持原体');
+  } finally {
+    rmSync(b.outDir, { recursive: true, force: true });
+  }
+});

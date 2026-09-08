@@ -424,6 +424,11 @@ export class ServiceManager {
     return this.sharedUseSignaled;
   }
 
+  /** 获取当前会话 Cookie（复用外来实例场景；供 bridge API 等需要鉴权的请求使用） */
+  getSessionCookie(): string | null {
+    return this.sessionCookie;
+  }
+
   /**
    * 关键分支持久日志：deps.log（OutputChannel，随窗口销毁）之外同步再落一份到
    * consoleLog（默认 console.log → exthost 持久日志，窗口关闭后仍可查，带
@@ -487,6 +492,7 @@ export class ServiceManager {
    * stop() 保持纯脱钩语义，绝不弹窗（deactivate/窗口关闭等程序化路径依赖这一点）。
    */
   async stop(): Promise<void> {
+    await this.pruneDeadUsers();
     this.stopRequested = true;
     this.clearHealthWatch(); // 复用外部服务时也要清掉健康探测定时器
     if (this.child) {
@@ -522,6 +528,7 @@ export class ServiceManager {
    * 强停失败（EPERM 等）→ 'kill-failed'：本窗口仍脱钩，owner 记录保留（服务可能仍在运行）。
    */
   async stopSharedService(): Promise<SharedStopOutcome> {
+    await this.pruneDeadUsers();
     // 防御：与命令层快照竞态（决策期间自启流程意外完成等），有自有子进程按自有停止处理
     if (this.child) {
       await this.stopOwned();
@@ -1249,6 +1256,7 @@ export class ServiceManager {
   private async registerSelf(): Promise<void> {
     const store = this.deps.usersStore;
     if (!store) return;
+    await this.pruneDeadUsers();
     const selfPid = this.deps.selfPid ?? process.pid;
     const authority = `${this.opts.host}:${this.opts.port}`;
     try {

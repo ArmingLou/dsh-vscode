@@ -64,6 +64,7 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
     private imageFallback: () => boolean = () => true,
     private shortcuts: () => Record<string, string> = () => ({}),
     private onBridgeRetry?: () => void,
+    private onSyncWorkspace?: () => void,
   ) {
     // 订阅状态变化，重绘面板（iframe 与占位页由状态驱动，无白屏路径）
     manager.onChange(() => void this.handleStateChange());
@@ -199,6 +200,9 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
       case 'bridgeAck':
         // 握手回执：通知注入的回调（Task 7 据此评估桥接状态；version 供日志确认桥接代码版本）
         this.onBridgeAck?.(msg.ok, msg.version);
+        if (msg.ok) {
+          try { this.onSyncWorkspace?.(); } catch { /* sync failure must not break handshake flow */ }
+        }
         break;
       case 'reloadPage':
         // 页面加载异常提示条「重新加载页面」：重渲染 = iframe 重载（DSH 页面重新引导并再次握手）
@@ -241,6 +245,13 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
   /** 页面加载异常提示条显隐（纯 postMessage，不重载 iframe；入口在握手超时/失败/恢复时调用） */
   setTrouble(trouble: boolean): void {
     void this.view?.webview.postMessage({ type: 'setBridgeTrouble', trouble });
+  }
+
+  /** 设置 dsh workspaceId 并下发到 iframe（工作区同步完成后由扩展侧调用；独立 postMessage，不修改握手脚本） */
+  setWorkspaceId(workspaceId: string | undefined): void {
+    if (workspaceId !== undefined) {
+      void this.view?.webview.postMessage({ type: 'bridgeSyncWorkspace', workspaceId });
+    }
   }
 
   /** 桥接落盘/删除依赖：图片缓存写文件/删文件（node:fs/promises）与回执投递（webview.postMessage） */

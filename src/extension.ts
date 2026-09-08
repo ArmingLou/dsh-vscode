@@ -12,6 +12,8 @@ import { DshPanelProvider } from './panel/provider';
 import { StatusBarController } from './statusbar';
 import { resolveWorkspaceRoot } from './workspaceRoot';
 import { createUrlResolver } from './remote';
+import { createDshApiClient } from './bridge/api';
+import { syncWorkspace } from './bridge/sync';
 import {
   installBridge,
   uninstallBridge,
@@ -560,6 +562,9 @@ export function activate(context: vscode.ExtensionContext): void {
     () => {
       void retryBridge(); // 「重新加载异常提示条」的「重试安装桥接」按钮 → 重装桥接并重启服务
     },
+    () => {
+      void syncWorkspaceOnce(); // 桥接握手成功后触发工作区同步
+    },
   );
   // 复制网址命令读取面板的展示 URL（远程=隧道本地 URL）
   getDisplayUrl = () => panel.getDisplayUrl();
@@ -614,6 +619,25 @@ export function activate(context: vscode.ExtensionContext): void {
       startHandshakeTimeout(); // 服务就绪：若面板已打开，启动握手超时
     }
   });
+
+  /** 工作区同步：取当前 VS Code 工作区根目录 → dsh workspace/create（幂等）→ workspaceId 下发到 iframe */
+  let workspaceSynced = false;
+  async function syncWorkspaceOnce(): Promise<void> {
+    if (workspaceSynced) return;
+    const root = workspaceRootGetter();
+    if (root === undefined) return;
+    const snapshot = manager?.getSnapshot();
+    if (!snapshot || snapshot.state !== 'ready' || !snapshot.url) return;
+    try {
+      const api = await createDshApiClient(snapshot.url, manager?.getSessionCookie() ?? undefined);
+      const ws = await syncWorkspace(api, root);
+      workspaceSynced = true;
+      panel.setWorkspaceId(ws.workspaceId);
+      appendLog(`[bridge] workspace synced: ${ws.workspaceId} (${root})`);
+    } catch (err) {
+      appendLog(`[bridge] workspace sync failed: ${String(err)}`);
+    }
+  }
 
   context.subscriptions.push(
     // 第三参数：隐藏面板时保留 webview（iframe 不销毁、DSH 页面会话不丢）
