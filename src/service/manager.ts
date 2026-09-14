@@ -1297,8 +1297,8 @@ export class ServiceManager {
   }
 
   /**
-   * 过滤注册表中的失效条目：本窗口自己的残留（注销写回失败等）+ 已死的窗口 pid
-   * （崩溃/强杀残留——deactivate 与 exit 钩子都没跑），顺带回写清理。
+   * 过滤注册表中的失效条目：仅"pid 已不存在"的条目算失效（本窗口自己的残留由后续
+   * unregisterSelf/退出流程处理，绝不在此处从磁盘上删除——见下方写回说明）。
    * 返回仍存活的「其他窗口」pid 列表（自己不算：退出中的本窗口无论注册表写入成败都不计数）。
    * 读取失败返回 null（调用方按无法确认处理）；**写回清理失败不影响判定结果**——
    * 退出期间 globalState 写入会被拒（VS Code deactivate 时存储服务已关闭），若把写回
@@ -1320,17 +1320,25 @@ export class ServiceManager {
       this.persistLog(`[users] ${authority} 使用者注册表读取失败: ${String(err)}`);
       return null;
     }
-    const kept = list.filter((pid) => pid !== selfPid && ext.isAlive(pid));
+    // 真正失效 = pid 已不存在。本窗口自己一定存活：不探测、也绝不从登记表里删掉
+    // （「过滤自己」只是判定口径，见下方写回说明）
+    const alive = list.filter((pid) => pid === selfPid || ext.isAlive(pid));
+    // 判定用列表：只关心「其他存活使用者」（自己不算——退出中的本窗口无论注册表写入成败都不计数）。
+    const kept = alive.filter((pid) => pid !== selfPid);
     if (kept.length > 0) this.sharedUseSignaled = true; // F5：本会话曾见过其他存活使用者
-    if (kept.length !== list.length) {
-      // 写回清理尽力而为：失败不影响力判定（仍返回 kept）
+    if (alive.length !== list.length) {
+      // 写回清理尽力而为：失败不影响力判定（仍返回 kept）。**写回的是 alive 而非 kept**——
+      // 本窗口自己一定存活，「过滤自己」只是判定口径；若把 kept 写回磁盘，本窗口就会在自己
+      // 仍在用服务时删掉自己的登记，其他窗口（含退出中的 owner）随后读到「无人在用」而误杀
+      // 共享服务（v0.3.20 线上根因：A/B 共用同一实例，B 取消一次 Stop 对话框触发 prune 后
+      // A 退出即 kill；日志形如「过滤 1 个失效使用者条目（剩余 1 个窗口）」实为删掉了自己）。
       try {
-        if (kept.length === 0) {
+        if (alive.length === 0) {
           await store.clear(this.opts.host, this.opts.port);
         } else {
-          await store.save(this.opts.host, this.opts.port, { extPids: kept });
+          await store.save(this.opts.host, this.opts.port, { extPids: alive });
         }
-        this.persistLog(`[users] ${authority} 过滤 ${list.length - kept.length} 个失效使用者条目（崩溃/强杀/退出残留，剩余 ${kept.length} 个窗口）`);
+        this.persistLog(`[users] ${authority} 过滤 ${list.length - alive.length} 个失效使用者条目（崩溃/强杀/退出残留，剩余 ${alive.length} 个窗口）`);
       } catch (err) {
         this.persistLog(`[users] ${authority} 失效条目写回清理失败: ${String(err)}（不影响力判定；退出期间存储已关闭属预期，残留由后续死 pid 过滤自愈）`);
       }

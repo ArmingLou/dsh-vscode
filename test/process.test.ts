@@ -2,6 +2,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { SpawnOptions } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join as pathJoin } from 'node:path';
 import {
   createProcessRunner,
   sanitizeCwd,
@@ -14,6 +17,7 @@ import {
   windowsDshInvocation,
   isProcessAlive,
   stopExternalProcess,
+  stdioGuardEnv,
   type ChildProcessLike,
   type SpawnFn,
 } from '../src/service/process';
@@ -621,3 +625,27 @@ test('stopExternalProcess：目标进程已不存在时幂等返回（不抛错�
   await stopExternalProcess(2147483647, 0);
 });
 
+
+test('stdio 存活兜底：启动 dsh 的环境注入 NODE_OPTIONS=--require <shim>（父窗口退出后管道读端关闭不再 EPIPE 杀死共享服务）', () => {
+  const calls: { cmd: string; args: string[]; opts: SpawnOptions }[] = [];
+  const spawnImpl: SpawnFn = (cmd, args, opts) => {
+    calls.push({ cmd, args, opts });
+    return new FakeChild();
+  };
+  const guardFile = pathJoin(tmpdir(), `dsh-vscode-stdio-guard.test-${process.pid}.cjs`);
+  const runner = createProcessRunner(spawnImpl, 'linux', 3000, () => false, {
+    path: '/usr/bin:/bin',
+    shell: '/bin/bash',
+  }, () => { throw new Error('no shell'); });
+  runner.startDsh({ host: '127.0.0.1', port: 3080, extraArgs: [] });
+  const env = calls[0].opts.env as NodeJS.ProcessEnv;
+  assert.ok(env && typeof env.NODE_OPTIONS === 'string', '必须注入 NODE_OPTIONS');
+  assert.ok(env.NODE_OPTIONS!.includes('--require'), '必须通过 --require 载入 stdio 兜底 shim');
+  const shim = env.NODE_OPTIONS!.split('--require')[1].trim().replace(/^"|"$/g, '');
+  assert.ok(existsSync(shim), `shim 必须已落盘：${shim}`);
+  // 既有 NODE_OPTIONS 必须保留（不能覆盖用户环境）
+  const merged = stdioGuardEnv({ NODE_OPTIONS: '--max-old-space-size=4096' }, () => {}, guardFile);
+  assert.ok(merged.NODE_OPTIONS!.startsWith('--max-old-space-size=4096 '), '追加而非覆盖既有 NODE_OPTIONS');
+  // 落盘失败（只读临时目录等）→ 静默降级为原环境，不阻断启动
+  assert.deepEqual(stdioGuardEnv({ PATH: '/usr/bin' }, () => { throw new Error('EACCES'); }, guardFile), { PATH: '/usr/bin' });
+});

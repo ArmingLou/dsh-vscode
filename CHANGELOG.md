@@ -1,3 +1,13 @@
+## [0.3.21] - 2026-09-14
+
+### 修复
+
+- **修复多窗口场景下「还有别的窗口在用，dsh 进程却被提前 kill」**（回归）。根因两条：
+  1. **共享使用者注册表被自己写坏**：`pruneDeadUsers` 清理失效条目后把结果写回磁盘时，误把**当前窗口自己**也从共享注册表（`dsh.users@host:port`）里过滤掉，于是本窗口一退出就被判定为「最后一个使用者」而触发停止流程——实际还有其他窗口在登记使用；
+  2. **共享实例被启动它的窗口拖着一起死**：共享 dsh 子进程的 stdout 继承自启动它的那个窗口，该窗口关闭后管道断裂（EPIPE），dsh 自身因写日志失败而自杀，剩下仍在使用的窗口随之失联。
+- **stdio 保活加固**：新增 `stdioGuardEnv()`，为 spawn 的 dsh 子进程注入 `NODE_OPTIONS=--require $TMPDIR/dsh-vscode-stdio-guard.cjs`（stdout/stderr 写入失败时静默丢弃而不是让进程崩溃），使共享实例在启动方窗口关闭后继续存活。
+- **新增回归用例**：`test/manager.test.ts` 覆盖「prune 后的写回不得删除自己」；`test/process.test.ts` 覆盖 `stdioGuardEnv()` 的环境变量注入与幂等。
+
 ## [0.3.9] - 2026-09-05
 
 ### 新增

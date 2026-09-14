@@ -1875,3 +1875,73 @@ test('dispose 无杀伤：移交场景（child 存活 + skipExitKill=true）deac
 
 
 
+
+// —— v0.3.20 线上根因回归：pruneDeadUsers 的「过滤自己」不得写回磁盘 ——
+// 用户真机复现：A（owner）自启 3080、B 复用且面板正常使用中（B 日志「现存 2 个窗口」），
+// 仅关 A 窗口 → 3080 进程被杀、B 报连接失败。
+// 根因：pruneDeadUsers 把「自己」当作失效条目过滤后**写回注册表**（本窗口仍在用服务，
+// 却从共享登记表里删掉了自己）；此后任一窗口退出判定「无其他存活使用者」→ 走清理分支
+// 杀掉共享服务进程。B 侧触发 prune 的最常见路径：点 Stop Service 后在对话框选「取消」
+// （stopSharedService 开头就会 prune），窗口继续用服务但登记已被自己抹掉。
+
+test('两窗口共用同一实例：关闭其一不 kill、关闭其二才 kill（最后使用者语义）', async () => {
+  const { a, b, ownerJar, usersJar, extKills } = makeTwoWindows();
+  await bootOwned(a); // A 自启（owner，子进程 pid=1234）
+  await bootReuse(b); // B 复用同一实例
+  assert.deepEqual(usersJar.get('127.0.0.1:3080'), [9001, 9002], '两窗口都在册');
+  // 关闭其一（A，owner）：B 仍在用 → 移交，绝不 kill
+  await a.manager.releaseOnExit(true);
+  assert.equal(a.child?.killed.length ?? 0, 0, '仍有存活使用者：不得 kill 共享服务进程');
+  assert.deepEqual(extKills, []);
+  assert.equal(a.manager.isExitKillSkipped(), true, '移交标志须置位（exit 钩子跳过兜底杀）');
+  assert.deepEqual(usersJar.get('127.0.0.1:3080'), [9002], 'B 仍登记在册');
+  assert.equal(b.manager.getSnapshot().state, 'ready', 'B 侧连接不受影响');
+  // 关闭其二（B，最后使用者）：才按跨窗口 owner 记录 kill 并清记录
+  await b.manager.releaseOnExit(true);
+  assert.deepEqual(extKills, [1234], '最后使用者退出才 kill（按 owner 记录定位）');
+  assert.equal(ownerJar.has('127.0.0.1:3080'), false, 'kill 成功后清 owner 记录');
+  await a.manager.stop(); // 收尾：释放 A 的 exit 钩子
+  a.manager.dispose();
+  b.manager.dispose();
+});
+
+test('根因回归：B 取消一次 Stop 对话框（触发 prune）后 A 退出 → 必须仍判「有存活使用者」而移交不杀', async () => {
+  const ownerJar = new Map<string, number>();
+  const usersJar = new Map<string, number[]>();
+  const extKills: number[] = [];
+  const shared = {
+    ownerStore: {
+      load: (host: string, port: number) => ownerJar.get(`${host}:${port}`) ?? null,
+      save: (host: string, port: number, pid: number) => { ownerJar.set(`${host}:${port}`, pid); },
+      clear: (host: string, port: number) => { ownerJar.delete(`${host}:${port}`); },
+    },
+    externalProcess: {
+      isAlive: () => true,
+      stop: async (pid: number) => { extKills.push(pid); },
+    },
+  };
+  const a = makeHarness(undefined, { selfPid: 9001, usersStore: jarUsersStore(usersJar), ...shared });
+  const b = makeHarness(undefined, {
+    selfPid: 9002,
+    usersStore: jarUsersStore(usersJar),
+    ...shared,
+    askStopReused: async () => 'cancel', // 用户在「停止方式」三选一点了取消：B 继续使用该服务
+  });
+  await bootOwned(a);
+  await bootReuse(b);
+  assert.deepEqual(usersJar.get('127.0.0.1:3080'), [9001, 9002]);
+  assert.equal(await b.manager.stopSharedService(), 'cancel');
+  assert.equal(b.manager.getSnapshot().state, 'ready', '取消停止：B 继续使用该实例');
+  assert.deepEqual(usersJar.get('127.0.0.1:3080'), [9001, 9002], 'prune 只清理死 pid，不得删掉本窗口仍在用的登记（旧实现在此变成 [9001]）');
+  // 关闭其一（A，owner）：旧实现此刻误判「无其他使用者」→ SIGTERM/SIGKILL 杀掉共享进程
+  await a.manager.releaseOnExit(true);
+  assert.equal(a.child?.killed.length ?? 0, 0, '仍有存活使用者（B）：owner 退出不得 kill');
+  assert.deepEqual(extKills, [], '不得触碰他人正在使用的服务进程');
+  assert.deepEqual(usersJar.get('127.0.0.1:3080'), [9002], 'A 注销后 B 仍在册');
+  // 关闭其二（B，最后使用者）：才 kill
+  await b.manager.releaseOnExit(true);
+  assert.deepEqual(extKills, [1234], '最后一个使用者退出才清理共享服务');
+  await a.manager.stop();
+  a.manager.dispose();
+  b.manager.dispose();
+});

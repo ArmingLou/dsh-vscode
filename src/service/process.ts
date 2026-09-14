@@ -1,9 +1,51 @@
 // src/service/process.ts — dsh web 子进程封装（跨平台）
 // 纯模块：spawn 通过参数注入，便于单测；不依赖 vscode。
 import { spawn, execSync, type SpawnOptions } from 'node:child_process';
-import { existsSync, readdirSync } from 'node:fs';
-import { posix as posixPath, win32 as win32Path } from 'node:path';
-import { homedir } from 'node:os';
+import { existsSync, readdirSync, writeFileSync } from 'node:fs';
+import { posix as posixPath, win32 as win32Path, join as pathJoin } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
+
+/**
+ * 共享 dsh 进程的 stdio 存活兜底 shim（写入临时目录 + 经 NODE_OPTIONS 注入）。
+ *
+ * 背景（0.1.5-rc.2 起的必现现象）：dsh 子进程的 stdout/stderr 是**启动它的那个窗口的扩展宿主**
+ * 建立的管道（stdio: ['ignore','pipe','pipe']）。窗口关闭 → 该宿主进程退出 → 管道读端关闭，
+ * 此后 dsh 的任何 stdout/stderr 写入都会 EPIPE；Node 对 process.stdout 上未处理的 'error'
+ * 是致命异常，dsh 会当场崩溃退出。实测：把子进程 stdout 管道读端关闭后，子进程在下一次写入
+ * 时即死亡（对照组存活）。dsh 0.1.5-rc.2 的插件链（bridge/product-subagents 等）在运行期持续
+ * 往 stdout 写，于是「A 窗口自启 3080、B 窗口复用，A 关闭」时进程随 A 的宿主一起死，
+ * 与「最后一个使用者退出才 kill」的语义直接冲突。
+ *
+ * 修法：让 dsh 自身忽略管道写错误（写丢弃、进程存活）——通过 NODE_OPTIONS=--require <shim>
+ * 注入，不改变扩展侧的令牌解析/输出通道转发（stdout 仍是管道，仍是本窗口活着时的数据源）。
+ * 写盘失败等异常一律静默降级为旧行为（不阻断启动）。
+ */
+const STDIO_GUARD_FILE = (): string => pathJoin(tmpdir(), 'dsh-vscode-stdio-guard.cjs');
+const STDIO_GUARD_SOURCE = [
+  '// 由 dsh-vscode 扩展自动生成：忽略 stdout/stderr 管道写错误。',
+  '// 共享 dsh 的管道读端属于启动它的窗口扩展宿主；该窗口关闭后管道读端消失，',
+  '// 未处理的 EPIPE 会直接杀死 dsh（最后一个使用者仍在用时服务即消失）。',
+  'for (const s of [process.stdout, process.stderr]) {',
+  '  try { s.on("error", () => {}); } catch { /* 流不可用时忽略 */ }',
+  '}',
+  '',
+].join('\n');
+
+/** 生成启动 dsh 用的环境（在原环境上追加 stdio 兜底 shim；任何异常都回退原环境） */
+export function stdioGuardEnv(
+  base: NodeJS.ProcessEnv = process.env,
+  write: (file: string, content: string) => void = (file, content) => writeFileSync(file, content),
+  guardFile: string = STDIO_GUARD_FILE(),
+): NodeJS.ProcessEnv {
+  try {
+    write(guardFile, STDIO_GUARD_SOURCE);
+    const flag = `--require "${guardFile}"`; // 路径可能含空白：NODE_OPTIONS 支持引号包裹
+    const prev = (base.NODE_OPTIONS ?? '').trim();
+    return { ...base, NODE_OPTIONS: prev.length > 0 ? `${prev} ${flag}` : flag };
+  } catch {
+    return base; // 落盘失败（只读临时目录等）：维持旧行为，不阻断启动
+  }
+}
 
 /** 最小子进程接口（真实 ChildProcess 结构上兼容，测试可注入假实现） */
 export interface ChildProcessLike {
@@ -572,6 +614,9 @@ export function createProcessRunner(
         detached: platform !== 'win32',
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'],
+        // 共享服务的进程存活与「启动它的窗口」解耦：注入 stdio 兜底 shim，
+        // 避免本窗口宿主退出后管道读端关闭 → dsh 写 stdout EPIPE 崩溃（见 stdioGuardEnv）
+        env: stdioGuardEnv(process.env),
         // cwd 仅在显式传入时指定，避免覆盖 spawn 自身对缺省 cwd 的处理
         ...(sanitizedCwd === undefined ? {} : { cwd: sanitizedCwd }),
       };
