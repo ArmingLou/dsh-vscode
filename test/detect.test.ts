@@ -87,6 +87,45 @@ test('带令牌探测：303 令牌交换（Location:/ + dsh-auth Cookie）→ ds
   }
 });
 
+test('带令牌探测：303 Location:./（dsh ≥0.1.6 目录相对根）→ dsh', async () => {
+  // 回归：dsh 0.1.6+ 令牌交换源码为 writeHead(303, { location: './' })，
+  // 旧实现按字面量比对 '/' 会漏判 → 带令牌探测恒 foreign → 启动等待循环超时（面板连不上）。
+  const { server, port } = await serve((req, res) => {
+    if (req.url?.startsWith('/?token=')) {
+      res.writeHead(303, {
+        'location': './',
+        'set-cookie': 'dsh-auth-HASH=yyy; Max-Age=86400; Path=/; HttpOnly; SameSite=Strict',
+      });
+      res.end();
+      return;
+    }
+    res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end('dsh web authentication required; reopen the URL printed by dsh web.\n');
+  });
+  try {
+    assert.equal(await probeService('127.0.0.1', port, 1000, 'TOKEN123'), 'dsh');
+  } finally {
+    server.close();
+  }
+});
+
+test('带令牌探测：303 Location 指向子路径（如 /login、./login）→ 仍为 foreign', async () => {
+  for (const location of ['/login', './login']) {
+    const { server, port } = await serve((_req, res) => {
+      res.writeHead(303, {
+        'location': location,
+        'set-cookie': 'dsh-auth-HASH=yyy; Path=/',
+      });
+      res.end();
+    });
+    try {
+      assert.equal(await probeService('127.0.0.1', port, 1000, 'TOKEN123'), 'foreign', `location=${location}`);
+    } finally {
+      server.close();
+    }
+  }
+});
+
 test('无令牌探测收到 401（dsh 认证提示）→ dsh-unauthenticated（疑似 dsh 未认证）', async () => {
   const { server, port } = await serve((_req, res) => {
     res.writeHead(401, { 'content-type': 'text/plain; charset=utf-8' });

@@ -17,13 +17,33 @@ const DSH_MARKER = '__DSH_BOOT__';
 const DSH_AUTH_REQUIRED_MARKER = 'dsh web authentication required';
 
 /**
- * 新版 dsh 的令牌交换响应特征：GET /?token=X → 303 Location:/ + Set-Cookie 会话。
+ * 新版 dsh 的令牌交换响应特征：GET /?token=X → 303 重定向到干净首页 + Set-Cookie 会话。
  * 该 303 只在令牌有效时发出（令牌是 32 字节随机数，只有 dsh 自己校验），
  * 因此「303 重定向到干净首页 + dsh-auth-* Cookie」即证明端口上是 dsh 且令牌有效。
  * fetch 不维护 cookie jar（无法自动跟随 303 并携带 Cookie），故直接以 303 特征判定，
  * 无需再跟随重定向。
+ *
+ * Location 的写法随 dsh 版本变化（语义一致，解析后都是根路径）：
+ * - 早期版本：绝对根 '/'
+ * - dsh ≥0.1.6：目录相对根 './'（dsh-client-connection 源码 writeHead(303, { location: './' })）
+ * 因此这里统一按「相对请求 URL 解析后 pathname 为 /」判定，而不是字面量比对，
+ * 否则新版的 './' 会被漏判 → 带令牌探测恒为 foreign → 启动等待循环直到超时（面板连不上）。
  */
-const DSH_TOKEN_EXCHANGE = { location: '/', cookiePrefix: 'dsh-auth-' };
+const DSH_TOKEN_EXCHANGE = { cookiePrefix: 'dsh-auth-' };
+
+/**
+ * 令牌交换的 Location 是否指向干净首页根路径。
+ * 兼容 '/'、'./' 以及 'http://host:port/' 等绝对写法（按 baseUrl 解析后比较 pathname）。
+ * 解析失败（非法 URL）一律视为不匹配，维持原 foreign 语义。
+ */
+function isRootLocation(location: string | null, baseUrl: string): boolean {
+  if (location === null || location === '') return false;
+  try {
+    return new URL(location, baseUrl).pathname === '/';
+  } catch {
+    return false;
+  }
+}
 
 /**
  * 探测 host:port 上运行的服务：
@@ -54,31 +74,35 @@ export async function probeService(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
+    // 空串/纯空白令牌 = 未提供（dsh.externalToken 默认值为 ''，归一化前也会流入）：
+    // 一律归一化为 undefined 后再参与后续所有判据，否则：
+    // - 空串会破坏「无令牌 401 → dsh-unauthenticated」判据 → 疑似 dsh 误判 foreign；
+    // - 纯空白（如 '   '）为真值，会拼进 ?token= 并被当作「已提供令牌」→ 同样误判 foreign。
+    // 归一化只影响探测语义，不改动调用方传入的令牌本身。
+    const authToken = token !== undefined && token.trim() !== '' ? token : undefined;
     // 带令牌时请求令牌交换 URL：新版 dsh 未带令牌访问首页会收到 401
-    const target = token
-      ? `http://${host}:${port}/?token=${encodeURIComponent(token)}`
+    const target = authToken
+      ? `http://${host}:${port}/?token=${encodeURIComponent(authToken)}`
       : `http://${host}:${port}/`;
     const headers: Record<string, string> = {};
-    // 空串令牌 = 未提供（外部配置默认 '' 归一化前也会流入）：一律按无令牌处理，
-    // 否则 401 的「无令牌识别」（下方 token 判据）会被空串破坏 → 疑似 dsh 误判 foreign
-    if (!token && cookie !== undefined) headers['cookie'] = cookie;
+    if (!authToken && cookie !== undefined) headers['cookie'] = cookie;
     const res = await fetch(target, {
       signal: controller.signal,
       redirect: 'manual',
       headers,
     });
-    if (res.status === 303 && token) {
+    if (res.status === 303 && authToken) {
       const location = res.headers.get('location');
       const cookies =
         typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : null;
       // getSetCookie 缺失（极旧 fetch 实现）时退化为仅校验 Location，不影响判定
       const cookieOk = cookies === null || cookies.some((c) => c.startsWith(DSH_TOKEN_EXCHANGE.cookiePrefix));
-      if (location === DSH_TOKEN_EXCHANGE.location && cookieOk) return 'dsh';
+      if (isRootLocation(location, target) && cookieOk) return 'dsh';
     }
     if (!res.ok) {
       // 无令牌（含空串，见上）收到 401 且响应体为 dsh 认证提示 → 疑似 dsh 未认证。
       // 带令牌的 401（令牌错误/过期）维持原 'foreign' 语义，不读响应体。
-      if (res.status === 401 && !token) {
+      if (res.status === 401 && !authToken) {
         const body = await res.text();
         if (body.includes(DSH_AUTH_REQUIRED_MARKER)) {
           log?.(`[probe] ${host}:${port} → dsh-unauthenticated（HTTP 401，响应体片段：${snippet(body)}）`);

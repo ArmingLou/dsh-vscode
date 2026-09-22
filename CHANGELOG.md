@@ -1,3 +1,18 @@
+## [0.3.22] - 2026-09-22
+
+### 修复
+
+- **修复 dsh 升级到 0.1.6+ 后插件「无法连接」——令牌交换的 `Location` 写法变化导致探测恒判 `foreign`**（用户实测：升级最新版 dsh 后面板连不上，日志刷屏 `[probe] 127.0.0.1:3080 → foreign（HTTP 303，响应体片段：）`）。
+  - **根因**：dsh ≥0.1.6 的令牌交换重定向改为**目录相对根**——`dsh-client-connection` 源码为 `res.writeHead(303, { location: './' })`（早期版本是绝对根 `'/'`）。插件 `detect.ts` 按字面量比对 `location === '/'`，因此新版的合法 303 令牌交换被漏判，落入「非 OK 响应 → foreign」分支。
+  - **故障链**：带令牌探测恒 `foreign` → `doStart` 的等待就绪循环永远等不到 `dsh` → 直到 `startTimeoutMs` 超时置 `err.startTimeout`，面板表现为连不上（此时子进程其实已正常启动、代理也已建立，只是「就绪判定」失败）。日志中「已捕获访问令牌 → 代理启动 → 之后一路 303 foreign 刷屏」正是该链路。
+  - **修复**：新增 `isRootLocation(location, baseUrl)`，按「相对请求 URL 解析后 `pathname === '/'`」判定，兼容 `'/'`、`'./'` 与绝对写法；`/login`、`./login` 等子路径仍维持 `foreign` 语义不变。
+- **修复纯空白令牌（如 `'   '`）被当作有效令牌**：`dsh.externalToken` 归一化前流入探测层时，空白串为真值 → 会拼进 `?token=` 且使「无令牌 401 → dsh-unauthenticated」判据失效 → 疑似 dsh 被误判 `foreign`。现在探测层统一把空串/纯空白归一化为「未提供令牌」（修复仓库中原本已红灯的该回归用例）。
+
+### 测试
+
+- `test/detect.test.ts` 新增 2 例：303 `Location: ./`（dsh ≥0.1.6）→ `dsh`；303 `Location: /login` 与 `./login` → 仍为 `foreign`。
+- 实证：以真实 dsh `0.1.7-alpha.1` 做 A/B——修复前带令牌探测返回 `foreign（HTTP 303，响应体片段：）`（与用户日志逐字一致），修复后返回 `dsh`；真实 dsh 集成测试（启动/复用/停止/意外退出、多实例并发）全绿。
+
 ## [0.3.21] - 2026-09-14
 
 ### 修复
