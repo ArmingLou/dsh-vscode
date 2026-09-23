@@ -162,6 +162,14 @@ export interface BridgeMessageDeps {
   showWarning(msg: string): void;
   /** 工作区根目录（相对路径解析的兜底基准，生产由扩展入口注入） */
   workspaceRoot?: string;
+  /** VS Code 各工作区根（多根工作区逐个；相对路径的兜底候选，v0.3.25） */
+  vscodeWorkspaceRoots?: () => readonly string[];
+  /** DSH 各会话 cwd（扩展侧经 `session/list` 探测，按由新到旧；相对路径的首选基准，v0.3.25） */
+  dshSessionCwds?: () => readonly string[];
+  /** DSH 工作区注册表里的工作区路径（最后的宽网兜底，v0.3.25） */
+  dshWorkspacePaths?: () => readonly string[];
+  /** 文件存在性判定（生产接 fs.existsSync）：让相对路径「取第一个真实存在的文件」（v0.3.25） */
+  exists?: (path: string) => boolean;
   /** 写入图片缓存文件（生产接 node:fs/promises，产物 base64）——v0.3.0 图片降级用 */
   writeFile?: (path: string, dataB64: string) => Thenable<void>;
   /** 删除图片缓存文件（生产接 node:fs/promises）——v0.3.0 会话结束清理用 */
@@ -182,13 +190,52 @@ function errSummary(err: unknown): string {
 }
 
 /**
- * 解析文件路径：绝对路径直接采用；相对路径依次按 会话 cwd → 工作区根 作为基准解析。
- * ~ 开头（DSH 工具行路径显示的主目录缩写）展开为主目录后再走绝对路径判定。
- * 安全规则：形似 URL 的协议串（如 https://、javascript:）一律拒绝，
- * 但 Windows 盘符（C:\ 或 C:/）不是协议，需要放行。
+ * 相对路径解析的候选基准与存在性判定（v0.3.25 多基准）。
+ *
+ * 背景：桥接转发的相对路径由 DSH 前端产出，其语义基准是**该会话的 cwd**
+ * （DSH 原生 `openFile` → `fileAddressFor(sessionId, cwd, path)`），而扩展此前只有
+ * 「VS Code 工作区根」这一个 base——当用户把 DSH 会话开在 A 仓库、却在 B 仓库的
+ * VS Code 窗口里用面板（跨仓库 / 多个 DSH 工作空间）时，相对路径会被拼到错误的仓库根，
+ * 报 `Unable to resolve nonexistent file`。
  */
-export function resolveBridgePath(raw: string, sessionCwd: string | undefined, workspaceRoot: string | undefined):
-  { kind: 'abs'; path: string } | { kind: 'invalid' } {
+export interface ResolvePathOptions {
+  /** DSH 各会话的 cwd 候选（由扩展侧经 `session/list` 探测，按由新到旧；首选基准） */
+  sessionCwds?: readonly (string | undefined)[] | undefined;
+  /** VS Code 各工作区根（多根工作区逐个；兜底基准） */
+  workspaceRoots?: readonly (string | undefined)[] | undefined;
+  /**
+   * DSH 工作区注册表（`$DSH_HOME/storages/workspace.json`）里的全部工作区路径。
+   * 排在 VS Code 工作区根**之后**作最后的宽网兜底：它可能包含与本次会话无关的历史工作区，
+   * 靠前会「抢走」用户在 VS Code 窗口里本来就能命中的同名文件（如各仓库都有的 README.md）。
+   */
+  dshWorkspacePaths?: readonly (string | undefined)[] | undefined;
+  /**
+   * 文件存在性判定（生产接 `fs.existsSync`）。
+   * 缺省时不做存在性筛选，沿用旧语义「取第一个基准」；提供时按候选顺序取**第一个真实存在**的文件。
+   */
+  exists?: ((path: string) => boolean) | undefined;
+}
+
+/** 路径解析结果：abs 可打开；invalid 危险协议/无基准；not-found 多基准全落空（携带试过的基准） */
+export type ResolveBridgePathResult =
+  | { kind: 'abs'; path: string }
+  | { kind: 'invalid' }
+  | { kind: 'not-found'; tried: string[] };
+
+/**
+ * 解析文件路径：绝对路径直接采用；相对路径按多候选基准依次尝试，取第一个真实存在的文件。
+ *
+ * 候选顺序（即优先级）：桥接消息自带的会话 cwd → DSH 各会话 cwd（由新到旧）→ 旧的工作区根参数
+ * → VS Code 各工作区根（多根逐个）→ DSH 工作区注册表路径（最后的宽网兜底）。
+ * ~ 开头（DSH 工具行路径显示的主目录缩写）展开为主目录后再走绝对路径判定。
+ * 安全规则：形似 URL 的协议串（如 https://、javascript:）一律拒绝，但 Windows 盘符（C:\ 或 C:/）不是协议，需要放行。
+ */
+export function resolveBridgePath(
+  raw: string,
+  sessionCwd: string | undefined,
+  workspaceRoot: string | undefined,
+  options: ResolvePathOptions = {},
+): ResolveBridgePathResult {
   // 路径形似 URL 一律拒绝（协议串）；Windows 盘符不属于协议，予以放行
   if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw) && !/^[a-zA-Z]:[\\/]/.test(raw)) {
     return { kind: 'invalid' };
@@ -199,10 +246,30 @@ export function resolveBridgePath(raw: string, sessionCwd: string | undefined, w
   else if (expanded.startsWith('~/') || expanded.startsWith('~\\')) expanded = join(homedir(), expanded.slice(2));
   // 绝对路径直接采用（跨平台：Windows 盘符与 POSIX / 开头都算绝对）
   if (isAbsolute(expanded)) return { kind: 'abs', path: expanded };
-  // 相对路径：优先用会话 cwd，缺失时退回工作区根；两者都无则无法解析
-  const base = sessionCwd ?? workspaceRoot;
-  if (base === undefined) return { kind: 'invalid' };
-  return { kind: 'abs', path: resolve(base, expanded) };
+  // 相对路径：收集去重后的候选基准（顺序即优先级：会话 cwd 优先于工作区根）
+  const bases: string[] = [];
+  const pushBase = (b: string | undefined): void => {
+    if (typeof b === 'string' && b !== '' && !bases.includes(b)) bases.push(b);
+  };
+  pushBase(sessionCwd);
+  for (const b of options.sessionCwds ?? []) pushBase(b);
+  pushBase(workspaceRoot);
+  for (const b of options.workspaceRoots ?? []) pushBase(b);
+  for (const b of options.dshWorkspacePaths ?? []) pushBase(b);
+  const first = bases[0];
+  if (first === undefined) return { kind: 'invalid' };
+  // 无存在性判定：无法筛选，沿用「取第一个基准」的旧语义（既有调用方与单测行为不变）
+  if (options.exists === undefined) return { kind: 'abs', path: resolve(first, expanded) };
+  // 多基准逐个探测：命中第一个真实存在的文件即用（DSH 原生语义基准是会话 cwd，故 cwd 排在最前）
+  for (const base of bases) {
+    const candidate = resolve(base, expanded);
+    try {
+      if (options.exists(candidate)) return { kind: 'abs', path: candidate };
+    } catch {
+      // 单个基准的存在性判定异常（权限/非法路径）：跳过该基准，继续尝试下一个
+    }
+  }
+  return { kind: 'not-found', tried: bases };
 }
 
 /**
@@ -222,7 +289,12 @@ export async function handleBridgeMessage(msg: PanelMessage, deps: BridgeMessage
     return;
   }
   if (msg.type === 'bridgeOpenFile') {
-    const r = resolveBridgePath(msg.path, msg.cwd, deps.workspaceRoot);
+    const r = resolveBridgePath(msg.path, msg.cwd, deps.workspaceRoot, {
+      sessionCwds: deps.dshSessionCwds?.(),
+      workspaceRoots: deps.vscodeWorkspaceRoots?.(),
+      dshWorkspacePaths: deps.dshWorkspacePaths?.(),
+      exists: deps.exists,
+    });
     if (r.kind === 'abs') {
       try {
         // 打开文档可能因文件不存在/无权限等失败，捕获后给用户可见反馈而非未处理拒绝
@@ -231,6 +303,17 @@ export async function handleBridgeMessage(msg: PanelMessage, deps: BridgeMessage
         // 文案内联固定提示（本模块纯逻辑，直接断言，与 Task 7 的 i18n 无关）
         deps.showWarning(`无法打开文件：${r.path}（${errSummary(err)}）`);
       }
+    } else if (r.kind === 'not-found') {
+      // 所有候选基准（DSH 会话 cwd → VS Code 各工作区根）下都没有这个文件：
+      // 给出可见、可读的提示（原始相对路径 + 试过哪些基准），而不是把 VS Code 原生
+      // 「Unable to resolve nonexistent file」这种无上下文的报错丢给用户。
+      deps.showWarning(
+        [
+          `找不到文件：${msg.path}（相对路径）`,
+          '已按以下基准目录逐个查找，均无此文件：',
+          ...r.tried.map((b) => `· ${b}`),
+        ].join('\n'),
+      );
     } else {
       // 路径无法解析（危险协议或缺少基准目录）：仅弹提示，不打断面板与桥接流程
       deps.showWarning(`无法解析路径：${msg.path}`);

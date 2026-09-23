@@ -92,7 +92,7 @@ npm run package        # 产出 dsh-vscode.vsix，再按方式二安装
 安装后，插件会在你的 DSH 用户目录安装本扩展的桥接包（经 DSH 官方客户端插件扩展点安装），让面板与 VS Code 联动。启用后获得三项能力：
 
 - 🔗 **外链跳转**：面板内点击外链，在系统默认浏览器中打开（而非被困在 iframe 内）；
-- 📂 **文件跳转**：点击面板内任意文件路径（模型回复中的路径、产物列表、工具调用行如 `read · test/bridge/a.ts` / `Edit · README.md`）统一在当前 VS Code 窗口打开。**双层兜底**：入口元素 DOM 拦截 + RPC 层统一接管（DSH 所有打开文件操作最终汇聚的 `host.openPath` 请求被桥接截获并改写为扩展宿主打开，后端系统默认应用不弹出，DSH 页面无感）——今后 DSH 新增任何形态的文件入口都会被自动兜住；
+- 📂 **文件跳转**：点击面板内任意文件路径（模型回复中的路径、产物列表、工具调用行如 `read · test/bridge/a.ts` / `Edit · README.md`）统一在当前 VS Code 窗口打开。**双层兜底**：入口元素 DOM 拦截 + RPC 层统一接管（桥接截获 DSH 请求宿主打开文件的 RPC 并改写为扩展宿主打开，后端系统默认应用不弹出，DSH 页面无感）——DSH 0.1.7+ 该端点为 `session/openWorkspacePath`（斜杠形态，参数在 `payload.args.request`），0.1.7 之前的点号 `host.openPath` 形态仍兼容旧版；用户显式选择的「在文件管理器中显示」（`action: 'reveal'`）与「用指定应用打开」（`application`）一律放行；
 - 📋 **剪贴板复制**：面板内 DSH 的复制按钮（如代码块复制）改由扩展宿主写入系统剪贴板，绕开 VS Code 对 webview 内跨源 iframe 的剪贴板权限拦截。
 - ↩️ **撤销/重做（macOS Cmd+Z / Cmd+Shift+Z，Windows Ctrl+Z / Ctrl+Y）**：DSH 输入框自带 draft 事务级撤销系统，桥接对撤销/重做**放行不拦截**（快捷键事件直达页面处理，浏览器原生撤销对普通输入框照常生效）；右键菜单的「撤销/重做」改为向焦点输入框派发对应组合键，同样由页面自身执行。
 - ⌨️ **任意快捷键转发（v0.3.2）**：面板内被 VS Code 吞掉的组合键（如 `Cmd+1`、`Cmd+Esc`）按 `dsh.bridge.shortcuts` 映射转发给扩展宿主执行对应 VS Code 命令。默认内置 `Cmd+1/2/3`（切换辅助栏/面板/侧边栏，与作者 keybindings 一致）、`Cmd+Esc`（最大化面板）；可在设置里自由覆盖或新增任意组合键（如 `"alt+1": "workbench.view.explorer"`、`"cmd+`": "workbench.action.terminal.toggleTerminal"`）；编辑类快捷键（Cmd/Ctrl+C/V/A/X/Z）仍由页面内本地仿真优先（复制/粘贴/剪切/全选；撤销/重做放行页面自身处理）。

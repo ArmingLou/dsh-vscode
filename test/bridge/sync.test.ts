@@ -8,6 +8,7 @@ const mkItem = (workspaceId: string, path: string): WorkspaceItem => ({ workspac
 test('syncWorkspace calls workspaceCreate (idempotent) and returns result', async () => {
   const api: DshApiClient = {
     workspaceCreate: async (p) => mkItem('w1', p),
+    sessionCwds: async () => [],
   };
   const ws = await syncWorkspace(api, '/proj');
   assert.equal(ws.workspaceId, 'w1');
@@ -17,6 +18,7 @@ test('syncWorkspace calls workspaceCreate (idempotent) and returns result', asyn
 test('syncWorkspace with created:false (existing workspace) returns same id', async () => {
   const api: DshApiClient = {
     workspaceCreate: async (p) => mkItem('w-existing', p),
+    sessionCwds: async () => [],
   };
   const ws = await syncWorkspace(api, '/proj');
   assert.equal(ws.workspaceId, 'w-existing');
@@ -26,6 +28,7 @@ test('syncWorkspace passes workspaceRoot as-is', async () => {
   let receivedPath = '';
   const api: DshApiClient = {
     workspaceCreate: async (p) => { receivedPath = p; return mkItem('w1', p); },
+    sessionCwds: async () => [],
   };
   await syncWorkspace(api, '/my/project');
   assert.equal(receivedPath, '/my/project');

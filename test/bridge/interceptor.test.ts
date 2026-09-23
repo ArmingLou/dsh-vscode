@@ -93,7 +93,10 @@ function loadBridge(opts: { fetch: (input: unknown, init: any) => Promise<Respon
     // 测试默认把「模型看完即删」的 TTL 设为 30ms：批次自动快速删除，避免测试结束时残留定时器
     __dshBridgeImageTtlMs: 30,
   };
+  // 按 id 取元素（改动行测试用）：React useId 生成的 id 形如 ":r5q:-0"，含冒号，不能当 CSS 选择器
+  const elementsById = new Map<string, any>();
   const fakeDocument: Record<string, any> = {
+    getElementById(id: string) { return elementsById.get(id) ?? null; },
     addEventListener(type: string, fn: (...a: any[]) => void) {
       (docListeners.get(type) ?? (docListeners.set(type, new Set()).get(type)!)).add(fn);
     },
@@ -137,6 +140,10 @@ function loadBridge(opts: { fetch: (input: unknown, init: any) => Promise<Respon
     atob: (globalThis as any).atob?.bind(globalThis),
     Response: globalThis.Response,
     fetch: globalThis.fetch,
+    // vm 沙箱不自动提供宿主 URL 构造器（与 Response/fetch 一样需显式注入）；
+    // 缺它会让 isAllowedExternalUrl 内部 new URL 抛错 → 外链判定恒为 false，
+    // 桥接行为与真实浏览器不一致（外链用例会假失败）。
+    URL: globalThis.URL,
     setTimeout,
     clearTimeout,
     // —— 撤销/重做测试用 DOM 桩 ——
@@ -182,6 +189,7 @@ function loadBridge(opts: { fetch: (input: unknown, init: any) => Promise<Respon
     document: fakeDocument,
     windowListeners,
     docListeners,
+    elementsById,
     parentMessages,
     emitWin,
     emitDoc,
@@ -657,57 +665,158 @@ test('v0.3.2 握手未携带 shortcuts 时：组合键一律放行（向后兼�
   }
 });
 
-test('v0.3.2 文件路径点击：fileMention 与产物 chip 统一转发 openFile（title 优先于 aria-label 文案）', async () => {
+/**
+ * 文件链接点击测试共用的元素桩。
+ * 只实现桥接 DOM 拦截真正用到的选择器（button / a / 用例注入的祖先），其余一律返回 null，
+ * 避免「任意选择器都命中」导致工具行等其它分支被假命中。
+ */
+function mkFileEl(over: {
+  className?: string;
+  title?: string;
+  ariaLabel?: string;
+  text?: string;
+  refChip?: string;
+  tag?: string;
+  closestMap?: Record<string, unknown>;
+}) {
+  const attrs: Record<string, string> = {};
+  if (over.className !== undefined) attrs['class'] = over.className;
+  if (over.title !== undefined) attrs['title'] = over.title;
+  if (over.ariaLabel !== undefined) attrs['aria-label'] = over.ariaLabel;
+  if (over.refChip !== undefined) attrs['data-ref-chip'] = over.refChip;
+  const el: any = {
+    textContent: over.text ?? '',
+    getAttribute: (n: string) => (Object.prototype.hasOwnProperty.call(attrs, n) ? attrs[n] : null),
+    closest: (sel: string) => {
+      if (sel === 'button') return (over.tag ?? 'button') === 'button' ? el : null;
+      if (sel === 'a') return null;
+      const hit = over.closestMap?.[sel];
+      return hit === true ? el : (hit as any) ?? null;
+    },
+  };
+  return el;
+}
+
+/** 一次点击的派发与结果（是否被拦截）；extra 可注入 detail 等原生事件字段 */
+function clickFile(b: { emitDoc: (t: string, e: unknown) => void }, target: any, extra: Record<string, unknown> = {}) {
+  let prevented = 0;
+  let stopped = 0;
+  b.emitDoc('click', {
+    target,
+    ...extra,
+    preventDefault() { prevented += 1; },
+    stopPropagation() { stopped += 1; },
+  });
+  return { prevented, stopped };
+}
+
+test('dsh 0.1.7 文件链接点击：CSS Modules 哈希类名 / @引用芯片 / 产物卡片 / 工具行均转发 openFile', async () => {
   const fakeRealFetch = async (_input: unknown, _init: any) => jsonResponse(ACCEPT_BODY);
   const b = loadBridge({ fetch: fakeRealFetch });
   try {
     b.apply();
     b.emitWin('message', { kind: 'bridgeHello', token: 'tok', imageFallback: true });
     const started = b.parentMessages.length;
-
-    // 模拟 DSH 的「路径按钮」DOM：title=真实路径、aria-label=「打开 xxx」文案（与 fileMention/产物 chip 一致）
-    const mkBtn = (over: any) => {
-      const btn: any = {
-        classList: { contains: (c: string) => (over.classes ?? []).includes(c) },
-        getAttribute: (name: string) =>
-          name === 'title' ? (over.title ?? null) : name === 'aria-label' ? (over.ariaLabel ?? null) : null,
-        textContent: over.text ?? '',
-        closest: (sel: string) => (sel === 'button[title], button[aria-label]' ? btn : null),
-      };
-      return btn;
-    };
-    const click = (target: any) => {
-      let prevented = 0;
-      let stopped = 0;
-      b.emitDoc('click', {
-        target,
-        preventDefault() { prevented += 1; },
-        stopPropagation() { stopped += 1; },
-      });
-      return { prevented, stopped };
-    };
     const openFiles = () => b.parentMessages.slice(started).filter((m) => m.kind === 'openFile');
 
-    // ① 模型回复路径（button.fileMention）：必须转发 title 真实路径（旧实现误用 aria-label 文案）
-    click(mkBtn({ classes: ['fileMention'], title: '/ws/src/main.ts', ariaLabel: '打开 /ws/src/main.ts', text: 'main.ts' }));
+    // ① markdown 文件链接：类名被哈希（_fileMention_x / _fileLink_y），title 是相对路径
+    clickFile(b, mkFileEl({
+      className: '_fileMention_1jct6_85 _fileLink_1jct6_59',
+      title: 'src/a.ts',
+      text: 'a.ts',
+    }));
+    assert.equal(openFiles().length, 1, '哈希类名的文件链接应被接管');
+    assert.equal(openFiles()[0].path, 'src/a.ts', '相对路径原样转发（扩展侧按工作区根解析）');
+
+    // ② @文件 引用芯片：data-ref-chip="file"，title 是 @路径（含引号包裹的空格路径）
+    clickFile(b, mkFileEl({
+      className: '_refChip_1jct6_1 _fileMention_1jct6_85',
+      title: '@"docs/a b.md"',
+      refChip: 'file',
+      text: 'a b.md',
+    }));
+    assert.equal(openFiles().length, 2, '@引用芯片应被接管');
+    assert.equal(openFiles()[1].path, 'docs/a b.md', '应去掉 @ 前缀与引号');
+
+    // ③ 产物文件卡片：覆盖整卡的 button，title 为绝对路径，aria-label 是本地化文案（不可当路径）
+    const r3 = clickFile(b, mkFileEl({
+      className: 'nyYjTG_cardPreview',
+      title: '/ws/out/a.log',
+      ariaLabel: '预览 a.log',
+      text: '',
+    }));
+    assert.equal(openFiles().length, 3, '产物卡片应被接管');
+    assert.equal(openFiles()[2].path, '/ws/out/a.log', '必须取 title 而非 aria-label 文案');
+    assert.equal(r3.prevented, 1, '命中应 preventDefault（阻止 DSH 打开自己的侧边栏预览）');
+
+    // ④ 工具调用行 fileLink（无 title，只剩 basename）：按类名 + 文本识别
+    clickFile(b, mkFileEl({ className: 'o3BgMG_fileLink', text: 'README.md' }));
+    assert.equal(openFiles().length, 4, '工具行只剩文件名时也应被接管');
+    assert.equal(openFiles()[3].path, 'README.md');
+
+    // ⑤ 点击落在卡片子节点（非 button）上：经 [data-presented-file] 回退到卡内带 title 的按钮
+    const overlay = mkFileEl({ className: 'nyYjTG_cardPreview', title: '/ws/card.txt', text: '' });
+    clickFile(b, mkFileEl({
+      tag: 'span', text: 'card.txt',
+      closestMap: { 'button': null, '[data-presented-file]': { querySelector: (sel: string) => (sel === 'button[title]' ? overlay : null) } },
+    }));
+    assert.equal(openFiles().length, 5, '卡片子节点点击应回退到卡内按钮');
+    assert.equal(openFiles()[4].path, '/ws/card.txt');
+
+    // ⑥ 非文件按钮（普通按钮、目录引用芯片）：不拦截、不 preventDefault，交回 DSH 自己处理
+    const prose = clickFile(b, mkFileEl({ className: 'lcKema_row', title: '复制代码', ariaLabel: '复制', text: '复制' }));
+    const folder = clickFile(b, mkFileEl({
+      className: '_refChip_1jct6_1 _fileMention_1jct6_85', title: '@docs/', refChip: 'folder', text: 'docs',
+    }));
+    assert.equal(openFiles().length, 5, '非文件点击不应转发');
+    assert.equal(prose.prevented + folder.prevented, 0, '非文件点击不应 preventDefault');
+    assert.equal(prose.stopped + folder.stopped, 0, '非文件点击不应 stopPropagation');
+
+    // ⑦ 带行号锚点的链接：剥掉锚点只转发路径（扩展侧 showTextDocument 只接受路径）
+    clickFile(b, mkFileEl({ className: '_fileLink_1jct6_59', title: '/ws/src/b.ts#L12-L20', text: 'b.ts' }));
+    assert.equal(openFiles().length, 6);
+    assert.equal(openFiles()[5].path, '/ws/src/b.ts', '应剥掉 #L12-L20 行号锚点');
+  } finally {
+    rmSync(b.outDir, { recursive: true, force: true });
+  }
+});
+
+test('旧版 dsh 文件链接点击仍被接管（裸类名 fileMention / title 绝对路径 / Windows 盘符）', async () => {
+  const fakeRealFetch = async (_input: unknown, _init: any) => jsonResponse(ACCEPT_BODY);
+  const b = loadBridge({ fetch: fakeRealFetch });
+  try {
+    b.apply();
+    b.emitWin('message', { kind: 'bridgeHello', token: 'tok', imageFallback: true });
+    const started = b.parentMessages.length;
+    const openFiles = () => b.parentMessages.slice(started).filter((m) => m.kind === 'openFile');
+
+    // ① 旧版裸类名 fileMention：title 为真实路径（旧实现曾误用 aria-label 文案）
+    clickFile(b, mkFileEl({ className: 'fileMention', title: '/ws/src/main.ts', ariaLabel: '打开 /ws/src/main.ts', text: 'main.ts' }));
     assert.equal(openFiles().length, 1, 'fileMention 应转发 openFile');
     assert.equal(openFiles()[0].path, '/ws/src/main.ts', '应转发 title 真实路径而非 aria-label 文案');
 
-    // ② 产物列表 chip（无 fileMention class，title 为绝对路径）：同样被拦截转发
-    click(mkBtn({ title: '/ws/out/a.log', ariaLabel: '打开 /ws/out/a.log', text: 'a.log' }));
-    assert.equal(openFiles().length, 2, '产物 chip（title 绝对路径）应转发 openFile');
+    // ② 产物 chip（无文件类名，title 绝对路径）③ Windows 盘符
+    clickFile(b, mkFileEl({ title: '/ws/out/a.log', ariaLabel: '打开 /ws/out/a.log', text: 'a.log' }));
+    clickFile(b, mkFileEl({ title: 'C:\\proj\\b.ts', ariaLabel: '打开 C:\\proj\\b.ts', text: 'b.ts' }));
+    assert.equal(openFiles().length, 3, 'title 为绝对路径的按钮应转发 openFile');
     assert.equal(openFiles()[1].path, '/ws/out/a.log');
-
-    // ③ Windows 盘符绝对路径同样识别
-    click(mkBtn({ title: 'C:\\proj\\b.ts', ariaLabel: '打开 C:\\proj\\b.ts', text: 'b.ts' }));
-    assert.equal(openFiles().length, 3);
     assert.equal(openFiles()[2].path, 'C:\\proj\\b.ts');
 
-    // ④ 普通按钮（title 非路径、无 fileMention class）：不拦截、不 preventDefault（放行给页面）
-    const r4 = click(mkBtn({ title: '复制代码', ariaLabel: '复制', text: '复制' }));
+    // ④ 普通按钮（title 非路径、无文件类名）：不拦截
+    const r4 = clickFile(b, mkFileEl({ title: '复制代码', ariaLabel: '复制', text: '复制' }));
     assert.equal(openFiles().length, 3, '非路径按钮不应转发');
     assert.equal(r4.prevented, 0, '非路径按钮不应 preventDefault');
     assert.equal(r4.stopped, 0, '非路径按钮不应 stopPropagation');
+
+    // ⑤ 外链 <a>：仍走 openExternal（不被文件分支误吞）
+    const before = openFiles().length;
+    b.emitDoc('click', {
+      target: { closest: (sel: string) => (sel === 'a' ? { href: 'https://example.com/x' } : null) },
+      preventDefault() {}, stopPropagation() {},
+    });
+    assert.equal(openFiles().length, before, '外链不应产生 openFile');
+    const openExternals = b.parentMessages.slice(started).filter((m) => m.kind === 'openExternal');
+    assert.ok(openExternals.length >= 1, '外链应转发 openExternal');
   } finally {
     rmSync(b.outDir, { recursive: true, force: true });
   }
@@ -719,14 +828,45 @@ test('v0.3.2 未握手时文件路径点击不拦截（普通浏览器保持 DSH
   try {
     b.apply(); // 不握手
     const started = b.parentMessages.length;
-    const btn: any = {
-      classList: { contains: () => true },
-      getAttribute: () => '/ws/a.ts',
-      textContent: 'a.ts',
-      closest: (sel: string) => (sel === 'button[title], button[aria-label]' ? btn : null),
-    };
-    b.emitDoc('click', { target: btn, preventDefault() {}, stopPropagation() {} });
+    clickFile(b, mkFileEl({ className: '_fileMention_1jct6_85', title: '/ws/a.ts', text: 'a.ts' }));
     assert.equal(b.parentMessages.slice(started).filter((m) => m.kind === 'openFile').length, 0, '未握手不应转发');
+  } finally {
+    rmSync(b.outDir, { recursive: true, force: true });
+  }
+});
+
+test('v0.3.24 原生同款守卫：多击与「存在未折叠选区」的单击都不接管（拖选/双击不误开文件）', async () => {
+  const fakeRealFetch = async (_input: unknown, _init: any) => jsonResponse(ACCEPT_BODY);
+  const b = loadBridge({ fetch: fakeRealFetch });
+  try {
+    b.apply();
+    b.emitWin('message', { kind: 'bridgeHello', token: 'tok', imageFallback: true });
+    const started = b.parentMessages.length;
+    const openFiles = () => b.parentMessages.slice(started).filter((m) => m.kind === 'openFile');
+    // 与 dsh 0.1.7 真实 DOM 一致的文件链接按钮（哈希类名 + 内层 span）
+    const link = () => mkFileEl({ className: '_fileMention_1jct6_85 _fileLink_1jct6_59', title: 'src/a.ts', text: 'a.ts' });
+
+    // ① 单击（detail=1）+ 选区折叠 → 接管
+    const single = clickFile(b, link(), { detail: 1 });
+    assert.equal(openFiles().length, 1, '单击应接管');
+    assert.equal(single.prevented, 1, '单击应 preventDefault');
+
+    // ② 双击/多击（detail>1）→ 不接管（照抄原生 `event.detail > 1` 直接 return）
+    const dbl = clickFile(b, link(), { detail: 2 });
+    assert.equal(openFiles().length, 1, '双击不应转发 openFile');
+    assert.equal(dbl.prevented + dbl.stopped, 0, '双击应完全放行原事件');
+
+    // ③ 存在未折叠选区时的单击（拖选收尾误触）→ 不接管
+    b.document.getSelection = () => ({ isCollapsed: false });
+    const drag = clickFile(b, link(), { detail: 1 });
+    assert.equal(openFiles().length, 1, '有未折叠选区时不应转发 openFile');
+    assert.equal(drag.prevented + drag.stopped, 0, '有未折叠选区时应完全放行原事件');
+
+    // ④ 选区恢复折叠 → 恢复接管（守卫只挡拖选，不挡正常单击）
+    b.document.getSelection = () => ({ isCollapsed: true });
+    const again = clickFile(b, link(), { detail: 1 });
+    assert.equal(openFiles().length, 2, '折叠选区后应恢复接管');
+    assert.equal(again.prevented, 1);
   } finally {
     rmSync(b.outDir, { recursive: true, force: true });
   }
@@ -948,6 +1088,122 @@ test('syncWorkspace：未下发工作区时 session.create 保持原体不被篡
     assert.equal(calls.length, 1, 'session.create 应到达后端');
     const sent = JSON.parse(calls[0].init.body);
     assert.equal(sent.payload.workspaceId, 'ws-other', '未下发工作区时应保持原体');
+  } finally {
+    rmSync(b.outDir, { recursive: true, force: true });
+  }
+});
+
+/**
+ * DSH「改动」卡片（[data-changed-files]）文件行的元素桩：只实现桥接真正用到的选择器，
+ * 其余一律返回 null（避免「任意选择器都命中」导致其它分支假命中）。
+ */
+function mkChangedRow(over: {
+  describedBy?: string;
+  inCard?: boolean;
+  rowText?: string;
+  tag?: string;
+}) {
+  const attrs: Record<string, string> = {};
+  if (over.describedBy !== undefined) attrs['aria-describedby'] = over.describedBy;
+  const firstSpan = { textContent: over.rowText ?? '' };
+  const el: any = {
+    textContent: over.rowText ?? '',
+    getAttribute: (n: string) => (Object.prototype.hasOwnProperty.call(attrs, n) ? attrs[n] : null),
+    querySelector: (sel: string) => (sel === 'span' ? firstSpan : null),
+    closest: (sel: string) => {
+      if (sel === '[data-changed-files] button') return (over.inCard ?? true) && (over.tag ?? 'button') === 'button' ? el : null;
+      if (sel === 'button') return (over.tag ?? 'button') === 'button' ? el : null;
+      return null;
+    },
+  };
+  return el;
+}
+
+test('v0.3.26 改动卡片文件行：点击改道 VS Code 打开（aria-describedby 的绝对路径 / 相对路径两形态）', async () => {
+  const fakeRealFetch = async (_input: unknown, _init: any) => jsonResponse(ACCEPT_BODY);
+  const b = loadBridge({ fetch: fakeRealFetch });
+  try {
+    b.apply();
+    b.emitWin('message', { kind: 'bridgeHello', token: 'tok', imageFallback: true });
+    const started = b.parentMessages.length;
+    const openFiles = () => b.parentMessages.slice(started).filter((m) => m.kind === 'openFile');
+
+    // ① cwd 已知：隐藏 span 是已解析的绝对路径
+    b.elementsById.set('r1-0', { textContent: '/ws/src/bridge/host.ts' });
+    const r1 = clickFile(b, mkChangedRow({ describedBy: 'r1-0', rowText: 'src/bridge/host.ts' }), { detail: 1 });
+    assert.equal(openFiles().length, 1, '改动行应转发 openFile');
+    assert.equal(openFiles()[0].path, '/ws/src/bridge/host.ts', '优先取 aria-describedby 指向的绝对路径');
+    assert.equal(r1.prevented, 1, '命中应 preventDefault（阻止 DSH 切侧栏 diff）');
+    assert.equal(r1.stopped, 1, '命中应 stopPropagation');
+    assert.equal(openFiles()[0].kind, 'openFile', '复用既有 bridgeOpenFile 消息，宿主侧零改动');
+
+    // ② cwd 缺失：隐藏 span 退回相对路径 → 照样转发（交宿主侧多基准解析）
+    b.elementsById.set('r1-1', { textContent: 'src/a.ts' });
+    clickFile(b, mkChangedRow({ describedBy: 'r1-1', rowText: 'a.ts' }), { detail: 1 });
+    assert.equal(openFiles().length, 2);
+    assert.equal(openFiles()[1].path, 'src/a.ts');
+
+    // ③ getElementById 返回 null（describedBy 指向不存在的 id）→ 回退 row 首个子 span 文本
+    clickFile(b, mkChangedRow({ describedBy: 'no-such-id', rowText: 'src/b.ts' }), { detail: 1 });
+    assert.equal(openFiles().length, 3);
+    assert.equal(openFiles()[2].path, 'src/b.ts', '描述元素缺失时回退 row 文本');
+
+    // ④ 描述文本与 row 文本都不是路径 → 不拦、不抛错
+    b.elementsById.set('r1-2', { textContent: '3 个文件' });
+    const r4 = clickFile(b, mkChangedRow({ describedBy: 'r1-2', rowText: '+67 -10' }), { detail: 1 });
+    assert.equal(openFiles().length, 3, '取不到路径时不得转发');
+    assert.equal(r4.prevented + r4.stopped, 0, '取不到路径时应完全放行原事件');
+  } finally {
+    rmSync(b.outDir, { recursive: true, force: true });
+  }
+});
+
+test('v0.3.26 改动行误拦面：header/折叠按钮、侧栏 review tab、hover 预览 span 一律放行', async () => {
+  const fakeRealFetch = async (_input: unknown, _init: any) => jsonResponse(ACCEPT_BODY);
+  const b = loadBridge({ fetch: fakeRealFetch });
+  try {
+    b.apply();
+    b.emitWin('message', { kind: 'bridgeHello', token: 'tok', imageFallback: true });
+    const started = b.parentMessages.length;
+    const openFiles = () => b.parentMessages.slice(started).filter((m) => m.kind === 'openFile');
+
+    // a) 卡片 header（aria-label=changes.openReview）：在卡片内但没有 aria-describedby → 放行
+    const header = clickFile(b, mkChangedRow({ rowText: 'src/a.ts' }), { detail: 1 });
+    assert.equal(openFiles().length, 0, 'header 按钮不得被拦');
+    assert.equal(header.prevented + header.stopped, 0);
+
+    // b) 侧栏 review tab 内的文件行：不在 [data-changed-files] 作用域 → 放行
+    const sidebarRow = clickFile(b, mkChangedRow({ inCard: false, describedBy: 'r1-0', rowText: '/ws/src/a.ts' }), { detail: 1 });
+    assert.equal(openFiles().length, 0, '侧栏 review tab 的行不得被拦');
+    assert.equal(sidebarRow.prevented + sidebarRow.stopped, 0);
+
+    // c) hover 预览是 span 而非 button：closest('[data-changed-files] button') 返回 null → 放行
+    const previewSpan = clickFile(b, mkChangedRow({ tag: 'span', describedBy: 'r1-0', rowText: '/ws/src/a.ts' }), { detail: 1 });
+    assert.equal(openFiles().length, 0, 'hover 预览（span）不得被拦');
+    assert.equal(previewSpan.prevented + previewSpan.stopped, 0);
+
+    // ④ 多击/选区守卫同样作用于改动行（有意比 DSH 原生更严）
+    const dbl = clickFile(b, mkChangedRow({ describedBy: 'r1-0', rowText: 'src/a.ts' }), { detail: 2 });
+    assert.equal(openFiles().length, 0, '双击改动行不应转发');
+    assert.equal(dbl.prevented + dbl.stopped, 0);
+    b.elementsById.set('r1-0', { textContent: '/ws/src/a.ts' });
+    b.document.getSelection = () => ({ isCollapsed: false });
+    const drag = clickFile(b, mkChangedRow({ describedBy: 'r1-0', rowText: 'src/a.ts' }), { detail: 1 });
+    assert.equal(openFiles().length, 0, '有未折叠选区时不应转发');
+    assert.equal(drag.prevented + drag.stopped, 0);
+    b.document.getSelection = () => null;
+
+    // ⑤ 未握手（纯浏览器）：改动行同样不拦，DSH 原生行为不变
+    const b2 = loadBridge({ fetch: fakeRealFetch });
+    try {
+      b2.apply();
+      const s2 = b2.parentMessages.length;
+      b2.elementsById.set('r-0', { textContent: '/ws/src/a.ts' });
+      clickFile(b2, mkChangedRow({ describedBy: 'r-0', rowText: 'src/a.ts' }), { detail: 1 });
+      assert.equal(b2.parentMessages.slice(s2).filter((m) => m.kind === 'openFile').length, 0, '未握手不应转发');
+    } finally {
+      rmSync(b2.outDir, { recursive: true, force: true });
+    }
   } finally {
     rmSync(b.outDir, { recursive: true, force: true });
   }

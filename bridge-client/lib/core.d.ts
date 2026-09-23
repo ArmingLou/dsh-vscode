@@ -69,6 +69,39 @@ export function buildShortcutMessage(
  */
 export function extractToolLinkPath(text: unknown): string;
 
+/**
+ * 元素类名是否为 DSH 的文件链接。
+ * 兼容旧版裸类名（fileMention）与 dsh 0.1.7+ 的 CSS Modules 哈希类名（_fileMention_1jct6_85）。
+ */
+export function hasFileLinkClass(className: unknown): boolean;
+
+/**
+ * 判定一次点击是否落在 DSH 的文件链接元素上，并给出交给扩展打开的路径。
+ * 入参为元素属性快照（className/title/text/refChip）；'' 表示不是文件链接（调用方放行原事件）。
+ */
+export function resolveFileClickPath(info: unknown): string;
+
+/**
+ * 从 RPC 请求体判定「DSH 请求宿主打开文件」，返回其路径。
+ * dsh 0.1.7+ 为斜杠端点 `session/openWorkspacePath`，参数在 `payload.args.request`；
+ * dsh ≤0.1.0-rc.6 的点号 `host.openPath` + `payload.path` 保留兼容。
+ * 仅接管「默认应用打开」；`action:'reveal'` 与显式 `application` 放行返回 ''。
+ */
+export function extractOpenPathRequest(body: unknown): string;
+
+/**
+ * 判定点击是否落在 DSH「改动」卡片（[data-changed-files]）的文件行上，返回要打开的路径。
+ * 作用域 + `aria-describedby` 双重限定（排除卡片 header/折叠按钮与侧栏 review tab）；
+ * 路径优先取 aria-describedby 指向的隐藏 span 文本，回退 row 首个子 span 文本；'' 表示放行。
+ */
+export function resolveChangedRowClick(info: unknown): string;
+
+/**
+ * 是否应放弃本次文件链接点击（照抄 DSH 原生守卫）：双击/多击（`detail > 1`），
+ * 或存在未折叠选区时的单击（拖选收尾误触）。true = 放行，不接管、不 preventDefault。
+ */
+export function isDuplicateOrSelectionClick(event: unknown, selection: unknown): boolean;
+
 /** 判定元素是否为可编辑元素（textarea / 可输入 input / contenteditable） */
 export function isEditableElement(el: unknown): boolean;
 

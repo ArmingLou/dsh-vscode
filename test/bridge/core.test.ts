@@ -16,6 +16,11 @@ import {
   normalizeShortcutMap,
   buildShortcutMessage,
   extractToolLinkPath,
+  hasFileLinkClass,
+  isDuplicateOrSelectionClick,
+  resolveChangedRowClick,
+  resolveFileClickPath,
+  extractOpenPathRequest,
   isEditableElement,
   computeInsertedValue,
   buildReadTextMessage,
@@ -211,4 +216,166 @@ test('extractToolLinkPath 从工具行按钮文本提取路径', () => {
   assert.equal(extractToolLinkPath(null), '');
   assert.equal(extractToolLinkPath(undefined), '');
   assert.equal(extractToolLinkPath(42), '');
+});
+
+// —— dsh 0.1.7 回归：文件链接类名从裸类名改为 CSS Modules 哈希类名 ——
+test('hasFileLinkClass 兼容裸类名与 CSS Modules 哈希类名', () => {
+  // 旧版 dsh：裸类名（原实现用 classList.contains('fileMention') 能命中）
+  assert.equal(hasFileLinkClass('fileMention'), true);
+  assert.equal(hasFileLinkClass('fileLink'), true);
+  // 新版 dsh：CSS Modules 哈希类名（本地名作为子串保留，原来的 contains 判断失效 → 回归根因）
+  assert.equal(hasFileLinkClass('_fileMention_1jct6_85 _fileLink_1jct6_59'), true);
+  assert.equal(hasFileLinkClass('_fileMention_1jct6_85'), true);
+  assert.equal(hasFileLinkClass('o3BgMG_fileLink'), true); // 前缀哈希形态（非下划线开头）
+  // 大小写不敏感
+  assert.equal(hasFileLinkClass('FILEMENTION'), true);
+  // 非文件链接类名：不命中（避免误拦其它按钮）
+  assert.equal(hasFileLinkClass('_linkIcon_1jct6_94 _markdown_1jct6_5'), false);
+  assert.equal(hasFileLinkClass('_cardPreview_nyYjTG_1'), false);
+  assert.equal(hasFileLinkClass(''), false);
+  assert.equal(hasFileLinkClass(null), false);
+  assert.equal(hasFileLinkClass(undefined), false);
+  assert.equal(hasFileLinkClass(42), false);
+});
+
+test('resolveFileClickPath 兼容新旧版文件链接 DOM 形态，并放行非文件点击', () => {
+  // ① 新版 markdown 文件链接：哈希类名 + 相对路径 title（旧实现 classList.contains 失效 → 回归）
+  assert.equal(
+    resolveFileClickPath({ className: '_fileMention_1jct6_85 _fileLink_1jct6_59', title: 'src/a.ts', text: 'a.ts' }),
+    'src/a.ts',
+  );
+  // ② 旧版裸类名 + 绝对路径 title：必须继续兼容
+  assert.equal(resolveFileClickPath({ className: 'fileMention', title: '/ws/src/main.ts' }), '/ws/src/main.ts');
+  // ③ 无类名的产物卡片（title 绝对路径）继续兼容
+  assert.equal(resolveFileClickPath({ className: '_cardPreview_1', title: '/ws/out/a.log' }), '/ws/out/a.log');
+  // ④ @文件 引用芯片：data-ref-chip="file" + title 带 @ 前缀（可含引号包裹的空格路径）
+  assert.equal(resolveFileClickPath({ refChip: 'file', title: '@src/a.ts' }), 'src/a.ts');
+  assert.equal(resolveFileClickPath({ refChip: 'file', title: '@"docs/a b.md"' }), 'docs/a b.md');
+  // ⑤ 非 file 引用芯片（folder/skill/session）：不得误拦（技能芯片 title=/skill 形似路径）
+  assert.equal(resolveFileClickPath({ refChip: 'skill', className: '_fileMention_1jct6_85', title: '/skill' }), '');
+  assert.equal(resolveFileClickPath({ refChip: 'folder', className: '_refChip_1', title: '@docs/' }), '');
+  // ⑥ 行号锚点剥离（扩展侧 showTextDocument 只接受路径）
+  assert.equal(resolveFileClickPath({ className: '_fileLink_1jct6_59', title: '/ws/src/b.ts#L12-L20' }), '/ws/src/b.ts');
+  // ⑦ 普通按钮：不返回路径（调用方据此放行原事件，不 preventDefault）
+  assert.equal(resolveFileClickPath({ className: '_button_1', title: '复制代码', text: '复制' }), '');
+  assert.equal(resolveFileClickPath({}), '');
+  assert.equal(resolveFileClickPath(null), '');
+});
+
+test('extractOpenPathRequest 按 0.1.7 真实线格式接管（slash 端点 + payload.args.request）', () => {
+  // 0.1.7 真实请求体：信封 {type:'client-request', rpcId, method, payload}（dsh-client-connection）；
+  // payload.args 是「按参数 wire 名索引的普通对象」，openWorkspacePath 的参数 wire 名为 request。
+  const wire = (method: string, args: unknown) => ({
+    type: 'client-request',
+    rpcId: 'rpc-1',
+    method,
+    payload: { args },
+  });
+
+  // ① 默认应用打开 → 接管并转发扩展宿主（扩展侧换成 showTextDocument）
+  assert.equal(
+    extractOpenPathRequest(wire('session/openWorkspacePath', { request: { path: '/ws/a.ts' } })),
+    '/ws/a.ts',
+    'slash 端点 + args.request.path 是 0.1.7 现行形态，必须命中',
+  );
+  // ② 用户有意的「离开编辑器」动作 → 放行给 DSH
+  assert.equal(
+    extractOpenPathRequest(wire('session/openWorkspacePath', { request: { path: '/ws/a.ts', action: 'reveal' } })),
+    '',
+    'action=reveal（在文件管理器显示）必须放行',
+  );
+  assert.equal(
+    extractOpenPathRequest(wire('session/openWorkspacePath', { request: { path: '/ws/a.ts', application: '/Applications/X.app' } })),
+    '',
+    '显式 application（指定应用打开）必须放行',
+  );
+  // ③ 防御形态：位置数组 args[0]（DSH 若改回位置参数仍能命中）
+  assert.equal(extractOpenPathRequest(wire('session/openWorkspacePath', [{ path: '/ws/b.ts' }])), '/ws/b.ts');
+  // ④ 其它端点 / 非法形状 → 放行
+  assert.equal(extractOpenPathRequest(wire('session/page', { request: { path: '/ws/a.ts' } })), '');
+  assert.equal(extractOpenPathRequest(wire('session/openWorkspacePath', {})), '');
+  assert.equal(extractOpenPathRequest(wire('session/openWorkspacePath', { request: {} })), '');
+  assert.equal(
+    extractOpenPathRequest({ type: 'client-request', rpcId: 'r', method: 'session.openWorkspacePath', payload: { path: '/ws/a.ts' } }),
+    '',
+    '0.1.7 无线协议不存在点号形态（endpointOf = namespace/method），不得误判命中',
+  );
+  assert.equal(extractOpenPathRequest(null), '');
+  assert.equal(extractOpenPathRequest({}), '');
+});
+
+test('extractOpenPathRequest 兼容 dsh ≤0.1.0-rc.6 旧点号协议（host.openPath + payload.path）', () => {
+  assert.equal(
+    extractOpenPathRequest({ type: 'client-request', rpcId: 'rpc-old', method: 'host.openPath', payload: { path: '/ws/old.ts' } }),
+    '/ws/old.ts',
+    'rc6 点号形态必须继续兼容（0.1.7 已无该端点，仅为旧版兜底）',
+  );
+  assert.equal(extractOpenPathRequest({ method: 'host.openPath', payload: {} }), '');
+  assert.equal(extractOpenPathRequest({ method: 'host.openPath' }), '');
+});
+
+test('resolveChangedRowClick 拦截「改动」卡片文件行：作用域 + aria-describedby 双重限定', () => {
+  // ① 正常命中：隐藏 span 给的是已解析绝对路径
+  assert.equal(
+    resolveChangedRowClick({ inChangedCard: true, describedBy: ':r5q:-0', describedPath: '/ws/src/bridge/host.ts', rowText: 'src/bridge/host.ts' }),
+    '/ws/src/bridge/host.ts',
+  );
+  // ② cwd 缺失：隐藏 span 退回相对路径，照样取用（交宿主侧多基准解析）
+  assert.equal(
+    resolveChangedRowClick({ inChangedCard: true, describedBy: ':r1:-0', describedPath: 'src/a.ts', rowText: 'a.ts' }),
+    'src/a.ts',
+  );
+  // ③ 被 describedBy 指向的文本不是路径（或元素不存在 → describedPath 为空）→ 回退 row 首个子 span 文本
+  assert.equal(
+    resolveChangedRowClick({ inChangedCard: true, describedBy: ':r1:-0', describedPath: '3 files changed', rowText: 'src/b.ts' }),
+    'src/b.ts',
+  );
+  assert.equal(
+    resolveChangedRowClick({ inChangedCard: true, describedBy: ':r1:-0', describedPath: '', rowText: 'src/c.ts' }),
+    'src/c.ts',
+    'getElementById 返回 null（describedPath 空）时回退 row 文本',
+  );
+  // ④ 两者都不形似路径 → 不拦（调用方放行原事件），且不抛错
+  assert.equal(resolveChangedRowClick({ inChangedCard: true, describedBy: ':r1:-0', describedPath: '3 个文件', rowText: '+67 -10' }), '');
+  assert.equal(resolveChangedRowClick({ inChangedCard: true, describedBy: ':r1:-0' }), '');
+  assert.equal(resolveChangedRowClick(null), '');
+  assert.equal(resolveChangedRowClick({}), '');
+});
+
+test('resolveChangedRowClick 排除误拦面：卡片 header / 折叠按钮 / 侧栏 review tab / 非改动行', () => {
+  // a) header 按钮（「打开整轮 review」）：无 aria-describedby → 不拦
+  assert.equal(
+    resolveChangedRowClick({ inChangedCard: true, describedBy: '', describedPath: '', rowText: 'src/a.ts' }),
+    '',
+    'header 按钮没有 aria-describedby，即使文本形似路径也不得拦',
+  );
+  // 折叠按钮同理（同样没有 aria-describedby）
+  assert.equal(resolveChangedRowClick({ inChangedCard: true, describedBy: '', rowText: 'src/a.ts' }), '');
+  // b) 侧栏 review tab 内的文件行：不在 [data-changed-files] 作用域内 → 不拦
+  assert.equal(
+    resolveChangedRowClick({ inChangedCard: false, describedBy: ':r1:-0', describedPath: '/ws/src/a.ts', rowText: 'src/a.ts' }),
+    '',
+    '侧栏 review tab 的行语义是切换预览，必须放行',
+  );
+  assert.equal(resolveChangedRowClick({ describedBy: ':r1:-0', describedPath: '/ws/src/a.ts' }), '');
+  // c) hover 预览是 span 而非 button：DOM 层只对 [data-changed-files] button 取属性，纯函数无从参与
+  //    （该项由 interceptor 用例断言；这里只需确认「未在改动卡片内的元素」一律返回 ''）
+  assert.equal(resolveChangedRowClick({ inChangedCard: true, describedBy: '   ', describedPath: '/ws/a.ts' }), '');
+});
+
+test('isDuplicateOrSelectionClick 照抄 DSH 原生守卫（多击 / 未折叠选区）', () => {
+  const sel = (isCollapsed: boolean) => ({ isCollapsed });
+  // 单击 + 无选区/折叠选区（光标）→ 应接管
+  assert.equal(isDuplicateOrSelectionClick({ detail: 1 }, null), false);
+  assert.equal(isDuplicateOrSelectionClick({ detail: 1 }, sel(true)), false, '折叠选区（光标）不拦截');
+  // 双击/多击 → 放行（原生 `detail > 1` 直接 return）
+  assert.equal(isDuplicateOrSelectionClick({ detail: 2 }, null), true);
+  assert.equal(isDuplicateOrSelectionClick({ detail: 3 }, sel(true)), true);
+  // 存在未折叠选区时的单击（拖选收尾误触）→ 放行
+  assert.equal(isDuplicateOrSelectionClick({ detail: 1 }, sel(false)), true);
+  // detail === 0（程序化点击）：原生不套用选区判定
+  assert.equal(isDuplicateOrSelectionClick({ detail: 0 }, sel(false)), false);
+  // detail 非数字（合成事件缺字段）：按 0 处理，不误拦
+  assert.equal(isDuplicateOrSelectionClick({}, sel(false)), false);
+  assert.equal(isDuplicateOrSelectionClick(null, sel(false)), false);
 });

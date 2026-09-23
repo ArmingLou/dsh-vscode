@@ -214,3 +214,100 @@ test('handleBridgeMessage 处理 bridgeDeleteImages：回执 deleteImagesAck', a
   assert.equal((acks[0] as { ok: boolean }).ok, true);
 });
 
+// —— v0.3.25：相对路径多基准解析（DSH 会话 cwd 优先 → VS Code 各工作区根）——
+// 背景（用户实测）：DSH 会话 cwd 在 A 仓库（如 /Users/.../suansuan/suansuan），
+// VS Code 窗口工作区根在 B 仓库（dsh-vscode），点 `docs/x.md` 被拼到 B 仓库 → 报 nonexistent。
+test('v0.3.25 相对路径多基准：按候选顺序取第一个真实存在的文件', () => {
+  // ① 会话 cwd 命中优先：即便工作区根下也有同名文件，也必须用会话 cwd（DSH 原生语义基准）
+  assert.deepEqual(
+    resolveBridgePath('docs/a.md', '/sess', '/ws', {
+      sessionCwds: ['/sess'],
+      workspaceRoots: ['/ws'],
+      exists: (p) => p === '/sess/docs/a.md' || p === '/ws/docs/a.md',
+    }),
+    { kind: 'abs', path: '/sess/docs/a.md' },
+  );
+  // ② 会话 cwd 落空 → 命中第二个工作区根（多根工作区逐个尝试）
+  assert.deepEqual(
+    resolveBridgePath('docs/a.md', undefined, '/ws1', {
+      workspaceRoots: ['/ws1', '/ws2'],
+      exists: (p) => p === '/ws2/docs/a.md',
+    }),
+    { kind: 'abs', path: '/ws2/docs/a.md' },
+  );
+  // ③ 用户真实场景：DSH 会话 cwd 在另一个仓库，工作区根里没有该文件
+  assert.deepEqual(
+    resolveBridgePath('docs/global_free_app_configs_override_guide.md', undefined, '/vs-root', {
+      sessionCwds: ['/other/repo'],
+      exists: (p) => p === '/other/repo/docs/global_free_app_configs_override_guide.md',
+    }),
+    { kind: 'abs', path: '/other/repo/docs/global_free_app_configs_override_guide.md' },
+  );
+  // ④ 全部落空 → not-found 并回报试过的基准（去重、保持优先级顺序）
+  assert.deepEqual(
+    resolveBridgePath('docs/missing.md', '/sess', '/ws', {
+      sessionCwds: ['/sess', '/other'],
+      workspaceRoots: ['/ws', '/ws2'],
+      exists: () => false,
+    }),
+    { kind: 'not-found', tried: ['/sess', '/other', '/ws', '/ws2'] },
+  );
+  // ④′ DSH 工作区注册表路径排在 VS Code 工作区根**之后**（避免无关历史工作区抢走窗口内同名文件）
+  assert.deepEqual(
+    resolveBridgePath('README.md', undefined, '/vs-root', {
+      dshWorkspacePaths: ['/old/proj'],
+      exists: (p) => p === '/vs-root/README.md' || p === '/old/proj/README.md',
+    }),
+    { kind: 'abs', path: '/vs-root/README.md' },
+    '窗口工作区根能命中时，注册表路径不得抢先',
+  );
+  assert.deepEqual(
+    resolveBridgePath('docs/only-in-old.md', undefined, '/vs-root', {
+      dshWorkspacePaths: ['/old/proj'],
+      exists: (p) => p === '/old/proj/docs/only-in-old.md',
+    }),
+    { kind: 'abs', path: '/old/proj/docs/only-in-old.md' },
+    '窗口工作区根没有时才回落到注册表路径',
+  );
+  // ⑤ 未提供 exists（旧调用方）：保持「取第一个基准」旧语义不变
+  assert.deepEqual(resolveBridgePath('src/main.ts', '/sess', '/ws'), { kind: 'abs', path: '/sess/src/main.ts' });
+  // ⑥ 绝对路径与危险协议不受多基准影响
+  assert.deepEqual(resolveBridgePath('/abs/a.md', '/sess', '/ws', { exists: () => false }), { kind: 'abs', path: '/abs/a.md' });
+  assert.deepEqual(resolveBridgePath('https://x.com/a', '/sess', '/ws', { exists: () => true }), { kind: 'invalid' });
+});
+
+test('v0.3.25 命中会话 cwd 时正常打开（不再落到 VS Code 工作区根）', async () => {
+  const opened: string[] = [];
+  const warns: string[] = [];
+  await handleBridgeMessage({ type: 'bridgeOpenFile', path: 'docs/a.md' }, {
+    openExternal: async () => true,
+    openTextDocument: async (p) => { opened.push(p); },
+    showWarning: (m) => { warns.push(m); },
+    workspaceRoot: '/vs-root',
+    dshSessionCwds: () => ['/other/repo'],
+    vscodeWorkspaceRoots: () => ['/vs-root'],
+    exists: (p) => p === '/other/repo/docs/a.md',
+  });
+  assert.deepEqual(opened, ['/other/repo/docs/a.md'], '应打开 DSH 会话 cwd 下的真实文件');
+  assert.equal(warns.length, 0, '命中时不应有提示');
+});
+
+test('v0.3.25 多基准全落空：提示写明原始路径与试过的基准（不再只有裸的 VS Code 报错）', async () => {
+  const warns: string[] = [];
+  let opened = 0;
+  await handleBridgeMessage({ type: 'bridgeOpenFile', path: 'docs/missing.md', cwd: '/sess' }, {
+    openExternal: async () => true,
+    openTextDocument: async () => { opened += 1; },
+    showWarning: (m) => { warns.push(m); },
+    workspaceRoot: '/ws',
+    dshSessionCwds: () => ['/sess', '/other'],
+    vscodeWorkspaceRoots: () => ['/ws'],
+    exists: () => false,
+  });
+  assert.equal(opened, 0, '全落空时不应尝试打开');
+  assert.equal(warns.length, 1, '必须给一次可见提示');
+  assert.match(warns[0]!, /找不到文件：docs\/missing\.md/);
+  for (const base of ['/sess', '/other', '/ws']) {
+    assert.ok(warns[0]!.includes(base), `提示应写明试过的基准 ${base}`);
+  }
+});

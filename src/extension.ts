@@ -11,6 +11,7 @@ import { ServiceManager, type ManagerOptions, type SessionCookieStore, type Owne
 import { DshPanelProvider } from './panel/provider';
 import { StatusBarController } from './statusbar';
 import { resolveWorkspaceRoot } from './workspaceRoot';
+import { workspacePathsFromRegistry } from './bridge/workspaceRegistry';
 import { createUrlResolver } from './remote';
 import { createDshApiClient } from './bridge/api';
 import { syncWorkspace } from './bridge/sync';
@@ -548,6 +549,52 @@ export function activate(context: vscode.ExtensionContext): void {
     asExternalUri: async (uri) => await vscode.env.asExternalUri(vscode.Uri.parse(uri.toString())),
   });
 
+  // DSH 用户目录：$DSH_HOME 优先，缺省 ~/.dsh（与 installOpts 的解析保持一致）
+  const dshHome = process.env.DSH_HOME ?? join(homedir(), '.dsh');
+  // DSH 各会话 cwd 缓存（v0.3.25）：文件链接相对路径的首选解析基准。
+  // DSH 原生 `openFile` 以「该会话的 cwd」为基准（fileAddressFor(sessionId, cwd, path)），
+  // 但扩展原先只有「VS Code 工作区根」一个 base —— 当 DSH 会话开在别的仓库/工作空间
+  // （用户实测：会话 cwd=<另一仓库>，VS Code 窗口工作区根=本仓库）时相对路径会被拼错，
+  // 报「Unable to resolve nonexistent file」。这里经 session/list 探测真实会话 cwd 交给宿主层。
+  let sessionCwdsCache: string[] = [];
+  let sessionCwdsAt = 0;
+  async function refreshSessionCwds(): Promise<void> {
+    const snapshot = manager?.getSnapshot();
+    if (!snapshot || snapshot.state !== 'ready' || !snapshot.url) return;
+    try {
+      const api = await createDshApiClient(snapshot.url, manager?.getSessionCookie() ?? undefined);
+      const cwds = await api.sessionCwds();
+      sessionCwdsCache = cwds;
+      appendLog(`[bridge] dsh session cwds: ${cwds.length > 0 ? cwds.join(' | ') : '(none)'}`);
+    } catch (err) {
+      appendLog(`[bridge] dsh session cwd probe failed: ${String(err)}`);
+    }
+  }
+  /**
+   * 不依赖网络/鉴权的兜底基准来源：DSH 客户端工作区注册表（$DSH_HOME/storages/workspace.json）
+   * 里记录了用户用过的全部工作区绝对路径。读取失败/形状变化一律返回空数组（不抛错、不打断点击链路）。
+   */
+  function dshRegistryWorkspacePaths(): string[] {
+    try {
+      const raw = readFileSync(join(dshHome, 'storages', 'workspace.json'), 'utf8');
+      return workspacePathsFromRegistry(raw);
+    } catch {
+      return [];
+    }
+  }
+  /**
+   * 同步 getter：会话 cwd 命中缓存，超过 TTL 时后台刷新（不阻塞点击链路）；
+   * 注册表路径随取随读（本地小文件 + 纯解析），失败/形状变化都静默降级为空。
+   */
+  const dshPathBasesGetter = (): { sessionCwds: readonly string[]; workspacePaths: readonly string[] } => {
+    const now = Date.now();
+    if (now - sessionCwdsAt > 30_000) {
+      sessionCwdsAt = now;
+      void refreshSessionCwds();
+    }
+    return { sessionCwds: sessionCwdsCache, workspacePaths: dshRegistryWorkspacePaths() };
+  };
+
   // 唯一面板（左侧活动栏视图 dsh.panel）的 provider；与 manager 一一对应（服务状态一致）
   const panel = new DshPanelProvider(
     manager,
@@ -565,6 +612,7 @@ export function activate(context: vscode.ExtensionContext): void {
     () => {
       void syncWorkspaceOnce(); // 桥接握手成功后触发工作区同步
     },
+    dshPathBasesGetter, // 文件链接相对路径的 DSH 侧基准：会话 cwd（首选）+ 工作区注册表（兜底）（v0.3.25）
   );
   // 复制网址命令读取面板的展示 URL（远程=隧道本地 URL）
   getDisplayUrl = () => panel.getDisplayUrl();
@@ -632,6 +680,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const api = await createDshApiClient(snapshot.url, manager?.getSessionCookie() ?? undefined);
       const ws = await syncWorkspace(api, root);
       workspaceSynced = true;
+      void refreshSessionCwds(); // 预热会话 cwd 缓存（文件链接相对路径的首选基准）
       panel.setWorkspaceId(ws.workspaceId, ws.path);
       appendLog(`[bridge] workspace synced: ${ws.workspaceId} (${root})`);
     } catch (err) {

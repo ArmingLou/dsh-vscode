@@ -1,3 +1,72 @@
+## [0.3.26] - 2026-09-23
+
+### 新增
+
+- **聊天里 DSH「改动」卡片（`[data-changed-files]`）的文件行，点击改为在 VS Code 编辑器打开该文件**（用户明确：不需要在 VS Code 开真 diff，能解析出路径、用编辑器打开即可）。
+  - **为什么只能 DOM 层拦**：该行点击**不发任何 RPC/HTTP** —— `button.row` 的 `onClick: openReview(index)` → `openChangesReview(...)` → `ctx.sidebarRight.openResource("dsh-resource://changes-review/…", { params: { index } })` → `placeResource` 只改前端 store（diff 内容要等侧栏 tab 挂载后才 GET `/api/changes.diff`）。传输层无请求可拦，必须在捕获阶段阻止 DSH 自己的 onClick。
+  - **实现**：`core.js` 新增纯函数 `resolveChangedRowClick({ inChangedCard, describedBy, describedPath, rowText })`；`client.js` 的 `bindLinkInterception` 在文件链接分支**之前**加改动行分支，命中即 `preventDefault()+stopPropagation()` 并复用既有 `bridgeOpenFile` 消息 → **宿主侧零改动**（`handleBridgeMessage` → `resolveBridgePath` 多基准（DSH 会话 cwd → VS Code 各工作区根 → DSH 工作区注册表 + `exists` 兜底）→ `showTextDocument`）。
+  - **路径取值优先级**：① 作用域必须在 `[data-changed-files]` 内（该 data-* 仅出现于聊天区卡片）→ ② 必须带非空白 `aria-describedby`（卡片 header「打开整轮 review」与底部折叠按钮都没有它，据此排除）→ ③ 取 `aria-describedby` 指向的隐藏 `span` 文本（DSH 用 `resolveWorkspacePath(cwd, file.path)` 渲染：cwd 已知时为**绝对路径**，缺失时退回**相对路径**，两种形态都支持）→ ④ 回退 row 首个子 `span` 文本（`file.display`）→ ⑤ 都不形似路径则返回 `''`（完全放行原事件）。注意 React `useId` 生成的 id 形如 `:r5q:-0`（含冒号），**不能当 CSS 选择器**，一律走 `getElementById`。
+  - **有意的行为收紧**：改动行同样套用与文件链接一致的**多击/选区守卫** `isDuplicateOrSelectionClick`（`detail > 1` 或存在未折叠选区时不触发）。DSH 原生该行**没有**这层守卫，桥接加上它以避免双击/拖选收尾误开文件——属有意收紧，与既有文件链接行为保持一致。
+  - **误拦面收窄（逐项有测试）**：卡片 header 按钮、折叠按钮（无 `aria-describedby`）、DSH 侧栏 review tab 内的文件行（不在 `[data-changed-files]` 作用域，语义是切换预览）、hover 预览 `span`（非 `button`）一律放行；不硬编码任何 CSS Modules 哈希类名（`hz8-rW_*` 随版本变），仅按 `data-*` / `aria-*` / 结构判定。
+
+### 测试
+
+- `test/bridge/core.test.ts` 新增 2 例：`resolveChangedRowClick` 的绝对/相对两形态、描述元素缺失时回退 row 文本、两者都不形似路径时不拦不抛错；以及误拦面（无 `aria-describedby` 的 header/折叠按钮、非卡片作用域、空白 `describedBy`）全部返回 `''`。
+- `test/bridge/interceptor.test.ts` 新增 2 例（对**构建产物**、真实改动卡片 DOM 结构）：命中转发 `openFile` 且 `kind === 'openFile'`（复用既有消息）、`getElementById` 为 null 时回退、取不到路径时完全放行；header/侧栏行/hover span/未握手四种情形一律不拦。
+- **反证**：临时移除 `client.js` 的改动行分支 → 新增的命中用例变红（`not ok 21`）；恢复后 22/22 绿。
+
+## [0.3.25] - 2026-09-23
+
+### 修复
+
+- **修复 0.3.24 实机暴露的问题：点文件链接已到达 VS Code，但报 `Unable to resolve nonexistent file`（相对路径的解析基准选错）**。
+  - **现象**：用户装 0.3.24 并 Reload 后点 `docs/global_free_app_configs_override_guide.md`，VS Code 提示 `无法打开文件：/Volumes/ssd/Documents/develop/third/dsh-vscode/docs/global_free_app_configs_override_guide.md（…Unable to resolve nonexistent file…）`——即 DOM 拦截层与转发链路已生效，但路径被拼到了**错误的仓库根**。
+  - **根因**：`host.ts` 的 `resolveBridgePath` 对相对路径只赌**单一 base**（`base = sessionCwd ?? workspaceRoot`），而桥接消息从不携带 `cwd`（`client.js` 发 `openFile` 不带 cwd），于是永远退化为「VS Code 窗口工作区根」。但 DSH 前端产出的相对路径，其语义基准是**该会话的 cwd**（DSH 原生 `openFile` → `fileAddressFor(sessionId, cwd, path)`，见 `dsh-client-ui-chat/lib/client.js:12066`）。用户把 DSH 会话开在 A 仓库（`/Users/arming/Documents/develop/suansuan/suansuan`，该文件确实只存在于此处），却在 B 仓库（本扩展仓库）的 VS Code 窗口里用面板 → 相对路径被拼到 B 仓库根，必然不存在。
+  - **修复（多基准 + 取第一个真实存在的文件）**：`resolveBridgePath` 收 `ResolvePathOptions { sessionCwds, workspaceRoots, exists }`，候选顺序为 **桥接消息自带 cwd → DSH 各会话 cwd（按 updatedAt 由新到旧）→ VS Code 各工作区根（多根逐个）→ DSH 工作区注册表里的全部工作区路径**，逐个与相对路径拼接后用 `fs.existsSync` 探测，**命中第一个真实存在的文件即打开**。未提供 `exists` 时保持旧语义（取第一个基准），既有调用方与单测行为不变。
+  - **两个 DSH 侧基准来源**：① 首选 `session/list`（新 `DshApiClient.sessionCwds()`，扩展侧带 TTL 缓存 + 面板就绪后预热；参数按 0.1.7 线格式 `payload.args._request`，取 `items[].cwd` 按 `updatedAt` 倒序去重）；② 不依赖网络/鉴权的兜底——新增 `src/bridge/workspaceRegistry.ts` 解析 `$DSH_HOME/storages/workspace.json` 的 `tables.workspaces[*].path`（纯函数、防御式，形状不符返回空数组）。两来源任一失效都自动降级，不会打断点击链路。
+  - **全不命中不再静默/裸报错**：多基准全部落空时弹可见提示，写明**原始相对路径**与**逐个试过的基准目录**，替代原先只有 VS Code 原生 `Unable to resolve nonexistent file` 的无上下文报错。
+
+### 测试
+
+- `test/bridge/host.test.ts` 新增 3 例：多基准按顺序取第一个真实存在的文件（会话 cwd 优先于工作区根、命中第二个工作区根、命中「另一个 DSH 工作区」的用户真实场景、全落空返回 `not-found` 并附试过的基础目录、无 `exists` 时保持旧语义、绝对路径/危险协议不受影响）；命中会话 cwd 时正常打开且无提示；全落空时提示包含原始路径与各基准。
+- `test/bridge/workspaceRegistry.test.ts` 新增 3 例：按 0.1.7 实测形状提取路径、去重与非法项跳过、非 JSON/形状不符返回空数组、上限截断。
+- **反证**：将 `resolveBridgePath` 临时回退为修复前的单基准实现 → 上述 3 个 `host.test.ts` 新用例全红（`应打开 DSH 会话 cwd 下的真实文件`）；恢复后全绿。
+- **真实数据自测**：以用户实际路径（会话工作区 `/Users/arming/Documents/develop/suansuan/suansuan` + 真实 `fs.existsSync`）跑修复前后对比——修复前解析到本仓库根（不存在），修复后解析到 `…/suansuan/docs/global_free_app_configs_override_guide.md`（存在）。
+
+## [0.3.24] - 2026-09-23
+
+### 修复
+
+- **修正 0.3.23 引入的 RPC 兜底层协议错误：0.1.7 的「宿主打开文件」端点是斜杠形态 `session/openWorkspacePath`，参数在 `payload.args.request`**（此前按点号 `session.openWorkspacePath` + `payload.path` 判定，在 0.1.7 上**永不命中**，RPC 兜底实为死代码）。
+  - **复核依据（0.1.7 产物）**：端点恒为 `<namespace>/<method>`——`dsh-typert-registry/README.md`（Identity and validation：「`<namespace>/<method>` for endpoints」）、`dsh-api-gateway/lib/client.js:2039-2041`（`endpointOf = namespace + '/' + method`）、`dsh-api-gateway/lib/index.js:1219-1222`（`remoteRequest` 要求 `endpoint.split('/')` 恰为 2 段）；请求信封为 `{type:'client-request', rpcId, method: endpoint, payload:{args}}`（`dsh-client-connection/lib/client.js:1213-1221`、`dsh-api-gateway/lib/client.js:1788`）。
+  - **参数位置**：`payload.args` **不是位置数组**，而是「按参数 wire 名索引的普通对象」（`prepareInvocation` 执行 `args[parameter.wire] = value`，`dsh-api-gateway/lib/client.js:1813-1842`；`remoteRequest` 亦要求 `payload.args` 是 plain object，数组会被 `isPlainObject` 拒绝）。`openWorkspacePath` 的参数 wire 名为 `request`（`dsh-api-remotes/lib/client.js:9951-9965` 描述符），故真实形态是 `payload.args.request = { path, action?, application? }`（请求 schema：`dsh-api-session-controller/lib/typert.host.js:516-520`）。**据此修正了审查意见中「取 `payload.args[0].path`」的说法**：实测应取 `payload.args.request.path`（仍防御性兼容 `args[0]`/摊平两种形态）。
+  - **修复**：`core.js:extractOpenPathRequest` 认斜杠端点 `session/openWorkspacePath` 并解析 `payload.args.request`；`action:'reveal'` 与显式 `application` 放行语义照旧（判据改为该 request 对象），保留用户「离开编辑器」的显式意图；dsh ≤0.1.0-rc.6 的点号 `host.openPath` + `payload.path` 分支保留为旧版兼容（0.1.7 已无该端点：全仓无 `host.openPath`、无 `dsh-host-apiproxy`）。
+- **补齐 DSH 原生同款的防误触守卫（多击 / 未折叠选区）**：DSH 原生文件链接 `onClick` 首行即 `if (event.detail > 1 || (event.detail !== 0 && getSelection()?.isCollapsed === false)) return;`（`dsh-client-ui-primitives/lib/index.js:5883`）——双击/多击、以及「文档里存在未折叠选区时的单击」（拖选收尾误触）都不打开文件。桥接在捕获阶段先于 DOM onClick 执行，此前不判这两个条件，反而比原生更容易误开文件；现由新增纯函数 `isDuplicateOrSelectionClick`（`core.js`）在 `client.js` 文件链接分支前统一守卫，命中即完全放行原事件（不 `preventDefault`/`stopPropagation`）。
+
+### 文档
+
+- `README.md` / `README.zh.md` 的「文件跳转 / File jumps」条目、`bridge-client/lib/client.js`（DOM 与 RPC 两处注释）、`bridge-client/lib/core.js` 的 `extractOpenPathRequest` 文档、`bridge-client/lib/core.d.ts` 声明，统一改为「0.1.7 为斜杠端点 `session/openWorkspacePath` + `payload.args.request`；点号 `host.openPath` 仅为 rc6 旧版兼容」，不再把 `host.openPath` 当作 0.1.7 的汇聚点。
+
+### 测试
+
+- `test/bridge/core.test.ts`：`extractOpenPathRequest` 用例**换成 0.1.7 真实请求体**（`{type:'client-request', rpcId, method:'session/openWorkspacePath', payload:{args:{request:{path}}}}`）——默认打开必命中、`action:'reveal'` 与显式 `application` 必放行；另断言点号 `session.openWorkspacePath` **不得**误判命中；rc6 点号 `host.openPath` 兼容用例独立成条；新增 `isDuplicateOrSelectionClick` 用例（多击、未折叠选区、折叠选区、`detail:0` 与缺字段）。
+- `test/bridge/interceptor.test.ts`：新增原生守卫端到端用例（对构建产物派发 `detail:2`、以及未折叠选区下的 `detail:1`，断言不转发 `openFile` 且不 `preventDefault`/`stopPropagation`；恢复折叠选区后恢复接管）；`clickFile` 支持注入原生事件字段。
+
+## [0.3.23] - 2026-09-23
+
+### 修复
+
+- **修复 dsh 升级到 0.1.7+ 后「点击聊天里的文件链接不再用 VS Code 编辑器打开」（回归）**：点击 markdown 文件链接、`@文件` 引用芯片、present 产物卡片，文件都落到 **DSH 自带侧栏预览**（`sidebarRight.openResource`），不再进编辑器。
+  - **根因（两层同时失效）**：① **DOM 拦截按裸类名判定**——旧实现是 `btn.classList.contains('fileMention')`；dsh 0.1.7 起前端全部改用 CSS Modules，实际渲染为 `_fileMention_1jct6_85 _fileLink_1jct6_59`（`MarkdownFileLink`）/ `_fileMention_1jct6_85`（inline-code mention），`contains` 恒 false；同时 markdown 链接的 `title` 是**相对路径**（如 `src/a.ts`），旧的「title 为绝对路径」兜底也不命中 → DOM 层漏拦。② **RPC 兜底网整条断掉**——旧版汇聚点 `host.openPath` 在 0.1.7 中已被移除，打开文件改由 `session.openWorkspacePath` 承担。两层同时失效 → 点击回落到 DSH 原生 `openFile()` → 侧栏预览。
+  - **修复**：DOM 判定收敛到 `core.js` 纯函数——`hasFileLinkClass`（类名子串匹配，兼容裸类名 `fileMention` 与 CSS Modules 哈希类名，含非下划线前缀形态如 `o3BgMG_fileLink`）+ `resolveFileClickPath`（「`data-ref-chip=file` 引用芯片 → 文件链接类名 → title 为绝对路径」三级判定，附行号锚点剥离与 `@`/目录/URL 形态排除）；RPC 兜底由 `extractOpenPathRequest` 接管。（注：本条最初把 0.1.7 的端点写成点号 `session.openWorkspacePath`，**该写法有误**——0.1.7 的 typert 端点是斜杠形态 `session/openWorkspacePath` 且参数在 `payload.args.request`；正确实现见 0.3.24。）
+  - **防误拦**：非 `file` 的引用芯片（`folder`/`session`/`skill`）显式排除——它们同样是 `<button>` 且带 `fileMention` 类名，技能芯片 `title` 恰为 `/skill`，不排除会被当绝对路径误拦。
+  - **兼容**：未握手（纯浏览器打开）时 `bridgeToken === ''` 直接放行，DSH 原生行为不变；旧版 dsh 的裸类名与无类名产物 chip（title 绝对路径）继续命中。
+
+### 测试
+
+- `test/bridge/core.test.ts` 新增 3 例：`hasFileLinkClass` 裸/哈希类名双向兼容与非文件类名不误判；`resolveFileClickPath` 覆盖新版哈希类名+相对路径、旧版裸类名、产物卡片、`@`芯片、非 file 芯片防误拦、行号锚点、普通按钮放行；`extractOpenPathRequest` 覆盖新旧 RPC 形态与 reveal/指定应用放行（该用例当时按点号形态自证，已在 0.3.24 换成真实请求体）。
+- `test/bridge/interceptor.test.ts` 以真实 dsh 0.1.7 类名驱动**构建产物**端到端验证；并补齐 vm 沙箱缺失的 `URL` 全局（缺失会让 `isAllowedExternalUrl` 恒 false，外链用例假失败）。
+
 ## [0.3.22] - 2026-09-22
 
 ### 修复

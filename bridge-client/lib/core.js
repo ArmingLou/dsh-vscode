@@ -268,6 +268,240 @@ export function extractToolLinkPath(text) {
   return s;
 }
 
+// DSH「文件链接」元素的类名本地名。旧版是裸类名（class="fileMention"）；
+// dsh 0.1.7 起全部走 CSS Modules，类名被哈希为 `_fileMention_1jct6_85` / `o3BgMG_fileLink`
+// 这类「哈希 + 本地名」形态——本地名仍作为子串保留，故统一用「包含」判定，一次兼容新旧两代。
+const FILE_LINK_CLASS_FRAGMENTS = ['filemention', 'filelink'];
+
+/** 元素类名是否为 DSH 的文件链接（兼容 CSS Modules 哈希类名与旧版裸类名）。 */
+export function hasFileLinkClass(className) {
+  const cn = typeof className === 'string' ? className.toLowerCase() : '';
+  if (cn === '') return false;
+  return FILE_LINK_CLASS_FRAGMENTS.some((fragment) => cn.indexOf(fragment) !== -1);
+}
+
+/** 绝对路径形态：POSIX `/a`、Windows 盘符 `C:\a` / `C:/a`（UNC `\\a` 一并认）。 */
+export function isAbsolutePathLike(value) {
+  const s = typeof value === 'string' ? value.trim() : '';
+  return s !== '' && (s.startsWith('/') || s.startsWith('\\\\') || /^[a-zA-Z]:[\\/]/.test(s));
+}
+
+/** 形似 URL（协议开头且非 Windows 盘符）：扩展侧的路径解析会拒绝它，不能当文件路径转发。 */
+export function isUrlLikePath(value) {
+  const s = typeof value === 'string' ? value.trim() : '';
+  return /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(s) && !/^[a-zA-Z]:[\\/]/.test(s);
+}
+
+/**
+ * 归一化一个「路径候选」字符串：去首尾空白与包裹引号，剥掉行号锚点。
+ * 剥行号的原因：DSH 的文件链接可带 `#L12` / 工具行摘要可带 `:12-20`，而扩展侧
+ * showTextDocument 只接受路径；留着会让路径解析直接失败（点了没反应）。
+ * 多行文本（说明文案）、超长串一律判非路径。
+ */
+function normalizePathToken(value) {
+  if (typeof value !== 'string') return '';
+  let s = value.trim();
+  if (s === '' || s.length > 512 || /[\r\n]/.test(s)) return '';
+  s = s.replace(/^['"`]+|['"`]+$/g, '').trim();
+  s = s.replace(/#L\d+(?:-L\d+)?$/i, '').replace(/:\d+(?:-\d+)?$/, '').trim();
+  return s;
+}
+
+/**
+ * `@路径` 引用芯片（DSH 输入框/回复里的 file mention）→ 真实路径。
+ * 形态：`@src/a.ts`、`@"C:\x y.md"`（带空格的路径被引号包裹）。
+ * 目录引用（`@docs/` 结尾带分隔符）不当作文件，返回 ''。
+ */
+export function extractReferencePath(label) {
+  const raw = typeof label === 'string' ? label.trim() : '';
+  if (!raw.startsWith('@')) return '';
+  const s = normalizePathToken(raw.slice(1));
+  if (s === '' || s.endsWith('/') || s.endsWith('\\')) return '';
+  return s;
+}
+
+/** 单令牌路径形态判定：含分隔符、`~` 缩写，或看起来像「有扩展名的文件名」。 */
+function looksLikeFilePath(value) {
+  const s = normalizePathToken(value);
+  if (s === '' || s.startsWith('@')) return false;
+  if (/\s/.test(s)) return extractToolLinkPath(s) !== ''; // 「read · src/a.ts」这类带前缀的摘要
+  return (
+    s === '~' ||
+    s.startsWith('/') ||
+    s.includes('/') ||
+    s.includes('\\') ||
+    /\.[A-Za-z0-9]{1,8}$/.test(s)
+  );
+}
+
+/**
+ * 判定一次点击是否落在 DSH 的「文件链接」元素上，并给出要交给扩展打开的路径。
+ *
+ * 纯数据入参（元素属性快照），因此新旧 DSH 的各种 DOM 形态都能在此一处收口并单测：
+ *  - `@文件` 引用芯片：data-ref-chip="file" + title=`@路径`（dsh 0.1.7 新增标记）；
+ *  - markdown 文件链接 / 旧版 fileMention：类名含 fileMention|fileLink，title 即路径
+ *    （可能是相对路径，由扩展侧按工作区根解析）；无 title 时退回按钮文本；
+ *  - 产物文件卡片等旧结构：title 为绝对路径即认（不依赖类名）。
+ *
+ * @param {{className?: unknown, title?: unknown, text?: unknown, refChip?: unknown}} info 属性快照
+ * @returns {string} 路径；'' 表示不是文件链接（调用方必须放行原事件，不 preventDefault）
+ */
+export function resolveFileClickPath(info) {
+  if (!info || typeof info !== 'object') return '';
+  const rawTitle = typeof info.title === 'string' ? info.title : '';
+  const rawText = typeof info.text === 'string' ? info.text : '';
+  // ① @文件 引用芯片：title/text 带 @ 前缀，必须先去前缀再判路径
+  if (info.refChip === 'file') {
+    const ref = extractReferencePath(rawTitle) || extractReferencePath(rawText);
+    if (ref !== '') return ref;
+  }
+  // ①′ 其它引用芯片（folder / session / skill）：渲染为 button 且同样带 fileMention 类名，
+  //     title 还常形似路径（技能芯片 title=`/skill`）——必须显式排除，否则会误拦并把
+  //     「/skill」当文件路径转发（点了弹「无法打开文件」且原生行为被吞）。
+  if (typeof info.refChip === 'string' && info.refChip !== '' && info.refChip !== 'file') return '';
+  const title = normalizePathToken(rawTitle);
+  const text = normalizePathToken(rawText);
+  if (hasFileLinkClass(typeof info.className === 'string' ? info.className : '')) {
+    // ② 文件链接元素：title 是真实路径，优先用它；绝不使用 aria-label
+    //    （那是「打开 xxx」本地化文案，当成路径会解析失败——旧实现踩过的坑）
+    //    @引用芯片（见 ①）与目录（结尾分隔符）不在这里兜底：它们不是可打开的文件路径。
+    const titleUsable = title !== '' && !title.startsWith('@') && !title.endsWith('/') && !title.endsWith('\\') && !isUrlLikePath(title);
+    if (titleUsable) return title;
+    const stripped = extractToolLinkPath(text); // 去掉「read · 」等工具名前缀
+    if (stripped !== '' && !stripped.startsWith('@')) return stripped;
+    if (looksLikeFilePath(text)) return text;
+  }
+  // ③ 兼容不依赖类名的旧结构（产物 chip：title 为绝对路径）
+  if (title !== '' && isAbsolutePathLike(title)) return title;
+  return '';
+}
+
+/**
+ * 判定一次点击是否落在 DSH「改动」卡片（`[data-changed-files]`）的文件行上，并给出要打开的路径。
+ *
+ * 背景：该行的点击**不发任何 RPC/HTTP**（`onClick: openReview(index)` →
+ * `openChangesReview` → `ctx.sidebarRight.openResource("dsh-resource://changes-review/…")`
+ * → `placeResource` 只改前端 store；diff 内容要等侧栏 tab 挂载后才 GET），因此无法在传输层接管，
+ * 只能在 DOM 捕获层拦。用户需求：不要求开真 diff，能解析出路径、用编辑器打开该文件即可。
+ *
+ * 入参为元素属性/文本快照（纯数据，可单测）：
+ *  - `inChangedCard`：点击的按钮是否位于 `[data-changed-files]` 卡片内（该 data-* 仅出现于
+ *    聊天区的改动卡片，侧栏 review tab 的文件行没有它 → 天然排除，那里语义是切换预览）；
+ *  - `describedBy`：`aria-describedby` 原文（React useId 形态如 `:r5q:-0`）。
+ *    卡片 header（「打开整轮 review」）与底部折叠按钮都**没有**它 → 据此排除；
+ *  - `describedPath`：`describedBy` 指向元素的文本。DSH 渲染的隐藏 span 内容是
+ *    `resolveWorkspacePath(cwd, file.path)` —— cwd 可用时是**绝对路径**，缺失时退回相对路径；
+ *  - `rowText`：row 按钮内首个子 span 的文本（`file.display`，相对会话 cwd 或已是绝对路径），
+ *    作为 describedPath 不可用时的回退。
+ *
+ * 判定优先级：作用域（必须在改动卡片内）→ 必须带 aria-describedby → describedPath 形似路径则用它
+ * → 否则回退 rowText → 都不形似则返回 ''（调用方必须放行原事件，不 preventDefault）。
+ *
+ * @param {{inChangedCard?: unknown, describedBy?: unknown, describedPath?: unknown, rowText?: unknown}} info 属性快照
+ * @returns {string} 路径；'' 表示不是改动行（或取不到可用路径）
+ */
+export function resolveChangedRowClick(info) {
+  if (!info || typeof info !== 'object') return '';
+  // ① 作用域限定：必须在聊天区「改动」卡片内
+  if (info.inChangedCard !== true) return '';
+  // ② 必须带（非空白的）aria-describedby（header / 折叠按钮 / 其它按钮据此排除）
+  if (typeof info.describedBy !== 'string' || info.describedBy.trim() === '') return '';
+  // ③ 首选隐藏 span 文本（DSH 已按会话 cwd 解析；绝对路径直接开，相对路径交宿主侧多基准解析）
+  const described = normalizePathToken(typeof info.describedPath === 'string' ? info.describedPath : '');
+  if (looksLikeFilePath(described)) return described;
+  // ④ 回退 row 首个子 span 的文本
+  const rowText = normalizePathToken(typeof info.rowText === 'string' ? info.rowText : '');
+  if (looksLikeFilePath(rowText)) return rowText;
+  return '';
+}
+
+/**
+ * 从 0.1.7 typert RPC 的 `payload.args` 中取出 openWorkspacePath 的请求对象。
+ *
+ * 线格式（已核对 0.1.7 产物，注意 args **不是位置数组**）：
+ * 客户端组装参数时执行 `args[parameter.wire] = value`，即 args 是「按参数 wire 名索引的
+ * 普通对象」（dsh-api-gateway/lib/client.js:1813-1842 prepareInvocation）。openWorkspacePath
+ * 的唯一参数 wire 名为 `request`（dsh-api-remotes/lib/client.js:9951-9965 描述符
+ * `parameters[0].wire === "request"`），故真实形态是：
+ *   `payload.args.request = { path, action?: 'reveal', application?: string }`
+ *   （请求 schema 见 dsh-api-session-controller/lib/typert.host.js:516-520）
+ * 另外 0.1.7 的 gateway 要求 `payload.args` 是 plain object（数组会被 isPlainObject 拒绝，
+ * dsh-api-gateway/lib/index.js:1536-1540 + remoteRequest 1217-1222），进一步印证非位置数组。
+ * 仍防御性接受「位置数组 args[0]」与「摊平 args.path」两种形态，避免 DSH 日后改回位置参数时静默失效。
+ *
+ * @param {unknown} args RPC payload.args
+ * @returns {{path: string, action?: unknown, application?: unknown}|null} 请求对象；形状不符返回 null
+ */
+function openWorkspacePathRequest(args) {
+  if (!args || typeof args !== 'object') return null;
+  const candidates = [];
+  if (args.request && typeof args.request === 'object') candidates.push(args.request); // 0.1.7 真实现行形态
+  if (Array.isArray(args) && args[0] && typeof args[0] === 'object') candidates.push(args[0]); // 防御：位置参数
+  candidates.push(args); // 防御：请求字段直接摊平在 args 上
+  for (const candidate of candidates) {
+    if (typeof candidate.path === 'string' && candidate.path !== '') return candidate;
+  }
+  return null;
+}
+
+/**
+ * 从 RPC 请求体判定「DSH 请求宿主打开文件」，返回其路径。
+ *
+ * 这是 DOM 拦截之外的兜底网：无论 UI 元素形态怎么改，只要 DSH 仍经 RPC 让宿主
+ * 打开文件，就在这里接管并转发扩展宿主（否则会用系统默认应用弹出）。兼容两代协议：
+ *  - **dsh 0.1.7+（typert RPC）**：端点为 `<namespace>/<method>`（**斜杠**）——
+ *    `session/openWorkspacePath`，参数在 `payload.args.request` 下（见 openWorkspacePathRequest）。
+ *    依据：dsh-typert-registry/README.md「`<namespace>/<method>` for endpoints」；
+ *    dsh-api-gateway/lib/client.js:2039-2041 `endpointOf = namespace + '/' + method`；
+ *    dsh-api-gateway/lib/index.js:1219-1222 要求 `endpoint.split('/')` 恰为 2 段；
+ *    请求信封 `{type:'client-request', rpcId, method: endpoint, payload:{args}}`
+ *    （dsh-client-connection/lib/client.js:1213-1221、dsh-api-gateway/lib/client.js:1788）。
+ *  - **dsh ≤0.1.0-rc.6（旧点号协议）**：method 为 `host.openPath`，路径直接是 `payload.path`。
+ *    0.1.7 已无该端点（全仓无 `host.openPath`、无 dsh-host-apiproxy），此分支仅为旧版兜底。
+ *
+ * `action:'reveal'`（在文件管理器显示）与显式 `application`（指定应用打开）是用户有意的
+ * 「离开编辑器」动作，必须放行给 DSH，只接管「默认应用打开」这一种。
+ *
+ * @param {unknown} body 已 JSON.parse 的请求体
+ * @returns {string} 待打开的路径；不需要接管返回 ''
+ */
+export function extractOpenPathRequest(body) {
+  if (!body || typeof body !== 'object') return '';
+  const method = typeof body.method === 'string' ? body.method : '';
+  const payload = unwrapRpcPayload(body);
+  if (method === 'session/openWorkspacePath') {
+    const request = openWorkspacePathRequest(payload && typeof payload === 'object' ? payload.args : undefined);
+    if (request === null) return '';
+    if (request.action === 'reveal' || typeof request.application === 'string') return '';
+    return request.path;
+  }
+  if (method === 'host.openPath') {
+    const path = payload && typeof payload === 'object' && typeof payload.path === 'string' ? payload.path : '';
+    return path;
+  }
+  return '';
+}
+
+/**
+ * 是否应当**放弃**本次文件链接点击（与 DSH 原生完全同款守卫）。
+ *
+ * DSH 原生在文件链接/引用芯片的 onClick 里首先判：
+ *   `if (event.detail > 1 || (event.detail !== 0 && getSelection()?.isCollapsed === false)) return;`
+ * （dsh-client-ui-primitives/lib/index.js:5883）——即**双击/多击**与「文档里存在未折叠选区时
+ * 的单击」都不打开文件（后者是「拖选文本时手抖落在链接上」的防误触）。
+ * 桥接在捕获阶段先于 DOM onClick 执行，若不照抄该守卫，反而会比原生更容易误打开文件。
+ *
+ * @param {{detail?: unknown}} event 点击事件（合成事件无 detail 时按 0 处理，与原生 `detail !== 0` 判定一致）
+ * @param {{isCollapsed?: unknown}|null} selection document.getSelection() 结果（无 API 时传 null）
+ * @returns {boolean} true 表示应放行（不接管、不 preventDefault），交由 DSH 原生走它的「直接 return」
+ */
+export function isDuplicateOrSelectionClick(event, selection) {
+  const detail = event && typeof event.detail === 'number' ? event.detail : 0;
+  if (detail > 1) return true;
+  if (detail !== 0 && selection !== null && typeof selection === 'object' && selection.isCollapsed === false) return true;
+  return false;
+}
+
 /**
  * 判定一个元素是否为"可编辑元素"（可接收粘贴/剪切/打字的目标）。
  *

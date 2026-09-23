@@ -84,7 +84,7 @@ window.__ModuleLoader__.load({
     }
 
     // 桥接包版本（与插件版本统一，随包发布；安装器按「版本不一致或 client.js 内容不一致」强制重装）
-    const BRIDGE_VERSION = "0.3.22";
+    const BRIDGE_VERSION = "0.3.26";
 
     // —— 剪贴板写桥接：VS Code webview 对跨源 iframe 的 navigator.clipboard.writeText 有权限拦截 ——
     // 背景：即使 iframe 声明 allow="clipboard-write"，VS Code（Electron）仍会拒绝写入
@@ -451,6 +451,10 @@ window.__ModuleLoader__.load({
     }
 
     // —— DOM 拦截：外链与文件路径点击 → postMessage 转发给父页面（扩展） ——
+    // 读属性一律防御式：元素缺方法/属性时当作空串，不抛异常、不误拦其它点击。
+    const readAttr = (el, name) => {
+      try { return typeof el.getAttribute === "function" ? el.getAttribute(name) || "" : ""; } catch { return ""; }
+    };
     function bindLinkInterception() {
       document.addEventListener("click", (e) => {
         if (bridgeToken === "") return; // 未握手（普通浏览器打开）不激活
@@ -464,30 +468,71 @@ window.__ModuleLoader__.load({
           parent.postMessage(buildOpenExternalMessage(anchor.href), "*");
           return;
         }
-        // 文件路径按钮：DSH 的「模型回复内路径」（button.fileMention）与「产物列表 chip」
-        // 都渲染为 title=真实路径 的 button，onClick 走 host.openPath（系统默认应用打开）。
-        // 桥接统一拦截并转发扩展宿主 → showTextDocument（在当前 VS Code 窗口打开）。
-        // 识别：fileMention class（兼容相对路径 title）或 title 为绝对路径形态（覆盖产物 chip
-        // 与 DSH 改版后的新结构）。路径取 title（真实路径）优先——aria-label 是「打开 xxx」文案，
-        // 绝不能当路径用（旧实现曾误用导致解析失败）。
-        const btn = target.closest("button[title], button[aria-label]");
-        if (btn && btn.classList) {
-          const title = btn.getAttribute("title") || "";
-          const isFileMention = btn.classList.contains("fileMention");
-          const titleIsPath = title !== "" && (title.startsWith("/") || /^[a-zA-Z]:[\\/]/.test(title));
-          if (isFileMention || titleIsPath) {
+        // —— DSH 原生同款防误触守卫（dsh-client-ui-primitives/lib/index.js:5883）——
+        // 原生 onClick 首行即 `if (event.detail > 1 || (event.detail !== 0 && getSelection()?.isCollapsed === false)) return;`
+        // ——双击/多击、以及「文档里存在未折叠选区时的单击」都不打开文件。桥接在捕获阶段
+        // 先于 DOM onClick 执行，若不照抄该守卫，反而会比原生更容易误打开文件（拖选误触）。
+        // 命中守卫时直接放行：不 preventDefault、不 stopPropagation，由原生走它的「直接 return」。
+        if (isDuplicateOrSelectionClick(e, typeof document.getSelection === "function" ? document.getSelection() : null)) return;
+        // —— DSH「改动」卡片（[data-changed-files]）里的文件行 ——
+        // 该行点击**不发任何 RPC/HTTP**：onClick: openReview(index) → openChangesReview →
+        // ctx.sidebarRight.openResource("dsh-resource://changes-review/…") → placeResource 只改前端 store
+        // （diff 内容等侧栏 tab 挂载后才 GET），传输层无从接管，只能在捕获阶段拦。
+        // 用户需求：不要求开真 diff，解析出路径用编辑器打开该文件即可 → 复用 bridgeOpenFile 消息（宿主侧零改动）。
+        const changedRow = target.closest("[data-changed-files] button");
+        if (changedRow) {
+          const describedBy = readAttr(changedRow, "aria-describedby");
+          // React useId 生成的 id 形如 ":r5q:-0"，含冒号，不能直接当 CSS 选择器 → 必须用 getElementById
+          let describedPath = "";
+          if (describedBy !== "" && typeof document.getElementById === "function") {
+            const descEl = document.getElementById(describedBy);
+            if (descEl) describedPath = descEl.textContent || "";
+          }
+          const firstSpan = typeof changedRow.querySelector === "function" ? changedRow.querySelector("span") : null;
+          const path = resolveChangedRowClick({
+            inChangedCard: true,
+            describedBy,
+            describedPath,
+            rowText: firstSpan ? firstSpan.textContent || "" : "",
+          });
+          if (path !== "") {
             e.preventDefault();
             e.stopPropagation();
-            const path = title || btn.getAttribute("aria-label") || btn.textContent || "";
-            // openFile 消息仍发送 path；不带 cwd 字段（工作区同步已移除，会话 cwd 不再维护），
-            // 扩展侧以工作区根目录作为相对路径解析兜底。
+            parent.postMessage(buildOpenFileMessage(path), "*");
+            return;
+          }
+        }
+        // 文件路径点击：DSH 各版本的「打开文件」入口（模型回复内路径 fileMention、@文件
+        // 引用芯片、产物文件卡片、工具调用行 fileLink）都统一在这里接管。
+        // 识别不写死在本文件：DOM 形态随 DSH 改版反复变化（0.1.7 起类名被 CSS Modules
+        // 哈希成 `_fileMention_1jct6_85`、卡片改为 data-* 标记），故由 core.js 的
+        // resolveFileClickPath 按「类名子串 + data-ref-chip + 路径形态」判定，纯逻辑可单测。
+        let fileBtn = target.closest("button");
+        // 产物卡片（[data-presented-file]）的可点区域是覆盖整卡的 button；
+        // 若 DSH 后续把 pointer-events 挪到子节点上，点这里回退到卡内带 title 的按钮。
+        if (!fileBtn) {
+          const card = target.closest("[data-presented-file]");
+          fileBtn = card && typeof card.querySelector === "function" ? card.querySelector("button[title]") : null;
+        }
+        if (fileBtn) {
+          const path = resolveFileClickPath({
+            className: readAttr(fileBtn, "class"),
+            title: readAttr(fileBtn, "title"),
+            text: fileBtn.textContent || "",
+            refChip: readAttr(fileBtn, "data-ref-chip"),
+          });
+          if (path !== "") {
+            e.preventDefault();
+            e.stopPropagation();
+            // openFile 消息只发 path；不带 cwd（工作区同步已移除，会话 cwd 不再维护），
+            // 相对路径由扩展侧以工作区根目录解析兜底。
             parent.postMessage(buildOpenFileMessage(path), "*");
             return;
           }
         }
         // 工具调用行（DSH ToolCall）：容器带 data-tool 属性，文件链接按钮（无 title/aria-label）
-        // 文本形如「read · <路径>」或直接「<路径>」（相对会话 cwd 或 ~ 缩写），onClick 同样走
-        // host.openPath（系统默认打开）。转发扩展宿主在当前窗口打开。
+        // 文本形如「read · <路径>」或直接「<路径>」（相对会话 cwd 或 ~ 缩写），点击后由 DSH 打开该文件。
+        // 转发扩展宿主在当前窗口打开。
         // 识别分两层：
         //  ① 文本路径形态（extractToolLinkPath：去「工具名 · 」前缀、要求含路径分隔符）——
         //     覆盖子目录/绝对/~ 路径（read 行通常命中）；
@@ -769,26 +814,27 @@ window.__ModuleLoader__.load({
       }
     }
 
-    // 拦截 RPC 传输：① host.openPath（统一接管文件打开）；② prompt RPC 的图片降级。
+    // 拦截 RPC 传输：① 宿主打开文件（统一接管）；② prompt RPC 的图片降级。
     // DSH 的 ApiClient.doFetch 即 globalThis.fetch，本包装是页面上所有 RPC 的必经之路。
     function interceptPromptFetch() {
       const origFetch = window.fetch.bind(window);
       window.fetch = async (input, init) => {
-        // —— 前置拦截：host.openPath（DSH 所有「打开文件」入口的最终汇聚点，默认系统应用打开）——
-        // 一网打尽：无论 UI 元素形态（fileMention / 产物 chip / 工具行 fileLink / 未来新组件），
-        // 只要 DSH 发起 openPath 就接管——转发扩展宿主在当前窗口打开（showTextDocument），
-        // 并伪造 server-response 成功响应让 DSH 无感（rpcId 回显 + opened:true）；
-        // 后端不被调用 → 系统默认应用不会弹出。未握手（普通浏览器）不干涉。
+        // —— 前置拦截：DSH 请求宿主打开文件 ——
+        // DOM 拦截之外的兜底网：无论 UI 元素形态怎么改版，只要 DSH 仍经 RPC 让宿主打开文件，
+        // 就在这里接管——转发扩展宿主在当前窗口打开（showTextDocument），并伪造 server-response
+        // 成功响应让 DSH 无感（rpcId 回显 + result.ok/opened:true）；后端不被调用 → 系统默认应用不弹出。
+        // 端点与「哪些动作该放行」的判定在 core.js.extractOpenPathRequest（纯逻辑、可单测）：
+        //   dsh 0.1.7+ 走 typert RPC，端点为 **斜杠** 形式 `session/openWorkspacePath`，
+        //   参数在 `payload.args.request`（args 按参数 wire 名索引的普通对象，非位置数组）；
+        //   旧版（≤0.1.0-rc.6）点号 `host.openPath` + `payload.path` 保留兼容。
+        // 未握手（普通浏览器）不干涉。
         if (bridgeToken !== "" && init && init.method === "POST" && typeof init.body === "string" && init.body !== "") {
           try {
             const parsed = JSON.parse(init.body);
-            if (
-              parsed && typeof parsed === "object" &&
-              parsed.method === "host.openPath" &&
-              parsed.payload && typeof parsed.payload.path === "string"
-            ) {
-              parent.postMessage(buildOpenFileMessage(parsed.payload.path), "*");
-              console.log("[dsh-vscode-bridge] openPath 接管：转发扩展宿主打开 " + parsed.payload.path);
+            const openPath = extractOpenPathRequest(parsed);
+            if (openPath !== "") {
+              parent.postMessage(buildOpenFileMessage(openPath), "*");
+              console.log("[dsh-vscode-bridge] openPath 接管：转发扩展宿主打开 " + openPath);
               return new Response(JSON.stringify({
                 type: "server-response",
                 rpcId: typeof parsed.rpcId === "string" ? parsed.rpcId : "rpc-id",

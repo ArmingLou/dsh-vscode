@@ -2,6 +2,7 @@
 import * as vscode from 'vscode';
 import { randomUUID } from 'node:crypto';
 import * as nodeFs from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { ServiceManager } from '../service/manager';
 import { handleBridgeMessage } from '../bridge/host';
 import { isRemoteName } from '../remote';
@@ -52,6 +53,9 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
    * @param imageFallback 是否启用非视觉模型图片降级（v0.3.0，默认开）
    * @param shortcuts 桥接快捷键映射 getter（v0.3.2：组合键 → VS Code 命令 id，随握手下发 iframe）
    * @param onBridgeRetry 「重试安装桥接」按钮回调（v0.3.9：页面加载异常提示条按钮；可选）
+   * @param dshPathBases DSH 侧相对路径基准候选的 getter（v0.3.25）：
+   *   `sessionCwds`＝各会话 cwd（`session/list` 探测、由新到旧，首选）；`workspacePaths`＝
+   *   工作区注册表里的全部工作区路径（最后兜底）。默认空＝只用 VS Code 工作区根（旧行为）
    */
   constructor(
     private manager: ServiceManager,
@@ -65,6 +69,8 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
     private shortcuts: () => Record<string, string> = () => ({}),
     private onBridgeRetry?: () => void,
     private onSyncWorkspace?: () => void,
+    private dshPathBases: () => { sessionCwds: readonly string[]; workspacePaths: readonly string[] } =
+      () => ({ sessionCwds: [], workspacePaths: [] }),
   ) {
     // 订阅状态变化，重绘面板（iframe 与占位页由状态驱动，无白屏路径）
     manager.onChange(() => void this.handleStateChange());
@@ -265,6 +271,12 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
       // 用户提示统一走 vscode.window.showWarningMessage（host 层不 import vscode，保持纯逻辑可单测）
       showWarning: (m) => void vscode.window.showWarningMessage(m),
       workspaceRoot: this.workspaceRoot(), // 工作区根目录：openFile 相对路径解析的兜底基准
+      // v0.3.25 多基准解析：DSH 各会话 cwd 优先（DSH 原生即以会话 cwd 为基准；跨仓库/多工作空间
+      // 场景下 VS Code 工作区根会拼错），其次 VS Code 各工作区根；exists 让宿主层取「第一个真实存在的文件」。
+      dshSessionCwds: () => this.dshPathBases().sessionCwds,
+      dshWorkspacePaths: () => this.dshPathBases().workspacePaths,
+      vscodeWorkspaceRoots: () => (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath),
+      exists: (p) => existsSync(p),
       // 图片缓存：以 base64 写入（node:fs/promises 支持 base64 编码字符串）；删除用 unlink
       writeFile: async (p, b64) => {
         await nodeFs.writeFile(p, Buffer.from(b64, 'base64'));
